@@ -365,3 +365,7 @@ If you find AIStudioToAPI useful, consider giving it a ⭐️!
    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI" />
  </picture>
 </a>
+
+## Model-aware scheduling
+
+Account quotas are now tracked per model. Context/page workers use independent account leases, bounded model queues, preferred allocations and optional idle capacity borrowing. The dashboard exposes scheduler state and recovery controls. Set `ACCOUNT_ROTATION_STRATEGY=legacy` to restore the previous rotation behavior. See the [configuration and architecture guide (Chinese)](docs/zh/model-aware-scheduling.md).

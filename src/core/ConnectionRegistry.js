@@ -116,6 +116,9 @@ class ConnectionRegistry extends EventEmitter {
 
     _removeConnection(websocket) {
         const disconnectedAuthIndex = websocket._authIndex;
+        // An old context can finish closing after its replacement has connected.
+        const current = this.connectionsByAuth.get(disconnectedAuthIndex);
+        if (current && current !== websocket) return;
 
         // Remove from connectionsByAuth if it has an authIndex
         if (disconnectedAuthIndex !== undefined && disconnectedAuthIndex >= 0) {

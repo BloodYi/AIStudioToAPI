@@ -511,7 +511,9 @@ class BrowserManager {
      * Interface: Notify user activity
      * Used to force wake up the Launch detection when a request comes in
      */
-    notifyUserActivity() {
+    notifyUserActivity(authIndex = this._currentAuthIndex) {
+        const workerState = this.contexts.get(authIndex);
+        if (workerState) workerState.noButtonCount = 0;
         if (this.noButtonCount > 0) {
             this.logger.info("[Browser] ⚡ User activity detected, forcing Launch detection wakeup...");
             this.noButtonCount = 0;
@@ -927,8 +929,7 @@ class BrowserManager {
      * Periodically cleans up popups and keeps the session alive.
      * In multi-context mode, stores the interval in the context data.
      */
-    _startHealthMonitor() {
-        const authIndex = this._currentAuthIndex;
+    _startHealthMonitor(authIndex = this._currentAuthIndex) {
         if (authIndex < 0) {
             this.logger.warn("[Browser] Cannot start health monitor: no active auth index");
             return;
@@ -955,7 +956,7 @@ class BrowserManager {
             try {
                 // Check if this is still the current active account
                 // This prevents background contexts from running healthMonitor unnecessarily
-                if (this._currentAuthIndex !== authIndex) {
+                if (!this.scheduler && this._currentAuthIndex !== authIndex) {
                     // Silently skip - this context is not active
                     return;
                 }
@@ -1119,40 +1120,40 @@ class BrowserManager {
      * This service is bound to this.page (instance-level), not individual contexts.
      * Only one instance should run at a time, tracking the current active page.
      */
-    async _startBackgroundWakeup() {
+    async _startBackgroundWakeup(workerState = this) {
         // Prevent multiple instances from running simultaneously
-        if (this.backgroundWakeupRunning) {
+        if (workerState.backgroundWakeupRunning) {
             this.logger.info("[Browser] BackgroundWakeup already running, skipping duplicate start.");
             return;
         }
 
         this.logger.debug("[Browser] Starting BackgroundWakeup initialization...");
-        this.backgroundWakeupRunning = true;
+        workerState.backgroundWakeupRunning = true;
 
         // Initial buffer - wait before starting the main loop to let page stabilize
         await new Promise(r => setTimeout(r, 1500));
 
         // Verify page is still valid after the initial delay
         try {
-            if (!this.page || this.page.isClosed()) {
-                this.backgroundWakeupRunning = false;
+            if (!workerState.page || workerState.page.isClosed()) {
+                workerState.backgroundWakeupRunning = false;
                 this.logger.info(
                     "[Browser] BackgroundWakeup stopped: page became null or closed during startup delay."
                 );
                 return;
             }
         } catch (error) {
-            this.backgroundWakeupRunning = false;
+            workerState.backgroundWakeupRunning = false;
             this.logger.warn(`[Browser] BackgroundWakeup stopped: error checking page status: ${error.message}`);
             return;
         }
 
         this.logger.info("[Browser] 🛡️ Background Wakeup Service (Rocket Handler) started...");
 
-        // Main loop: directly use this.page, automatically follows context switches
-        while (this.page && !this.page.isClosed()) {
+        // Main loop: directly use workerState.page, automatically follows context switches
+        while (workerState.page && !workerState.page.isClosed()) {
             try {
-                const currentPage = this.page; // Capture for this iteration
+                const currentPage = workerState.page; // Capture for this iteration
 
                 // 1. Force page wake-up
                 await currentPage.bringToFront().catch(() => {});
@@ -1277,7 +1278,7 @@ class BrowserManager {
                         this.logger.info(`[Browser] ✅ Click successful, button disappeared.`);
                         // Long sleep on success, but check for context switches every second
                         for (let i = 0; i < 60; i++) {
-                            if (this.noButtonCount === 0) {
+                            if (!workerState.page || workerState.page.isClosed() || workerState.noButtonCount === 0) {
                                 this.logger.info(`[Browser] ⚡ Woken up early due to user activity or context switch.`);
                                 break; // Wake up early if user activity detected
                             }
@@ -1285,12 +1286,13 @@ class BrowserManager {
                         }
                     }
                 } else {
-                    this.noButtonCount++;
+                    workerState.noButtonCount++;
                     // Smart Sleep
-                    if (this.noButtonCount > 20) {
+                    if (workerState.noButtonCount > 20) {
                         // Long sleep, but check for user activity
                         for (let i = 0; i < 30; i++) {
-                            if (this.noButtonCount === 0) break; // Woken up by request
+                            if (!workerState.page || workerState.page.isClosed() || workerState.noButtonCount === 0)
+                                break; // Woken up by request
                             await new Promise(r => setTimeout(r, 1000));
                         }
                     } else {
@@ -1304,13 +1306,13 @@ class BrowserManager {
         }
 
         // Reset flag when loop exits
-        this.backgroundWakeupRunning = false;
+        workerState.backgroundWakeupRunning = false;
 
         // Log the reason for stopping
-        if (!this.page) {
-            this.logger.info("[Browser] Background Wakeup Service stopped: this.page is null.");
-        } else if (this.page.isClosed()) {
-            this.logger.info("[Browser] Background Wakeup Service stopped: this.page was closed.");
+        if (!workerState.page) {
+            this.logger.info("[Browser] Background Wakeup Service stopped: workerState.page is null.");
+        } else if (workerState.page.isClosed()) {
+            this.logger.info("[Browser] Background Wakeup Service stopped: workerState.page was closed.");
         } else {
             this.logger.info("[Browser] Background Wakeup Service stopped: unknown reason.");
         }
@@ -1480,6 +1482,45 @@ class BrowserManager {
     /**
      * Launch browser instance if not already running
      */
+    async ensureWorkerContext(authIndex) {
+        // Serialize context creation/eviction, while already-ready contexts execute concurrently.
+        const existing = this.contexts.get(authIndex);
+        if (existing?.page && !existing.page.isClosed() && this.connectionRegistry.getConnectionByAuth(authIndex))
+            return;
+        const previous = this._workerContextTask || Promise.resolve();
+        const task = previous
+            .catch(() => {})
+            .then(async () => {
+                if (this.scheduler.closed) throw new Error("Scheduler is shutting down");
+                await this._ensureBrowser();
+                if (this.scheduler.closed) {
+                    await this.closeBrowser();
+                    throw new Error("Scheduler is shutting down");
+                }
+                const context = this.contexts.get(authIndex);
+                if (context?.page && !context.page.isClosed() && this.connectionRegistry.getConnectionByAuth(authIndex))
+                    return;
+                if (context) await this.closeContext(authIndex, { keepBrowser: true });
+                while (this.contexts.size >= this.scheduler.config.maxWorkers) {
+                    const idle = [...this.contexts.keys()].find(index => !this.scheduler.account(index).inflight);
+                    if (idle === undefined) throw new Error("No idle browser context available");
+                    await this.closeContext(idle, { keepBrowser: true });
+                }
+                this.initializingContexts.add(authIndex);
+                await this._initializeContext(authIndex);
+                this._startHealthMonitor(authIndex);
+                const workerState = this.contexts.get(authIndex);
+                workerState.noButtonCount = 0;
+                this._startBackgroundWakeup(workerState).catch(error => {
+                    this.logger.warn(`[Worker#${authIndex}] Wakeup stopped: ${error.message}`);
+                });
+                if (!this.connectionRegistry.getConnectionByAuth(authIndex))
+                    throw new Error("WebSocket not ready after context initialization");
+            });
+        this._workerContextTask = task;
+        return task;
+    }
+
     async _ensureBrowser() {
         if (this.browser) return;
 
@@ -1922,6 +1963,7 @@ class BrowserManager {
      * Removes excess contexts and starts missing ones in background
      */
     async rebalanceContextPool() {
+        if (this.scheduler) return;
         const maxContexts = this.config.maxContexts;
         // maxContexts === 0 means unlimited pool size
         const isUnlimited = maxContexts === 0;
@@ -2595,7 +2637,7 @@ class BrowserManager {
      *
      * @param {number} authIndex - The auth index to close
      */
-    async closeContext(authIndex) {
+    async closeContext(authIndex, { keepBrowser = false } = {}) {
         this.pendingContextClosures.delete(authIndex);
 
         // If context is being initialized in background, signal abort and wait
@@ -2610,7 +2652,7 @@ class BrowserManager {
             // Context doesn't exist (was never initialized or was aborted)
             // Still check if we need to close the browser
             // Only close if there are no contexts AND no contexts being initialized
-            if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser) {
+            if (!keepBrowser && this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser) {
                 this.logger.info(`[Browser] All contexts closed, closing browser instance...`);
                 await this.closeBrowser();
             }
@@ -2667,7 +2709,7 @@ class BrowserManager {
         // If this was the last context, close the browser to free resources
         // This ensures a clean state when all accounts are deleted
         // Only close if there are no contexts AND no contexts being initialized
-        if (this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser) {
+        if (!keepBrowser && this.contexts.size === 0 && this.initializingContexts.size === 0 && this.browser) {
             this.logger.info(`[Browser] All contexts closed, closing browser instance...`);
             await this.closeBrowser();
         }

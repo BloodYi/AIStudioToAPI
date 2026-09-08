@@ -107,6 +107,11 @@ class ProxyServerSystem extends EventEmitter {
             this.config,
             this.authSource
         );
+        if (this.config.scheduler.enabled) {
+            const { ModelScheduler } = require("./ModelScheduler");
+            this.scheduler = new ModelScheduler(this.config.scheduler, this.authSource, this.logger);
+            this.browserManager.scheduler = this.scheduler;
+        }
         this.browserManager.setSystemBusyProvider(() => this.requestHandler?.isSystemBusy === true);
 
         this.httpServer = null;
@@ -137,6 +142,14 @@ class ProxyServerSystem extends EventEmitter {
             this.logger.warn("[System] No available authentication source. Starting in account binding mode.");
             this.emit("started");
             return; // Exit early
+        }
+
+        if (this.scheduler) {
+            this.logger.info(
+                `[Scheduler] Model-aware context workers enabled (${this.config.scheduler.maxWorkers}); contexts initialize on demand.`
+            );
+            this.emit("started");
+            return;
         }
 
         // Determine startup order
@@ -621,6 +634,8 @@ class ProxyServerSystem extends EventEmitter {
             this.staleQueueCleanupInterval = null;
             this.logger.info("[System] Stopped stale queue cleanup interval");
         }
+
+        this.scheduler?.close();
 
         // Close all message queues
         if (this.connectionRegistry) {

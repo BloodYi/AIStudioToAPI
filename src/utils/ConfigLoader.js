@@ -45,6 +45,8 @@ class ConfigLoader {
             wsPort: 9998,
         };
 
+        config.scheduler = require("../core/SchedulerConfig")();
+
         // Environment variable overrides
         if (process.env.PORT) {
             const parsed = parseInt(process.env.PORT, 10);

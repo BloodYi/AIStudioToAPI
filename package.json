@@ -25,7 +25,8 @@
         "lint:js:fix": "eslint . --fix",
         "lint:css:fix": "stylelint \"ui/**/*.{css,less}\" --fix",
         "format": "prettier --write .",
-        "format:check": "prettier --check ."
+        "format:check": "prettier --check .",
+        "test": "node tests/model-scheduler.test.js && node tests/scheduled-request.test.js && node tests/browser-workers.test.js"
     },
     "dependencies": {
         "archiver": "^7.0.1",

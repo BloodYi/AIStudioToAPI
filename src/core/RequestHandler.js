@@ -640,6 +640,19 @@ class RequestHandler {
         return true;
     }
 
+    async _sendAndReadInitial(proxyRequest, queue, authIndex) {
+        this._forwardRequest(proxyRequest, authIndex);
+        return this._readInitialMessage(queue);
+    }
+
+    _shouldRetryError(error) {
+        return this.config.immediateSwitchStatusCodes.includes(Number(error?.status));
+    }
+
+    async _readInitialMessage(queue) {
+        return queue.dequeue();
+    }
+
     _createImmediateSwitchTracker(initialAuthIndex = this.currentAuthIndex) {
         const attemptedAuthIndices = new Set();
         if (Number.isInteger(initialAuthIndex) && initialAuthIndex >= 0) {
@@ -889,6 +902,9 @@ class RequestHandler {
 
     // Process standard Google API requests
     async processRequest(req, res) {
+        if (this.serverSystem.scheduler && !this.scheduled) {
+            return require("./ScheduledRequestHandler").dispatch(this, "processRequest", req, res);
+        }
         const requestId = this._generateRequestId();
         this._startTrackedRequest(requestId, req, {
             apiFormat: "gemini",
@@ -924,6 +940,13 @@ class RequestHandler {
             const proxyRequest = this._buildProxyRequest(req, requestId);
             proxyRequest.is_generative = isGenerativeRequest;
             this._initializeProxyRequestAttempt(proxyRequest);
+            if (this.scheduled) {
+                try {
+                    await this._acquireScheduledLease(proxyRequest);
+                } catch (error) {
+                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                }
+            }
 
             const wantsStream = req.path.includes(":streamGenerateContent");
             res.__proxyResponseStreamMode = wantsStream ? proxyRequest.streaming_mode : null;
@@ -983,6 +1006,9 @@ class RequestHandler {
 
     // Process OpenAI embeddings requests
     async processOpenAIEmbeddingsRequest(req, res) {
+        if (this.serverSystem.scheduler && !this.scheduled) {
+            return require("./ScheduledRequestHandler").dispatch(this, "processOpenAIEmbeddingsRequest", req, res);
+        }
         const requestId = this._generateRequestId();
         this._startTrackedRequest(requestId, req, {
             apiFormat: "openai",
@@ -1013,6 +1039,13 @@ class RequestHandler {
                 tracking_model: cleanModelName,
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            if (this.scheduled) {
+                try {
+                    await this._acquireScheduledLease(proxyRequest);
+                } catch (error) {
+                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                }
+            }
             this._updateTrackedRequest(requestId, {
                 isStreaming: false,
                 model: proxyRequest.tracking_model,
@@ -1044,6 +1077,9 @@ class RequestHandler {
 
     // Process File Upload requests
     async processUploadRequest(req, res) {
+        if (this.serverSystem.scheduler && !this.scheduled) {
+            return require("./ScheduledRequestHandler").dispatch(this, "processUploadRequest", req, res);
+        }
         const requestId = this._generateRequestId();
         this.logger.info(`[Upload] Processing upload request ${req.method} ${req.path}, request ID: ${requestId}`);
         this._startTrackedRequest(requestId, req, {
@@ -1071,6 +1107,13 @@ class RequestHandler {
                 streaming_mode: "fake", // Uploads always return a single JSON response
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            if (this.scheduled) {
+                try {
+                    await this._acquireScheduledLease(proxyRequest);
+                } catch (error) {
+                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                }
+            }
             this._updateTrackedRequest(requestId, {
                 path: proxyRequest.path,
             });
@@ -1132,6 +1175,9 @@ class RequestHandler {
 
     // Process OpenAI format requests
     async processOpenAIRequest(req, res) {
+        if (this.serverSystem.scheduler && !this.scheduled) {
+            return require("./ScheduledRequestHandler").dispatch(this, "processOpenAIRequest", req, res);
+        }
         const requestId = this._generateRequestId();
         this._startTrackedRequest(requestId, req, {
             apiFormat: "openai",
@@ -1191,6 +1237,13 @@ class RequestHandler {
                 streaming_mode: useRealStream ? "real" : "fake",
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            if (this.scheduled) {
+                try {
+                    await this._acquireScheduledLease(proxyRequest);
+                } catch (error) {
+                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                }
+            }
             res.__proxyResponseStreamMode = isOpenAIStream ? (useRealStream ? "real" : "fake") : null;
             this._updateTrackedRequest(requestId, {
                 isStreaming: isOpenAIStream,
@@ -1223,15 +1276,18 @@ class RequestHandler {
                             currentQueueAuthIndex,
                             this._getAccountNameForIndex(currentQueueAuthIndex)
                         );
-                        this._forwardRequest(proxyRequest, currentQueueAuthIndex);
-                        initialMessage = await currentQueue.dequeue();
+                        initialMessage = await this._sendAndReadInitial(
+                            proxyRequest,
+                            currentQueue,
+                            currentQueueAuthIndex
+                        );
 
                         const initialStatus = Number(initialMessage?.status);
                         if (
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            this._shouldRetryError(initialMessage)
                         ) {
                             this.logger.warn(
                                 `[Request] OpenAI real stream received ${initialStatus}, preparing retry...`
@@ -1480,6 +1536,9 @@ class RequestHandler {
 
     // Process OpenAI Response API format requests
     async processOpenAIResponseRequest(req, res) {
+        if (this.serverSystem.scheduler && !this.scheduled) {
+            return require("./ScheduledRequestHandler").dispatch(this, "processOpenAIResponseRequest", req, res);
+        }
         const requestId = this._generateRequestId();
         this._startTrackedRequest(requestId, req, {
             apiFormat: "response_api",
@@ -1594,6 +1653,13 @@ class RequestHandler {
                 streaming_mode: useRealStream ? "real" : "fake",
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            if (this.scheduled) {
+                try {
+                    await this._acquireScheduledLease(proxyRequest);
+                } catch (error) {
+                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                }
+            }
             res.__proxyResponseStreamMode = isOpenAIStream ? (useRealStream ? "real" : "fake") : null;
             this._updateTrackedRequest(requestId, {
                 isStreaming: isOpenAIStream,
@@ -1626,15 +1692,18 @@ class RequestHandler {
                             currentQueueAuthIndex,
                             this._getAccountNameForIndex(currentQueueAuthIndex)
                         );
-                        this._forwardRequest(proxyRequest, currentQueueAuthIndex);
-                        initialMessage = await currentQueue.dequeue();
+                        initialMessage = await this._sendAndReadInitial(
+                            proxyRequest,
+                            currentQueue,
+                            currentQueueAuthIndex
+                        );
 
                         const initialStatus = Number(initialMessage?.status);
                         if (
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            this._shouldRetryError(initialMessage)
                         ) {
                             this.logger.warn(
                                 `[Request] OpenAI Response API real stream received ${initialStatus}, preparing retry...`
@@ -1906,6 +1975,9 @@ class RequestHandler {
 
     // Process Claude API format requests
     async processClaudeRequest(req, res) {
+        if (this.serverSystem.scheduler && !this.scheduled) {
+            return require("./ScheduledRequestHandler").dispatch(this, "processClaudeRequest", req, res);
+        }
         const requestId = this._generateRequestId();
         this._startTrackedRequest(requestId, req, {
             apiFormat: "claude",
@@ -1966,6 +2038,13 @@ class RequestHandler {
                 streaming_mode: useRealStream ? "real" : "fake",
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            if (this.scheduled) {
+                try {
+                    await this._acquireScheduledLease(proxyRequest);
+                } catch (error) {
+                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                }
+            }
             res.__proxyResponseStreamMode = isClaudeStream ? (useRealStream ? "real" : "fake") : null;
             this._updateTrackedRequest(requestId, {
                 isStreaming: isClaudeStream,
@@ -1998,15 +2077,18 @@ class RequestHandler {
                             currentQueueAuthIndex,
                             this._getAccountNameForIndex(currentQueueAuthIndex)
                         );
-                        this._forwardRequest(proxyRequest, currentQueueAuthIndex);
-                        initialMessage = await currentQueue.dequeue();
+                        initialMessage = await this._sendAndReadInitial(
+                            proxyRequest,
+                            currentQueue,
+                            currentQueueAuthIndex
+                        );
 
                         const initialStatus = Number(initialMessage?.status);
                         if (
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this.config?.immediateSwitchStatusCodes?.includes(initialStatus)
+                            this._shouldRetryError(initialMessage)
                         ) {
                             this.logger.warn(
                                 `[Request] Claude real stream received ${initialStatus}, preparing retry...`
@@ -2244,6 +2326,9 @@ class RequestHandler {
 
     // Process Claude count tokens request
     async processClaudeCountTokens(req, res) {
+        if (this.serverSystem.scheduler && !this.scheduled) {
+            return require("./ScheduledRequestHandler").dispatch(this, "processClaudeCountTokens", req, res);
+        }
         const requestId = this._generateRequestId();
         this.logger.info(`[Request] Claude count tokens request started, request ID: ${requestId}`);
         this._startTrackedRequest(requestId, req, {
@@ -2293,6 +2378,13 @@ class RequestHandler {
                 request_id: requestId,
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            if (this.scheduled) {
+                try {
+                    await this._acquireScheduledLease(proxyRequest);
+                } catch (error) {
+                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                }
+            }
             this._updateTrackedRequest(requestId, {
                 model,
                 path: proxyRequest.path,
@@ -2301,7 +2393,7 @@ class RequestHandler {
 
             try {
                 // Create message queue inside try-catch to handle invalid authIndex
-                const messageQueue = this.connectionRegistry.createMessageQueue(
+                let messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
                     this.currentAuthIndex,
                     proxyRequest.request_attempt_id
@@ -2310,13 +2402,20 @@ class RequestHandler {
                     this.connectionRegistry.getAuthIndexForRequest(requestId) ?? this.currentAuthIndex;
                 this._setupClientDisconnectHandler(res, requestId);
 
-                this._getUsageStatsService()?.recordAttempt(
-                    requestId,
-                    messageQueueAuthIndex,
-                    this._getAccountNameForIndex(messageQueueAuthIndex)
-                );
-                this._forwardRequest(proxyRequest, messageQueueAuthIndex);
-                const response = await messageQueue.dequeue();
+                let response;
+                if (this.scheduled) {
+                    const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+                    response = result.success ? result.message : { ...result.error, event_type: "error" };
+                    messageQueue = result.queue || messageQueue;
+                } else {
+                    this._getUsageStatsService()?.recordAttempt(
+                        requestId,
+                        messageQueueAuthIndex,
+                        this._getAccountNameForIndex(messageQueueAuthIndex)
+                    );
+                    this._forwardRequest(proxyRequest, messageQueueAuthIndex);
+                    response = await messageQueue.dequeue();
+                }
 
                 if (response.event_type === "error") {
                     this.logger.error(
@@ -2382,6 +2481,9 @@ class RequestHandler {
     // OpenAI Response API count input tokens endpoint
     // Mirrors OpenAI's /v1/responses/input_tokens by returning only the request-side token count.
     async processOpenAIResponseInputTokens(req, res) {
+        if (this.serverSystem.scheduler && !this.scheduled) {
+            return require("./ScheduledRequestHandler").dispatch(this, "processOpenAIResponseInputTokens", req, res);
+        }
         const requestId = this._generateRequestId();
         this.logger.info(`[Request] OpenAI Response input_tokens request started, request ID: ${requestId}`);
         this._startTrackedRequest(requestId, req, {
@@ -2435,6 +2537,13 @@ class RequestHandler {
                 request_id: requestId,
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            if (this.scheduled) {
+                try {
+                    await this._acquireScheduledLease(proxyRequest);
+                } catch (error) {
+                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                }
+            }
             this._updateTrackedRequest(requestId, {
                 model,
                 path: proxyRequest.path,
@@ -2442,7 +2551,7 @@ class RequestHandler {
             });
 
             try {
-                const messageQueue = this.connectionRegistry.createMessageQueue(
+                let messageQueue = this.connectionRegistry.createMessageQueue(
                     requestId,
                     this.currentAuthIndex,
                     proxyRequest.request_attempt_id
@@ -2451,13 +2560,20 @@ class RequestHandler {
                     this.connectionRegistry.getAuthIndexForRequest(requestId) ?? this.currentAuthIndex;
                 this._setupClientDisconnectHandler(res, requestId);
 
-                this._getUsageStatsService()?.recordAttempt(
-                    requestId,
-                    messageQueueAuthIndex,
-                    this._getAccountNameForIndex(messageQueueAuthIndex)
-                );
-                this._forwardRequest(proxyRequest, messageQueueAuthIndex);
-                const response = await messageQueue.dequeue();
+                let response;
+                if (this.scheduled) {
+                    const result = await this._executeRequestWithRetries(proxyRequest, messageQueue);
+                    response = result.success ? result.message : { ...result.error, event_type: "error" };
+                    messageQueue = result.queue || messageQueue;
+                } else {
+                    this._getUsageStatsService()?.recordAttempt(
+                        requestId,
+                        messageQueueAuthIndex,
+                        this._getAccountNameForIndex(messageQueueAuthIndex)
+                    );
+                    this._forwardRequest(proxyRequest, messageQueueAuthIndex);
+                    response = await messageQueue.dequeue();
+                }
 
                 if (response.event_type === "error") {
                     this.logger.error(
@@ -2946,8 +3062,7 @@ class RequestHandler {
                 currentQueueAuthIndex,
                 this._getAccountNameForIndex(currentQueueAuthIndex)
             );
-            this._forwardRequest(proxyRequest, currentQueueAuthIndex);
-            headerMessage = await currentQueue.dequeue();
+            headerMessage = await this._sendAndReadInitial(proxyRequest, currentQueue, currentQueueAuthIndex);
 
             const headerStatus = Number(headerMessage?.status);
             if (
@@ -2955,7 +3070,7 @@ class RequestHandler {
                 proxyRequest.is_generative &&
                 !isUserAbortedError(headerMessage) &&
                 Number.isFinite(headerStatus) &&
-                this.config?.immediateSwitchStatusCodes?.includes(headerStatus)
+                this._shouldRetryError(headerMessage)
             ) {
                 this.logger.warn(`[Request] Gemini real stream received ${headerStatus}, preparing retry...`);
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);

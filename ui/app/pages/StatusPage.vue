@@ -155,6 +155,8 @@
                     <h1>{{ t("statusHeading") }}</h1>
                 </header>
 
+                <SchedulerStatus :data="schedulerData" :t="t" @refresh="updateContent" />
+
                 <div class="dashboard-grid">
                     <!-- Service Status Card -->
                     <div class="status-card">
@@ -2821,6 +2823,9 @@ import I18n from "../utils/i18n";
 import { useTheme } from "../utils/useTheme";
 import EnvVarTooltip from "../components/EnvVarTooltip.vue";
 
+import SchedulerStatus from "../components/SchedulerStatus.vue";
+
+const schedulerData = ref(null);
 const router = useRouter();
 const fileInput = ref(null);
 const usageStatsImportInput = ref(null);
@@ -4494,6 +4499,7 @@ const updateContent = async () => {
             if (state.serviceConnected) dot.classList.add("status-running");
             else dot.classList.remove("status-running");
         }
+        schedulerData.value = data.scheduler || null;
         updateStatus(data);
     } catch (err) {
         console.error("Error fetching status:", err.message || err);

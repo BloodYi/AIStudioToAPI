@@ -34,7 +34,10 @@ class StatusRoutes {
     }
 
     _rejectIfSystemBusy(res) {
-        if (!this.serverSystem.requestHandler?.isSystemBusy) {
+        if (
+            !this.serverSystem.requestHandler?.isSystemBusy &&
+            !this.serverSystem.scheduler?.workers.some(worker => worker.lease)
+        ) {
             return false;
         }
 
@@ -48,6 +51,52 @@ class StatusRoutes {
      * Setup status and management routes
      */
     setupRoutes(app, isAuthenticated) {
+        // Maintenance may replace auth files or close contexts. Pause admission until it finishes.
+        app.use(["/api/accounts", "/api/files"], isAuthenticated, (req, res, next) => {
+            const scheduler = this.serverSystem.scheduler;
+            if (!scheduler || !["POST", "PUT", "DELETE"].includes(req.method)) return next();
+            if (scheduler.paused || scheduler.workers.some(worker => worker.lease)) {
+                return res.status(409).json({ error: "Active scheduler requests; retry maintenance when idle" });
+            }
+            scheduler.paused = true;
+            const resume = () => {
+                scheduler.paused = false;
+                scheduler.drain();
+            };
+            const end = res.end;
+            res.end = function (...args) {
+                try {
+                    return end.apply(this, args);
+                } finally {
+                    resume();
+                }
+            };
+            next();
+        });
+
+        app.get("/api/scheduler", isAuthenticated, (req, res) => {
+            res.json(this.serverSystem.scheduler?.snapshot() || { enabled: false });
+        });
+        app.post("/api/scheduler/reset", isAuthenticated, (req, res) => {
+            const scheduler = this.serverSystem.scheduler;
+            if (!scheduler) return res.status(409).json({ error: "Scheduler is in legacy mode" });
+            const index = req.body?.account_id;
+            const model = req.body?.model;
+            if (
+                !Number.isInteger(index) ||
+                !this.serverSystem.authSource.availableIndices.includes(index) ||
+                (model !== undefined && (typeof model !== "string" || !model))
+            ) {
+                return res.status(400).json({ error: "Valid account_id and optional model are required" });
+            }
+            try {
+                scheduler.reset(index, model);
+                res.json({ success: true });
+            } catch (error) {
+                res.status(error.status || 500).json({ error: error.message });
+            }
+        });
+
         // Favicon endpoint (public, no authentication required)
         app.get("/favicon.ico", (req, res) => {
             const iconUrl = process.env.ICON_URL || "/AIStudio_logo.svg";
@@ -130,6 +179,10 @@ class StatusRoutes {
             const hasChanges = this.serverSystem.authSource.reloadAuthSources();
 
             const { authSource, browserManager, requestHandler } = this.serverSystem;
+
+            if (this.serverSystem.scheduler) {
+                return res.json({ ...this._getStatusData(), scheduler: this.serverSystem.scheduler.snapshot() });
+            }
 
             // If the system is busy switching accounts, skip the validity check to prevent race conditions
             if (requestHandler.isSystemBusy) {
@@ -1006,7 +1059,9 @@ class StatusRoutes {
                 accountDetails,
                 activeContextsCount: browserManager.contexts.size,
                 apiKeySource: config.apiKeySource,
-                browserConnected: !!this.serverSystem.connectionRegistry.getConnectionByAuth(currentAuthIndex, false),
+                browserConnected: this.serverSystem.scheduler
+                    ? this.serverSystem.connectionRegistry.connectionsByAuth.size > 0
+                    : !!this.serverSystem.connectionRegistry.getConnectionByAuth(currentAuthIndex, false),
                 checkUpdate: config.checkUpdate,
                 currentAccountName,
                 currentAuthIndex,

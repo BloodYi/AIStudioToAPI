@@ -238,6 +238,10 @@ services:
 - 在 AMC WebUI 中进入 **设置 -> API 配置**，启用“自定义 API 配置”，并将 Gemini 兼容 Base URL 填为 AIStudioToAPI 的 `/v1beta` 地址。
 - AMC WebUI 中填写的 API Key 应与 AIStudioToAPI 部署时配置的 `API_KEYS` 对应。
 
+## 模型感知账号池
+
+默认按账号 × 模型独立维护额度和错误状态，支持多个 context/page worker、模型配额、排队和空闲资源借用。管理主页可查看调度状态并手动恢复模型或账号。六 worker 配置、兼容模式、持久化与部署验收见 [模型感知调度说明](docs/zh/model-aware-scheduling.md)。
+
 ## 🧰 相关配置
 
 ### 🔧 环境变量
