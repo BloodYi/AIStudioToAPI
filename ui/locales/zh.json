@@ -236,6 +236,8 @@
     "schedulerRequests": "调用次数",
     "schedulerReset": "恢复模型",
     "schedulerResetAccount": "恢复账号及全部模型",
+    "schedulerResetAll429": "一键重置所有账号 429 状态",
+    "schedulerResetAll429Success": "已重置所有账号的 429 状态及对应冷却。",
     "schedulerStatus": "状态",
     "schedulerSuccess": "成功",
     "schedulerTitle": "模型调度",

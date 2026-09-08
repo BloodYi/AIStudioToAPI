@@ -5,6 +5,10 @@
             {{ t("schedulerWorkers") }}: {{ data.active_workers }} / {{ data.active_workers + data.idle_workers }} ·
             {{ t("schedulerQueued") }}: {{ data.queued_requests }}
         </p>
+        <button :disabled="busy" @click="resetAllRateLimits">
+            {{ t("schedulerResetAll429") }}
+        </button>
+        <p v-if="rateLimitsReset" role="status">{{ t("schedulerResetAll429Success") }}</p>
         <div class="scheduler-table">
             <table>
                 <thead>
@@ -90,19 +94,29 @@ defineProps({ data: { default: null, type: Object }, t: { required: true, type: 
 const emit = defineEmits(["refresh"]);
 const busy = ref(false);
 const error = ref("");
+const rateLimitsReset = ref(false);
+async function resetAllRateLimits() {
+    rateLimitsReset.value = await sendReset("/api/scheduler/reset-rate-limits", {});
+}
 async function reset(accountId, model) {
+    await sendReset("/api/scheduler/reset", { account_id: accountId, model });
+}
+async function sendReset(url, body) {
+    rateLimitsReset.value = false;
     busy.value = true;
     error.value = "";
     try {
-        const response = await fetch("/api/scheduler/reset", {
-            body: JSON.stringify({ account_id: accountId, model }),
+        const response = await fetch(url, {
+            body: JSON.stringify(body),
             headers: { "Content-Type": "application/json" },
             method: "POST",
         });
         if (!response.ok) throw new Error((await response.json()).error);
         emit("refresh");
+        return true;
     } catch (failure) {
         error.value = failure.message;
+        return false;
     } finally {
         busy.value = false;
     }

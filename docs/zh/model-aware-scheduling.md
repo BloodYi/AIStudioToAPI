@@ -64,6 +64,7 @@ SCHEDULER_STATE_PATH=data/scheduler-state.json
 
 Web 管理主页展示模型调用次数、成功/失败、可用账号数、429 数、排队数和 worker 配额，并提供账号×模型状态详情与恢复按钮。管理接口沿用原 Web UI session 认证：
 
+- `POST /api/scheduler/reset-rate-limits`：一键清除全部账号所有模型的 429 标记及对应冷却，保留账号健康、unsupported、其他临时冷却、历史错误和统计；允许在任务运行时使用，后续新的 429 仍会重新触发冷却。管理主页提供同名按钮。
 - `GET /api/scheduler`：全局、模型、账号与 worker 快照。
 - `POST /api/scheduler/reset`，body `{"account_id":0,"model":"model-a"}`：恢复单模型，保留统计。
 - `POST /api/scheduler/reset`，body `{"account_id":0}`：恢复账号及全部模型，保留统计。

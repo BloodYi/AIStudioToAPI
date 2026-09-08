@@ -181,3 +181,38 @@ test("corrupt state is backed up and inflight reset does not persist a lock", ()
     assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 1);
     fs.rmSync(directory, { recursive: true });
 });
+
+test("bulk 429 reset preserves other failures, statistics and active leases", async () => {
+    const scheduler = setup({}, 2);
+    const active = await scheduler.acquire("running");
+    for (const index of [0, 1]) {
+        const slot = scheduler.slot(scheduler.account(index), "limited");
+        Object.assign(slot, {
+            cooldown_until: Date.now() + 60000,
+            failure_count: 4,
+            last_error: "quota",
+            rate_limited: true,
+        });
+    }
+    const other = scheduler.slot(scheduler.account(0), "temporary");
+    Object.assign(other, { cooldown_until: Date.now() + 30000, unsupported: true });
+    scheduler.account(1).healthy = false;
+    const before = { ...other };
+    assert.equal(scheduler.resetAllRateLimits(), 2);
+    for (const index of [0, 1]) {
+        const slot = scheduler.account(index).models.limited;
+        assert.equal(slot.rate_limited, false);
+        assert.equal(slot.cooldown_until, 0);
+        assert.equal(slot.failure_count, 4);
+        assert.equal(slot.last_error, "quota");
+    }
+    assert.deepEqual(other, before);
+    assert.equal(scheduler.account(1).healthy, false);
+    assert.equal(active.account.inflight, 1);
+    assert.equal(scheduler.resetAllRateLimits(), 0);
+    scheduler.startAttempt(active);
+    scheduler.failure(active, { status: 429 });
+    assert.equal(active.slot.rate_limited, true);
+    scheduler.release(active);
+    scheduler.close();
+});

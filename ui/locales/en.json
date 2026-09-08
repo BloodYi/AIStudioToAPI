@@ -236,6 +236,8 @@
     "schedulerRequests": "Attempts",
     "schedulerReset": "Recover model",
     "schedulerResetAccount": "Recover account and all models",
+    "schedulerResetAll429": "Reset 429 status for all accounts",
+    "schedulerResetAll429Success": "All account 429 states and their cooldowns have been reset.",
     "schedulerStatus": "Status",
     "schedulerSuccess": "Success",
     "schedulerTitle": "Model scheduling",

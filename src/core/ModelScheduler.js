@@ -240,6 +240,22 @@ class ModelScheduler {
         this.drain();
     }
 
+    resetAllRateLimits() {
+        let resetCount = 0;
+        // Synchronous update preserves active leases; later 429 responses can set a new cooldown.
+        for (const account of this.accounts.values()) {
+            for (const slot of Object.values(account.models)) {
+                if (!slot.rate_limited) continue;
+                slot.rate_limited = false;
+                slot.cooldown_until = 0;
+                resetCount++;
+            }
+        }
+        this.flush();
+        this.drain();
+        return resetCount;
+    }
+
     reset(index, model) {
         const account = this.account(index);
         if (account.inflight) throw schedulerError("Account has active requests", 409);

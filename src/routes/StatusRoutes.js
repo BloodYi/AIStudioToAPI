@@ -77,6 +77,11 @@ class StatusRoutes {
         app.get("/api/scheduler", isAuthenticated, (req, res) => {
             res.json(this.serverSystem.scheduler?.snapshot() || { enabled: false });
         });
+        app.post("/api/scheduler/reset-rate-limits", isAuthenticated, (req, res) => {
+            const scheduler = this.serverSystem.scheduler;
+            if (!scheduler) return res.status(409).json({ error: "Scheduler is in legacy mode" });
+            res.json({ reset_count: scheduler.resetAllRateLimits(), success: true });
+        });
         app.post("/api/scheduler/reset", isAuthenticated, (req, res) => {
             const scheduler = this.serverSystem.scheduler;
             if (!scheduler) return res.status(409).json({ error: "Scheduler is in legacy mode" });
