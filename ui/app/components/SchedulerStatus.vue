@@ -5,6 +5,10 @@
             {{ t("schedulerWorkers") }}: {{ data.active_workers }} / {{ data.active_workers + data.idle_workers }} ·
             {{ t("schedulerQueued") }}: {{ data.queued_requests }}
         </p>
+        <p>
+            {{ t("schedulerBrowserContexts") }}: {{ data.active_browser_workers }} / {{ data.max_browser_workers }} ·
+            {{ t("schedulerIdleContexts") }}: {{ data.idle_browser_workers }}
+        </p>
         <button :disabled="busy" @click="resetAllRateLimits">
             {{ t("schedulerResetAll429") }}
         </button>
@@ -43,7 +47,8 @@
             <summary>{{ t("schedulerAccounts") }}</summary>
             <div v-for="account in data.accounts" :key="account.key">
                 <p>
-                    #{{ account.index }} {{ account.key }} · {{ account.healthy ? "HEALTHY" : "UNHEALTHY" }}
+                    #{{ account.index }} {{ account.key }} · {{ account.healthy ? "HEALTHY" : "UNHEALTHY" }} ·
+                    {{ t("schedulerInflight") }}: {{ account.inflight }}
                     <button :disabled="busy || account.inflight > 0" @click="reset(account.index)">
                         {{ t("schedulerResetAccount") }}
                     </button>
@@ -54,6 +59,7 @@
                             <tr>
                                 <th>{{ t("schedulerModel") }}</th>
                                 <th>{{ t("schedulerStatus") }}</th>
+                                <th>{{ t("schedulerInflight") }}</th>
                                 <th>{{ t("schedulerRequests") }}</th>
                                 <th>{{ t("schedulerErrors") }}</th>
                                 <th>{{ t("schedulerCooldown") }}</th>
@@ -65,6 +71,7 @@
                             <tr v-for="(slot, model) in account.models" :key="model">
                                 <td>{{ model }}</td>
                                 <td>{{ slot.status }}</td>
+                                <td>{{ slot.inflight }}</td>
                                 <td>{{ slot.request_count }}</td>
                                 <td>{{ slot.failure_count }}</td>
                                 <td>

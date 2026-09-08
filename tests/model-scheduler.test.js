@@ -216,3 +216,78 @@ test("bulk 429 reset preserves other failures, statistics and active leases", as
     scheduler.release(active);
     scheduler.close();
 });
+
+test("one account fills global concurrency independently of context capacity", async () => {
+    const scheduler = setup({ globalConcurrency: 12, maxWorkers: 1 }, 1);
+    const leases = await Promise.all(Array.from({ length: 12 }, () => scheduler.acquire("a")));
+    assert.equal(scheduler.account(0).inflight, 12);
+    assert.equal(scheduler.pending.length, 0);
+    scheduler.startAttempt(leases[0]);
+    scheduler.startAttempt(leases[0]);
+    scheduler.failure(leases[0], { status: 429 });
+    scheduler.failure(leases[0], { status: 429 });
+    scheduler.release(leases[1], true);
+    await assert.rejects(scheduler.acquire("a"), /No eligible/);
+    const other = await scheduler.acquire("b");
+    assert.equal(other.account.index, 0);
+    assert.equal(leases[0].slot.request_count, 1);
+    assert.equal(leases[0].slot.failure_count, 1);
+    assert.equal(leases[0].slot.rate_limited, true);
+    scheduler.release(other);
+    leases.forEach(lease => scheduler.release(lease));
+    assert.equal(scheduler.account(0).inflight, 0);
+    scheduler.close();
+});
+
+test("account and model caps queue independently and zero model cap overrides inheritance", async () => {
+    const scheduler = setup({ accountConcurrency: 3, accountModelConcurrency: { a: 1, b: 0 } }, 1);
+    const a = await scheduler.acquire("a");
+    const queued = scheduler.acquire("a");
+    const b = await scheduler.acquire("b");
+    const c = await scheduler.acquire("b");
+    assert.equal(scheduler.pending.length, 1);
+    scheduler.release(a);
+    const next = await queued;
+    [b, c, next].forEach(lease => scheduler.release(lease));
+    scheduler.close();
+});
+
+test("context reservations reuse busy accounts instead of overbooking browser capacity", async () => {
+    const scheduler = setup({ globalConcurrency: 12, maxWorkers: 2 });
+    const leases = await Promise.all(Array.from({ length: 12 }, () => scheduler.acquire("a")));
+    assert.equal(new Set(leases.map(lease => lease.account.index)).size, 2);
+    assert.equal(scheduler.account(0).inflight, 6);
+    assert.equal(scheduler.account(1).inflight, 6);
+    leases.forEach(lease => scheduler.release(lease));
+    const rotated = await scheduler.acquire("a");
+    assert.equal(rotated.account.index, 2);
+    scheduler.release(rotated);
+    scheduler.close();
+});
+
+test("concurrency config accepts independent capacities and rejects invalid account limits", () => {
+    const config = loadConfig({ GLOBAL_MAX_CONCURRENCY: "24", MAX_BROWSER_WORKERS: "1" });
+    assert.equal(config.globalConcurrency, 24);
+    assert.equal(config.accountConcurrency, 0);
+    assert.throws(() => loadConfig({ ACCOUNT_MAX_CONCURRENCY: "-1" }));
+    assert.throws(() => loadConfig({ ACCOUNT_MODEL_MAX_CONCURRENCY: '{"a":-1}' }));
+    assert.throws(() => loadConfig({ ACCOUNT_MODEL_MAX_CONCURRENCY: '{"a":"2"}' }));
+});
+
+test("a model needing a cold account eventually gets a context under sustained hot traffic", async () => {
+    const scheduler = setup({ globalConcurrency: 3, maxWorkers: 1 }, 2);
+    scheduler.slot(scheduler.account(0), "b").unsupported = true;
+    const running = await Promise.all([scheduler.acquire("a"), scheduler.acquire("a")]);
+    const minority = scheduler.acquire("b");
+    const hot = scheduler.acquire("a");
+    assert.equal(scheduler.pending.length, 2);
+    scheduler.release(running[0]);
+    assert.equal(scheduler.pending.length, 2);
+    scheduler.release(running[1]);
+    const b = await minority;
+    assert.equal(b.account.index, 1);
+    const a = await hot;
+    scheduler.release(a);
+    scheduler.release(b);
+    scheduler.close();
+});

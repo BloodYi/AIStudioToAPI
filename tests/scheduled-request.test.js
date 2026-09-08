@@ -287,3 +287,25 @@ test("503 and model permissions retry but malformed client requests do not", asy
         fixture.scheduler.close();
     }
 });
+
+test("concurrent streams on one account keep request IDs and response queues isolated", async () => {
+    const fixture = setup(
+        (index, req) => [
+            success[0],
+            { ...success[1], data: success[1].data.replace("hello", req.request_id) },
+            success[2],
+        ],
+        { scheduler: { globalConcurrency: 8, maxWorkers: 1 } }
+    );
+    const responses = Array.from({ length: 8 }, () => new Response());
+    await Promise.all(responses.map(res => fixture.handler.processOpenAIRequest(request("a", true), res)));
+    assert.equal(new Set(fixture.sent.map(entry => entry.index)).size, 1);
+    assert.equal(new Set(fixture.sent.map(entry => entry.request.request_id)).size, 8);
+    for (const { request: req } of fixture.sent) {
+        assert.equal(responses.filter(res => res.body.includes(req.request_id)).length, 1);
+    }
+    assert.equal(fixture.registry.messageQueues.size, 0);
+    assert.equal(fixture.scheduler.account(0).inflight, 0);
+    assert.equal(fixture.scheduler.account(0).models.a.success_count, 8);
+    fixture.scheduler.close();
+});

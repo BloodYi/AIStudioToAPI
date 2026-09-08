@@ -59,3 +59,24 @@ test("a delayed WebSocket close cannot remove a replacement connection", () => {
     registry._removeConnection({ _authIndex: 0 });
     assert.equal(registry.connectionsByAuth.get(0), replacement);
 });
+
+test("same account concurrent initialization creates only one context", async () => {
+    const manager = browserFixture(1);
+    let launches = 0;
+    const initialize = manager._initializeContext.bind(manager);
+    manager._initializeContext = async index => {
+        launches++;
+        await initialize(index);
+    };
+    await Promise.all(Array.from({ length: 12 }, () => manager.ensureWorkerContext(0)));
+    assert.equal(launches, 1);
+    assert.equal(manager.contexts.size, 1);
+});
+
+test("complete context initialization failure is classified at account scope", async () => {
+    const manager = browserFixture(1);
+    manager._initializeContext = async () => {
+        throw new Error("Build initialization failed");
+    };
+    await assert.rejects(manager.ensureWorkerContext(0), error => error.accountUnhealthy === true);
+});

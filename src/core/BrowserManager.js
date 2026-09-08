@@ -1507,7 +1507,13 @@ class BrowserManager {
                     await this.closeContext(idle, { keepBrowser: true });
                 }
                 this.initializingContexts.add(authIndex);
-                await this._initializeContext(authIndex);
+                try {
+                    await this._initializeContext(authIndex);
+                } catch (error) {
+                    // A complete account session initialization failure affects all its models.
+                    if (!isContextAbortedError(error)) error.accountUnhealthy = true;
+                    throw error;
+                }
                 this._startHealthMonitor(authIndex);
                 const workerState = this.contexts.get(authIndex);
                 workerState.noButtonCount = 0;

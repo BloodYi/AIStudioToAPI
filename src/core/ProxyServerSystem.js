@@ -111,6 +111,7 @@ class ProxyServerSystem extends EventEmitter {
             const { ModelScheduler } = require("./ModelScheduler");
             this.scheduler = new ModelScheduler(this.config.scheduler, this.authSource, this.logger);
             this.browserManager.scheduler = this.scheduler;
+            this.scheduler.browserManager = this.browserManager;
         }
         this.browserManager.setSystemBusyProvider(() => this.requestHandler?.isSystemBusy === true);
 

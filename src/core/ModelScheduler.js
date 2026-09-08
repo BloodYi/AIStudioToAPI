@@ -90,6 +90,20 @@ class ModelScheduler {
             });
     }
 
+    canLease(account, model) {
+        if (account.key === this.drainingAccount) return false;
+        const accountLimit = this.config.accountConcurrency || 0;
+        const modelLimit = this.config.accountModelConcurrency?.[model] ?? accountLimit;
+        if (accountLimit && account.inflight >= accountLimit) return false;
+        if (modelLimit && this.slot(account, model).inflight >= modelLimit) return false;
+        // Reserve context capacity synchronously, including contexts still initializing.
+        // Existing active accounts can share their context without consuming another slot.
+        return (
+            account.inflight > 0 ||
+            [...this.accounts.values()].filter(entry => entry.inflight > 0).length < this.config.maxWorkers
+        );
+    }
+
     active(model) {
         return this.workers.filter(worker => worker.lease?.model === model).length;
     }
@@ -139,6 +153,20 @@ class ModelScheduler {
                 item.reject(schedulerError(`No eligible accounts for model ${item.model}`));
             }
         }
+        // Stop replenishing one context when a waiting model needs a different account.
+        // Existing streams finish normally; this prevents permanent starvation at capacity.
+        const activeAccounts = [...this.accounts.values()].filter(account => account.inflight > 0);
+        const waitingForContext = this.pending.some(item => {
+            const candidates = this.candidates(item.model, item.excluded);
+            return candidates.length && candidates.every(account => !account.inflight);
+        });
+        if (waitingForContext && activeAccounts.length >= this.config.maxWorkers) {
+            if (!activeAccounts.some(account => account.key === this.drainingAccount)) {
+                this.drainingAccount = activeAccounts.sort((a, b) => a.inflight - b.inflight)[0].key;
+            }
+        } else {
+            this.drainingAccount = null;
+        }
         for (const worker of this.workers.filter(entry => !entry.lease)) {
             const options = this.pending.filter(item => {
                 const active = this.active(item.model);
@@ -153,7 +181,7 @@ class ModelScheduler {
                 return (
                     active < (this.config.modelConcurrency[item.model] ?? this.config.globalConcurrency) &&
                     (this.config.dynamic || active < staticLimit) &&
-                    this.candidates(item.model, item.excluded).some(account => !account.inflight)
+                    this.candidates(item.model, item.excluded).some(account => this.canLease(account, item.model))
                 );
             });
             const priority = item => {
@@ -164,11 +192,15 @@ class ModelScheduler {
             options.sort((a, b) => priority(a) - priority(b) || a.order - b.order);
             const item = options[0];
             if (!item) break;
-            const accounts = this.candidates(item.model, item.excluded).filter(account => !account.inflight);
+            const accounts = this.candidates(item.model, item.excluded).filter(account =>
+                this.canLease(account, item.model)
+            );
             accounts.sort((a, b) => {
                 const x = this.slot(a, item.model),
                     y = this.slot(b, item.model);
                 return (
+                    x.inflight - y.inflight ||
+                    a.inflight - b.inflight ||
                     (this.config.strategy === "least_used" ? x.request_count - y.request_count : 0) ||
                     x.last_used_at - y.last_used_at ||
                     (x.last_selected || 0) - (y.last_selected || 0) ||
@@ -197,6 +229,7 @@ class ModelScheduler {
     }
 
     startAttempt(lease) {
+        if (!lease || lease.attempted || lease.released) return;
         lease.attempted = true;
         lease.slot.request_count++;
         lease.slot.last_used_at = Date.now();
@@ -311,10 +344,17 @@ class ModelScheduler {
                 })
             ),
         }));
+        const contexts = this.browserManager?.contexts;
+        const activeContexts = contexts
+            ? [...contexts.keys()].filter(index => this.account(index).inflight > 0).length
+            : 0;
         return {
             accounts,
+            active_browser_workers: activeContexts,
             active_workers: this.workers.filter(worker => worker.lease).length,
+            idle_browser_workers: contexts ? contexts.size - activeContexts : 0,
             idle_workers: this.workers.filter(worker => !worker.lease).length,
+            max_browser_workers: this.config.maxWorkers,
             models: [...models].map(model => {
                 const slots = accounts.map(account => account.models[model]).filter(Boolean);
                 return {

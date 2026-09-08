@@ -22,7 +22,11 @@ function loadSchedulerConfig(env = process.env) {
         Number.isSafeInteger(legacyContexts) && legacyContexts > 0 ? legacyContexts : 1
     );
     const globalConcurrency = integer("GLOBAL_MAX_CONCURRENCY", maxWorkers);
-    if (globalConcurrency > maxWorkers) throw new Error("GLOBAL_MAX_CONCURRENCY exceeds MAX_BROWSER_WORKERS");
+    const accountConcurrency = integer("ACCOUNT_MAX_CONCURRENCY", 0, 0);
+    const accountModelConcurrency = object("ACCOUNT_MODEL_MAX_CONCURRENCY");
+    for (const value of Object.values(accountModelConcurrency)) {
+        if (!Number.isSafeInteger(value) || value < 0) throw new Error("Invalid ACCOUNT_MODEL_MAX_CONCURRENCY");
+    }
     const allocation = object("MODEL_WORKER_ALLOCATION");
     let preferredTotal = 0;
     for (const [model, value] of Object.entries(allocation)) {
@@ -51,6 +55,8 @@ function loadSchedulerConfig(env = process.env) {
             throw new Error(`Concurrency below minimum for ${model}`);
     }
     return {
+        accountConcurrency,
+        accountModelConcurrency,
         allocation,
         dynamic: env.ENABLE_DYNAMIC_WORKER_ALLOCATION !== "false",
         enabled: strategy !== "legacy",
