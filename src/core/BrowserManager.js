@@ -65,6 +65,12 @@ class BrowserManager {
         this._onAuthQueuesDrained = null;
         this._isSystemBusyProvider = null;
         this.pendingContextClosures = new Map();
+        this.contextDemand = new Map();
+        this.contextUnavailable = new Map();
+        this.closingContexts = new Set();
+        this._contextInitTasks = new Map();
+        this._contextPoolRunning = false;
+        this._ensureBrowserTask = null;
 
         // Background wakeup service status (instance-level, tracks this.page)
         // Prevents multiple BackgroundWakeup instances from running simultaneously
@@ -1483,47 +1489,200 @@ class BrowserManager {
      * Launch browser instance if not already running
      */
     async ensureWorkerContext(authIndex) {
-        // Serialize context creation/eviction, while already-ready contexts execute concurrently.
-        const existing = this.contexts.get(authIndex);
-        if (existing?.page && !existing.page.isClosed() && this.connectionRegistry.getConnectionByAuth(authIndex))
-            return;
-        const previous = this._workerContextTask || Promise.resolve();
-        const task = previous
-            .catch(() => {})
-            .then(async () => {
+        if (!this.scheduler) return this.launchOrSwitchContext(authIndex);
+        if (this.scheduler.closed) throw new Error("Scheduler is shutting down");
+        if (this.isContextReady(authIndex)) return;
+        this.requestContext(authIndex);
+        const deadline = Date.now() + this.scheduler.config.queueTimeoutMs;
+        while (!this.isContextReady(authIndex)) {
+            if (this.scheduler.closed) throw new Error("Scheduler is shutting down");
+            const unavailable = this.contextUnavailable.get(authIndex);
+            if (unavailable?.error && !this._contextInitTasks.has(authIndex)) throw unavailable.error;
+            if (Date.now() >= deadline) throw new Error(`Timeout waiting for ready context #${authIndex}`);
+            await new Promise(resolve => setTimeout(resolve, 25));
+        }
+    }
+
+    isContextReady(authIndex) {
+        const data = this.contexts.get(authIndex);
+        if (!data?.page || data.page.isClosed() || data.draining) return false;
+        const connection = this.connectionRegistry?.getConnectionByAuth(authIndex, false);
+        const connected = connection && (connection.readyState === undefined || connection.readyState === 1);
+        return Boolean(connected && !["RECONNECTING", "UNAVAILABLE"].includes(data.state));
+    }
+
+    isContextClosing(authIndex) {
+        return this.isClosingIntentionally || this.closingContexts.has(authIndex);
+    }
+
+    markContextState(authIndex, state, details = {}) {
+        const data = this.contexts.get(authIndex);
+        if (data) Object.assign(data, details, { state });
+        if (state === "UNAVAILABLE") this.contextUnavailable.set(authIndex, { ...details, at: Date.now() });
+        if (state === "READY") this.contextUnavailable.delete(authIndex);
+        this.scheduler?.drain();
+    }
+
+    getContextPoolSnapshot() {
+        const contexts = [...this.contexts.entries()].map(([authIndex, data]) => {
+            const inflight = this.scheduler?.account(authIndex).inflight || 0;
+            let state = data.state || "READY";
+            if (this.isContextReady(authIndex)) state = inflight > 0 ? "BUSY" : "READY";
+            return {
+                auth_index: authIndex,
+                connection_epoch: this.connectionRegistry?.getConnectionEpoch(authIndex) || null,
+                inflight,
+                last_disconnect_reason: data.lastDisconnectReason || null,
+                state,
+            };
+        });
+        for (const authIndex of this.initializingContexts) {
+            if (!contexts.some(item => item.auth_index === authIndex))
+                contexts.push({ auth_index: authIndex, connection_epoch: null, inflight: 0, state: "INITIALIZING" });
+        }
+        for (const [authIndex, info] of this.contextUnavailable) {
+            if (!contexts.some(item => item.auth_index === authIndex))
+                contexts.push({
+                    auth_index: authIndex,
+                    connection_epoch: null,
+                    inflight: 0,
+                    last_disconnect_reason: info.reason || info.error?.message || null,
+                    state: "UNAVAILABLE",
+                });
+        }
+        for (const authIndex of this.authSource.getRotationIndices()) {
+            if (!contexts.some(item => item.auth_index === authIndex)) {
+                contexts.push({ auth_index: authIndex, connection_epoch: null, inflight: 0, state: "COLD" });
+            }
+        }
+        return contexts.sort((a, b) => a.auth_index - b.auth_index);
+    }
+
+    startContextPool() {
+        if (!this.scheduler || this._contextPoolRunning) return;
+        this._contextPoolRunning = true;
+        this._pumpContextPool();
+    }
+
+    requestContext(authIndex, model = null) {
+        if (!this.scheduler || this.scheduler.closed || this.isContextReady(authIndex)) return;
+        this.contextDemand ??= new Map();
+        this.contextDemand.set(authIndex, { at: Date.now(), model });
+        this._pumpContextPool();
+    }
+
+    _poolCandidates() {
+        const rotation = this.authSource.getRotationIndices();
+        const demanded = [...(this.contextDemand?.keys() || [])].filter(index => rotation.includes(index));
+        const target = this.scheduler.config.contextPoolMinReady;
+        const readyCount = rotation.filter(index => this.isContextReady(index)).length;
+        const needWarm = Math.max(0, target - readyCount - this.initializingContexts.size);
+        const warm = needWarm
+            ? rotation
+                  .filter(index => {
+                      const unavailable = this.contextUnavailable.get(index);
+                      return (
+                          !demanded.includes(index) &&
+                          !this.isContextReady(index) &&
+                          !this.initializingContexts.has(index) &&
+                          (!unavailable?.retryAt || unavailable.retryAt <= Date.now())
+                      );
+                  })
+                  .slice(0, needWarm)
+            : [];
+        return [...demanded, ...warm].filter(index => {
+            const unavailable = this.contextUnavailable.get(index);
+            return (
+                !this.isContextReady(index) &&
+                !this.initializingContexts.has(index) &&
+                (!unavailable?.retryAt || unavailable.retryAt <= Date.now())
+            );
+        });
+    }
+
+    _pumpContextPool() {
+        if (!this.scheduler || this.scheduler.closed) return;
+        const limit = this.scheduler.config.contextInitConcurrency;
+        let available = limit - (this._contextInitTasks?.size || 0);
+        for (const authIndex of this._poolCandidates()) {
+            if (available-- <= 0) break;
+            this._startPooledContext(authIndex);
+        }
+    }
+
+    async _ensureBrowserForPool() {
+        if (this.browser) return;
+        if (!this._ensureBrowserTask) {
+            this._ensureBrowserTask = this._ensureBrowser().finally(() => {
+                this._ensureBrowserTask = null;
+            });
+        }
+        await this._ensureBrowserTask;
+    }
+
+    _startPooledContext(authIndex) {
+        if (this._contextInitTasks.has(authIndex)) return this._contextInitTasks.get(authIndex);
+        this.initializingContexts.add(authIndex);
+        let blockedByCapacity = false;
+        const task = (async () => {
+            try {
+                await this._ensureBrowserForPool();
                 if (this.scheduler.closed) throw new Error("Scheduler is shutting down");
-                await this._ensureBrowser();
-                if (this.scheduler.closed) {
-                    await this.closeBrowser();
-                    throw new Error("Scheduler is shutting down");
+                const stale = this.contexts.get(authIndex);
+                if (stale) {
+                    if (this.scheduler.account(authIndex).inflight > 0) {
+                        blockedByCapacity = true;
+                        return;
+                    }
+                    // closeContext waits for initialization markers, so temporarily
+                    // clear this task's marker while replacing a dead idle context.
+                    this.initializingContexts.delete(authIndex);
+                    await this.closeContext(authIndex, { keepBrowser: true });
+                    this.initializingContexts.add(authIndex);
                 }
-                const context = this.contexts.get(authIndex);
-                if (context?.page && !context.page.isClosed() && this.connectionRegistry.getConnectionByAuth(authIndex))
-                    return;
-                if (context) await this.closeContext(authIndex, { keepBrowser: true });
-                while (this.contexts.size >= this.scheduler.config.maxWorkers) {
-                    const idle = [...this.contexts.keys()].find(index => !this.scheduler.account(index).inflight);
-                    if (idle === undefined) throw new Error("No idle browser context available");
+                const occupancy = this.contexts.size + this.initializingContexts.size - 1;
+                if (occupancy >= this.scheduler.config.maxWorkers) {
+                    const idle = [...this.contexts.keys()].find(
+                        index => index !== authIndex && !this.scheduler.account(index).inflight
+                    );
+                    if (idle === undefined) {
+                        blockedByCapacity = true;
+                        return;
+                    }
                     await this.closeContext(idle, { keepBrowser: true });
                 }
-                this.initializingContexts.add(authIndex);
-                try {
-                    await this._initializeContext(authIndex);
-                } catch (error) {
-                    // A complete account session initialization failure affects all its models.
-                    if (!isContextAbortedError(error)) error.accountUnhealthy = true;
-                    throw error;
-                }
+                await this._initializeContext(authIndex, true);
+                const data = this.contexts.get(authIndex);
+                if (!data || !this.connectionRegistry.getConnectionByAuth(authIndex, false))
+                    throw Object.assign(new Error("WebSocket not ready after context initialization"), {
+                        reason: "connection_lost",
+                    });
+                Object.assign(data, { lastDisconnectReason: null, noButtonCount: 0, state: "READY" });
+                this.contextDemand.delete(authIndex);
+                this.contextUnavailable.delete(authIndex);
                 this._startHealthMonitor(authIndex);
-                const workerState = this.contexts.get(authIndex);
-                workerState.noButtonCount = 0;
-                this._startBackgroundWakeup(workerState).catch(error => {
+                this._startBackgroundWakeup(data).catch(error => {
                     this.logger.warn(`[Worker#${authIndex}] Wakeup stopped: ${error.message}`);
                 });
-                if (!this.connectionRegistry.getConnectionByAuth(authIndex))
-                    throw new Error("WebSocket not ready after context initialization");
-            });
-        this._workerContextTask = task;
+            } catch (error) {
+                if (!isContextAbortedError(error)) {
+                    const retryAt = Date.now() + 5000;
+                    this.contextUnavailable.set(authIndex, { at: Date.now(), error, reason: error.reason, retryAt });
+                    this.contextDemand.delete(authIndex);
+                    this.logger.error(`[ContextPool] Context #${authIndex} unavailable: ${error.message}`);
+                    const retryTimer = setTimeout(() => this._pumpContextPool(), 5000);
+                    retryTimer.unref?.();
+                }
+            } finally {
+                this.initializingContexts.delete(authIndex);
+                this._contextInitTasks.delete(authIndex);
+                if (!blockedByCapacity) {
+                    this.scheduler?.drain();
+                    this._pumpContextPool();
+                }
+            }
+        })();
+        this._contextInitTasks.set(authIndex, task);
         return task;
     }
 
@@ -1551,13 +1710,15 @@ class BrowserManager {
             ...(proxyConfig ? { proxy: proxyConfig } : {}),
         });
         this.browser.on("disconnected", () => {
-            if (!this.isClosingIntentionally) {
+            const unexpected = !this.isClosingIntentionally;
+            if (unexpected) {
                 this.logger.error("❌ [Browser] Main browser unexpectedly disconnected!");
             } else {
                 this.logger.debug("[Browser] Main browser closed intentionally.");
             }
             this.browser = null;
             this._cleanupAllContexts();
+            if (unexpected) setImmediate(() => this._pumpContextPool());
         });
         this.logger.info("✅ [Browser] Main browser instance launched successfully.");
     }
@@ -1969,7 +2130,15 @@ class BrowserManager {
      * Removes excess contexts and starts missing ones in background
      */
     async rebalanceContextPool() {
-        if (this.scheduler) return;
+        if (this.scheduler) {
+            const valid = new Set(this.authSource.getRotationIndices());
+            for (const index of this.contextDemand.keys()) if (!valid.has(index)) this.contextDemand.delete(index);
+            for (const index of this.contextUnavailable.keys())
+                if (!valid.has(index)) this.contextUnavailable.delete(index);
+            this.startContextPool();
+            this._pumpContextPool();
+            return;
+        }
         const maxContexts = this.config.maxContexts;
         // maxContexts === 0 means unlimited pool size
         const isUnlimited = maxContexts === 0;
@@ -2240,6 +2409,7 @@ class BrowserManager {
                     context,
                     healthMonitorInterval: null,
                     page,
+                    state: "READY",
                 });
             } else {
                 this._throwIfContextInitAborted(authIndex, isBackgroundTask);
@@ -2666,6 +2836,7 @@ class BrowserManager {
         }
 
         const contextData = this.contexts.get(authIndex);
+        this.closingContexts.add(authIndex);
 
         // Stop health monitor for this context
         if (contextData.healthMonitorInterval) {
@@ -2710,6 +2881,9 @@ class BrowserManager {
             }
         } catch (e) {
             this.logger.warn(`[Browser] Error closing context #${authIndex}: ${e.message}`);
+        } finally {
+            const cleanupTimer = setTimeout(() => this.closingContexts.delete(authIndex), 1000);
+            cleanupTimer.unref?.();
         }
 
         // If this was the last context, close the browser to free resources
@@ -2740,6 +2914,7 @@ class BrowserManager {
         this.initializingContexts.clear();
         this.abortedContexts.clear();
         this.pendingContextClosures.clear();
+        this.closingContexts.clear();
         this._wsInitState.clear();
         this.context = null;
         this.page = null;

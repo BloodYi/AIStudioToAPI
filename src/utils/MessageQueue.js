@@ -11,11 +11,14 @@ const { EventEmitter } = require("events");
  * Custom error class for queue closed errors
  */
 class QueueClosedError extends Error {
-    constructor(message = "Queue is closed", reason = "unknown") {
+    constructor(message = "Queue is closed", reason = "unknown", details = {}) {
         super(message);
         this.name = "QueueClosedError";
         this.code = "QUEUE_CLOSED";
         this.reason = reason;
+        this.kind = details.kind || "transport";
+        this.retryable = details.retryable ?? true;
+        this.cooldown = details.cooldown ?? false;
     }
 }
 
@@ -63,8 +66,7 @@ class MessageQueue extends EventEmitter {
 
     async dequeue(timeoutMs = this.defaultTimeout) {
         if (this.closed) {
-            const reason = this.closeReason || "unknown";
-            throw new QueueClosedError(`Queue is closed (reason: ${reason})`, reason);
+            throw this._closedError();
         }
         return new Promise((resolve, reject) => {
             // Check if there are already queued messages
@@ -108,10 +110,16 @@ class MessageQueue extends EventEmitter {
         this.closeReason = reason;
         this.waitingResolvers.forEach(resolver => {
             clearTimeout(resolver.timeoutId);
-            resolver.reject(new QueueClosedError(`Queue is closed (reason: ${reason})`, reason));
+            resolver.reject(this._closedError());
         });
         this.waitingResolvers = [];
         this.messages = [];
+    }
+
+    _closedError() {
+        const details = typeof this.closeReason === "object" ? this.closeReason : { reason: this.closeReason };
+        const reason = details.reason || "unknown";
+        return new QueueClosedError(`Queue is closed (reason: ${reason})`, reason, details);
     }
 }
 

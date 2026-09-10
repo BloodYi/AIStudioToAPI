@@ -6,6 +6,19 @@ const schedulerError = (message, status = 503) => Object.assign(new Error(messag
 
 function classifyError(error = {}) {
     if (isUserAbortedError(error) || error.reason === "client_disconnect") return "aborted";
+    if (
+        error.kind === "transport" ||
+        error.code === "QUEUE_CLOSED" ||
+        [
+            "page_closed",
+            "context_closed",
+            "connection_lost",
+            "reconnect_cleanup",
+            "grace_period_timeout",
+            "retry_replaced",
+        ].includes(error.kind || error.reason)
+    )
+        return "transport";
     if (error.accountUnhealthy) return "account";
     const status = Number(error.status ?? error.code);
     const message = String(error.message || "");
@@ -39,6 +52,12 @@ class ModelScheduler {
         this.workers = Array.from({ length: config.globalConcurrency }, (_, id) => ({ id, lease: null }));
         this.sequence = 0;
         this.closed = false;
+        this.metrics = {
+            dispatch_timeout: 0,
+            local_transport: 0,
+            samples: { context_wait_ms: [], http_headers_ms: [], model_first_output_ms: [], upstream_ttfb_ms: [] },
+            upstream_error: 0,
+        };
         this.load();
     }
 
@@ -75,7 +94,7 @@ class ModelScheduler {
         return slot;
     }
 
-    candidates(model, excluded) {
+    eligibleAccounts(model, excluded = new Set()) {
         return this.authSource
             .getRotationIndices()
             .map(index => this.account(index))
@@ -90,14 +109,27 @@ class ModelScheduler {
             });
     }
 
+    candidates(model, excluded = new Set()) {
+        return this.eligibleAccounts(model, excluded);
+    }
+
+    readyCandidates(model, excluded = new Set()) {
+        const eligible = this.eligibleAccounts(model, excluded);
+        if (!this.config.readyContextOnly || !this.browserManager) return eligible;
+        return eligible.filter(account => this.browserManager.isContextReady(account.index));
+    }
+
     canLease(account, model) {
         if (account.key === this.drainingAccount) return false;
         const accountLimit = this.config.accountConcurrency || 0;
         const modelLimit = this.config.accountModelConcurrency?.[model] ?? accountLimit;
         if (accountLimit && account.inflight >= accountLimit) return false;
         if (modelLimit && this.slot(account, model).inflight >= modelLimit) return false;
-        // Reserve context capacity synchronously, including contexts still initializing.
-        // Existing active accounts can share their context without consuming another slot.
+        if (this.config.readyContextOnly && this.browserManager) {
+            if (!this.browserManager.isContextReady(account.index)) return false;
+            const contextLimit = this.config.contextMaxConcurrency || 0;
+            return !contextLimit || account.inflight < contextLimit;
+        }
         return (
             account.inflight > 0 ||
             [...this.accounts.values()].filter(entry => entry.inflight > 0).length < this.config.maxWorkers
@@ -111,10 +143,10 @@ class ModelScheduler {
     acquire(model, excluded = new Set(), signal) {
         if (this.closed) return Promise.reject(schedulerError("Scheduler is shutting down"));
         if (signal?.aborted) return Promise.reject(schedulerError("Client disconnected", 499));
-        if (!this.candidates(model, excluded).length)
+        if (!this.eligibleAccounts(model, excluded).length)
             return Promise.reject(schedulerError(`No eligible accounts for model ${model}`));
         return new Promise((resolve, reject) => {
-            const item = { excluded, model, order: ++this.sequence, reject, resolve, signal };
+            const item = { createdAt: Date.now(), excluded, model, order: ++this.sequence, reject, resolve, signal };
             item.abort = () => {
                 this.remove(item);
                 reject(schedulerError("Client disconnected", 499));
@@ -130,6 +162,7 @@ class ModelScheduler {
                 } else {
                     item.timer = setTimeout(() => {
                         this.remove(item);
+                        this.metrics.dispatch_timeout++;
                         reject(schedulerError(`Queue timeout for model ${model}`, 504));
                     }, this.config.queueTimeoutMs);
                 }
@@ -148,11 +181,12 @@ class ModelScheduler {
         if (this.closed || this.paused) return;
         // Reservation and selection are synchronous: there is no await between checking and leasing.
         for (const item of [...this.pending]) {
-            if (!this.candidates(item.model, item.excluded).length) {
+            if (!this.eligibleAccounts(item.model, item.excluded).length) {
                 this.remove(item);
                 item.reject(schedulerError(`No eligible accounts for model ${item.model}`));
             }
         }
+        this._signalContextDemand();
         // Stop replenishing one context when a waiting model needs a different account.
         // Existing streams finish normally; this prevents permanent starvation at capacity.
         const activeAccounts = [...this.accounts.values()].filter(account => account.inflight > 0);
@@ -181,7 +215,7 @@ class ModelScheduler {
                 return (
                     active < (this.config.modelConcurrency[item.model] ?? this.config.globalConcurrency) &&
                     (this.config.dynamic || active < staticLimit) &&
-                    this.candidates(item.model, item.excluded).some(account => this.canLease(account, item.model))
+                    this.readyCandidates(item.model, item.excluded).some(account => this.canLease(account, item.model))
                 );
             });
             const priority = item => {
@@ -192,15 +226,20 @@ class ModelScheduler {
             options.sort((a, b) => priority(a) - priority(b) || a.order - b.order);
             const item = options[0];
             if (!item) break;
-            const accounts = this.candidates(item.model, item.excluded).filter(account =>
+            const accounts = this.readyCandidates(item.model, item.excluded).filter(account =>
                 this.canLease(account, item.model)
             );
             accounts.sort((a, b) => {
                 const x = this.slot(a, item.model),
                     y = this.slot(b, item.model);
+                const recentTransportFailures = account =>
+                    Date.now() - (account.last_transport_failure_at || 0) < 60000
+                        ? account.local_transport_failures || 0
+                        : 0;
                 return (
                     x.inflight - y.inflight ||
                     a.inflight - b.inflight ||
+                    recentTransportFailures(a) - recentTransportFailures(b) ||
                     (this.config.strategy === "least_used" ? x.request_count - y.request_count : 0) ||
                     x.last_used_at - y.last_used_at ||
                     (x.last_selected || 0) - (y.last_selected || 0) ||
@@ -224,7 +263,24 @@ class ModelScheduler {
             };
             worker.lease = lease;
             this.remove(item);
+            this.observe("context_wait_ms", Date.now() - item.createdAt);
             item.resolve(lease);
+        }
+    }
+
+    _signalContextDemand() {
+        if (!this.browserManager || !this.config.readyContextOnly) return;
+        const demanded = new Set();
+        for (const item of this.pending) {
+            if (this.readyCandidates(item.model, item.excluded).some(account => this.canLease(account, item.model)))
+                continue;
+            const cold = this.eligibleAccounts(item.model, item.excluded).find(
+                account => !demanded.has(account.index) && !this.browserManager.isContextReady(account.index)
+            );
+            if (cold && !demanded.has(cold.index)) {
+                demanded.add(cold.index);
+                this.browserManager.requestContext(cold.index, item.model);
+            }
         }
     }
 
@@ -240,9 +296,17 @@ class ModelScheduler {
         if (!lease || lease.recorded) return;
         const kind = classifyError(error);
         if (kind === "aborted") return;
+        if (kind === "transport") {
+            lease.recorded = true;
+            lease.account.local_transport_failures = (lease.account.local_transport_failures || 0) + 1;
+            lease.account.last_transport_failure_at = Date.now();
+            this.metrics.local_transport++;
+            return;
+        }
         lease.recorded = true;
         const { account, slot } = lease;
         slot.failure_count++;
+        this.metrics.upstream_error++;
         slot.consecutive_failures++;
         slot.last_error = String(error.message || "Request failed").slice(0, 2000);
         account.last_error = slot.last_error;
@@ -344,37 +408,76 @@ class ModelScheduler {
                 })
             ),
         }));
-        const contexts = this.browserManager?.contexts;
-        const activeContexts = contexts
-            ? [...contexts.keys()].filter(index => this.account(index).inflight > 0).length
-            : 0;
+        const contexts = this.browserManager?.getContextPoolSnapshot?.() || [];
+        const contextCount = state => contexts.filter(context => context.state === state).length;
+        const busyContexts = contextCount("BUSY");
+        const readyContexts = contextCount("READY") + busyContexts;
         return {
             accounts,
-            active_browser_workers: activeContexts,
+            active_browser_workers: busyContexts,
             active_workers: this.workers.filter(worker => worker.lease).length,
-            idle_browser_workers: contexts ? contexts.size - activeContexts : 0,
+            busy_browser_workers: busyContexts,
+            contexts,
+            idle_browser_workers: contextCount("READY"),
             idle_workers: this.workers.filter(worker => !worker.lease).length,
+            initializing_browser_workers: contextCount("INITIALIZING"),
             max_browser_workers: this.config.maxWorkers,
+            metrics: this.metricsSnapshot(),
             models: [...models].map(model => {
                 const slots = accounts.map(account => account.models[model]).filter(Boolean);
                 return {
                     active_workers: this.active(model),
-                    available_accounts: this.candidates(model, new Set()).length,
+                    available_accounts: this.eligibleAccounts(model, new Set()).length,
                     configured_workers: this.config.allocation[model] || { min: 0, preferred: 1 },
                     failures: slots.reduce((sum, slot) => sum + slot.failure_count, 0),
                     model,
                     queue_length: this.pending.filter(item => item.model === model).length,
                     rate_limited_accounts: slots.filter(slot => slot.rate_limited).length,
+                    ready_accounts: this.readyCandidates(model, new Set()).length,
                     requests: slots.reduce((sum, slot) => sum + slot.request_count, 0),
                     success: slots.reduce((sum, slot) => sum + slot.success_count, 0),
                 };
             }),
             queued_requests: this.pending.length,
+            ready_browser_workers: readyContexts,
+            reconnecting_browser_workers: contextCount("RECONNECTING"),
+            unavailable_browser_workers: contextCount("UNAVAILABLE"),
             workers: this.workers.map(worker => ({
                 account_id: worker.lease?.account.index ?? null,
                 id: worker.id,
                 model: worker.lease?.model ?? null,
             })),
+        };
+    }
+
+    observe(name, value) {
+        if (!Number.isFinite(value) || !this.metrics.samples[name]) return;
+        const samples = this.metrics.samples[name];
+        samples.push(Math.max(0, value));
+        if (samples.length > 1000) samples.splice(0, samples.length - 1000);
+    }
+
+    metricsSnapshot() {
+        const percentile = (values, fraction) => {
+            if (!values.length) return null;
+            const sorted = [...values].sort((a, b) => a - b);
+            return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)];
+        };
+        return {
+            dispatch_timeout: this.metrics.dispatch_timeout,
+            local_transport: this.metrics.local_transport,
+            timings: Object.fromEntries(
+                Object.entries(this.metrics.samples).map(([name, samples]) => [
+                    name,
+                    {
+                        count: samples.length,
+                        p50: percentile(samples, 0.5),
+                        p95: percentile(samples, 0.95),
+                        p99: percentile(samples, 0.99),
+                    },
+                ])
+            ),
+            upstream_error: this.metrics.upstream_error,
         };
     }
 

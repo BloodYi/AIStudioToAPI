@@ -38,6 +38,7 @@ class ConnectionRegistry extends EventEmitter {
         this.reconnectingAccounts = new Map();
         // Map: authIndex -> timeoutId, stores lightweight reconnect timeout timers
         this.lightweightReconnectTimeouts = new Map();
+        this.connectionEpochs = new Map();
     }
 
     addConnection(websocket, clientInfo) {
@@ -58,6 +59,7 @@ class ConnectionRegistry extends EventEmitter {
             this.logger.warn(
                 `[Server] Duplicate connection detected for authIndex=${authIndex}, closing old connection...`
             );
+            this.closeMessageQueuesForEpoch(authIndex, existingConnection._connectionEpoch, "connection_lost");
             try {
                 // Remove event listeners to prevent them from firing during close
                 existingConnection.removeAllListeners();
@@ -92,12 +94,9 @@ class ConnectionRegistry extends EventEmitter {
             this.logger.debug(`[Server] Cleared lightweight reconnect timeout for reconnected authIndex=${authIndex}`);
         }
 
-        // Clear message queues for the reconnecting account.
-        // When WebSocket disconnects, the browser aborts all in-flight requests for that account.
-        // Keeping those queues would cause them to hang until timeout.
-        this.closeMessageQueuesForAuth(authIndex, "reconnect_cleanup");
-
         // Store connection by authIndex
+        const connectionEpoch = (this.connectionEpochs.get(authIndex) || 0) + 1;
+        this.connectionEpochs.set(authIndex, connectionEpoch);
         this.connectionsByAuth.set(authIndex, websocket);
         this.logger.info(
             `[Server] Internal WebSocket client connected (from: ${clientInfo.address}, authIndex: ${authIndex})`
@@ -105,17 +104,20 @@ class ConnectionRegistry extends EventEmitter {
 
         // Store authIndex on websocket for cleanup
         websocket._authIndex = authIndex;
+        websocket._connectionEpoch = connectionEpoch;
 
-        websocket.on("message", data => this._handleIncomingMessage(data.toString(), authIndex));
+        websocket.on("message", data => this._handleIncomingMessage(data.toString(), authIndex, connectionEpoch));
         websocket.on("close", () => this._removeConnection(websocket));
         websocket.on("error", error =>
             this.logger.error(`[Server] Internal WebSocket connection error: ${error.message}`)
         );
         this.emit("connectionAdded", websocket);
+        this.browserManager?.markContextState(authIndex, "READY", { connectionEpoch });
     }
 
     _removeConnection(websocket) {
         const disconnectedAuthIndex = websocket._authIndex;
+        const disconnectedEpoch = websocket._connectionEpoch;
         // An old context can finish closing after its replacement has connected.
         const current = this.connectionsByAuth.get(disconnectedAuthIndex);
         if (current && current !== websocket) return;
@@ -123,6 +125,10 @@ class ConnectionRegistry extends EventEmitter {
         // Remove from connectionsByAuth if it has an authIndex
         if (disconnectedAuthIndex !== undefined && disconnectedAuthIndex >= 0) {
             this.connectionsByAuth.delete(disconnectedAuthIndex);
+            this.closeMessageQueuesForEpoch(disconnectedAuthIndex, disconnectedEpoch, "connection_lost");
+            this.browserManager?.markContextState(disconnectedAuthIndex, "RECONNECTING", {
+                lastDisconnectReason: "connection_lost",
+            });
             this.logger.info(`[Server] Internal WebSocket client disconnected (authIndex: ${disconnectedAuthIndex}).`);
         } else {
             this.logger.info("[Server] Internal WebSocket client disconnected.");
@@ -136,6 +142,7 @@ class ConnectionRegistry extends EventEmitter {
         if (this.browserManager) {
             const contextData = this.browserManager.contexts.get(disconnectedAuthIndex);
             if (!contextData || !contextData.page || contextData.page.isClosed()) {
+                const intentionalClose = this.browserManager.isContextClosing?.(disconnectedAuthIndex);
                 this.logger.info(
                     `[Server] Account #${disconnectedAuthIndex} page is closed/missing, skipping reconnect logic.`
                 );
@@ -160,6 +167,10 @@ class ConnectionRegistry extends EventEmitter {
                 // Close pending message queues for this account to prevent in-flight requests
                 // from hanging until timeout
                 this.closeMessageQueuesForAuth(disconnectedAuthIndex, "page_closed");
+                if (!intentionalClose)
+                    this.browserManager?.markContextState(disconnectedAuthIndex, "UNAVAILABLE", {
+                        lastDisconnectReason: "page_closed",
+                    });
                 // Emit event after all cleanup is done
                 this.emit("connectionRemoved", websocket);
                 return;
@@ -182,7 +193,7 @@ class ConnectionRegistry extends EventEmitter {
             // Close queues belonging to the disconnected account.
             // Since queues are now bound to authIndex, this is safe even if the current account
             // has since switched — only account #disconnectedAuthIndex's queues are affected.
-            this.closeMessageQueuesForAuth(disconnectedAuthIndex, "grace_period_timeout");
+            this.closeMessageQueuesForEpoch(disconnectedAuthIndex, disconnectedEpoch, "grace_period_timeout");
 
             // Attempt lightweight reconnect if callback is provided and this account is not already reconnecting
             const isAccountReconnecting = this.reconnectingAccounts.get(disconnectedAuthIndex) || false;
@@ -232,6 +243,12 @@ class ConnectionRegistry extends EventEmitter {
                     }
                     this.lightweightReconnectTimeouts.delete(disconnectedAuthIndex);
                     this.reconnectingAccounts.delete(disconnectedAuthIndex);
+                    if (!this.connectionsByAuth.has(disconnectedAuthIndex)) {
+                        this.browserManager?.markContextState(disconnectedAuthIndex, "UNAVAILABLE", {
+                            lastDisconnectReason: "reconnect_failed",
+                        });
+                        this.browserManager?.requestContext(disconnectedAuthIndex);
+                    }
                 }
             }
 
@@ -246,8 +263,9 @@ class ConnectionRegistry extends EventEmitter {
         this.emit("connectionRemoved", websocket);
     }
 
-    _handleIncomingMessage(messageData, messageAuthIndex) {
+    _handleIncomingMessage(messageData, messageAuthIndex, connectionEpoch = null) {
         try {
+            connectionEpoch ??= this.getConnectionEpoch(messageAuthIndex);
             const parsedMessage = JSON.parse(messageData);
             const requestId = parsedMessage.request_id;
             if (!requestId) {
@@ -262,6 +280,12 @@ class ConnectionRegistry extends EventEmitter {
                         `[Server] Received message for request ${requestId} from wrong account: ` +
                             `expected authIndex=${entry.authIndex}, got authIndex=${messageAuthIndex}. ` +
                             `Message discarded (likely a delayed response after account switch).`
+                    );
+                    return;
+                }
+                if (entry.connectionEpoch != null && connectionEpoch !== entry.connectionEpoch) {
+                    this.logger.warn(
+                        `[Server] Received stale message for request ${requestId}: expected epoch=${entry.connectionEpoch}, got epoch=${connectionEpoch}`
                     );
                     return;
                 }
@@ -326,6 +350,16 @@ class ConnectionRegistry extends EventEmitter {
         }
 
         return connection;
+    }
+
+    getConnectionEpoch(authIndex) {
+        const connection = this.connectionsByAuth.get(authIndex);
+        if (!connection) return null;
+        if (!connection._connectionEpoch) {
+            connection._connectionEpoch = this.connectionEpochs.get(authIndex) || 1;
+            this.connectionEpochs.set(authIndex, connection._connectionEpoch);
+        }
+        return connection._connectionEpoch;
     }
 
     /**
@@ -450,10 +484,19 @@ class ConnectionRegistry extends EventEmitter {
             }
         }
 
+        const connectionEpoch = this.getConnectionEpoch(authIndex);
+        if (connectionEpoch == null) {
+            throw Object.assign(new Error(`No ready WebSocket for account #${authIndex}`), {
+                kind: "transport",
+                reason: "connection_lost",
+                status: 503,
+            });
+        }
         const queue = new MessageQueue();
         // Add timestamp for stale queue detection
         this.messageQueues.set(requestId, {
             authIndex,
+            connectionEpoch,
             createdAt: Date.now(),
             queue,
             requestAttemptId,
@@ -494,6 +537,25 @@ class ConnectionRegistry extends EventEmitter {
     getRequestAttemptIdForRequest(requestId) {
         const entry = this.messageQueues.get(requestId);
         return entry ? entry.requestAttemptId || null : null;
+    }
+
+    getMessageQueuesForEpoch(authIndex, connectionEpoch) {
+        return [...this.messageQueues.entries()]
+            .filter(([, entry]) => entry.authIndex === authIndex && entry.connectionEpoch === connectionEpoch)
+            .map(([requestId, entry]) => ({ requestId, ...entry }));
+    }
+
+    closeMessageQueuesForEpoch(authIndex, connectionEpoch, reason = "connection_lost") {
+        if (connectionEpoch == null) return 0;
+        let count = 0;
+        for (const [requestId, entry] of this.messageQueues.entries()) {
+            if (entry.authIndex !== authIndex || entry.connectionEpoch !== connectionEpoch) continue;
+            entry.queue.close({ cooldown: false, kind: "transport", reason, retryable: true });
+            this.messageQueues.delete(requestId);
+            count++;
+        }
+        if (count) this._emitAuthQueuesDrainedIfNeeded(authIndex);
+        return count;
     }
 
     /**

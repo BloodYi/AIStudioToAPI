@@ -6,9 +6,60 @@
             {{ t("schedulerQueued") }}: {{ data.queued_requests }}
         </p>
         <p>
-            {{ t("schedulerBrowserContexts") }}: {{ data.active_browser_workers }} / {{ data.max_browser_workers }} ·
-            {{ t("schedulerIdleContexts") }}: {{ data.idle_browser_workers }}
+            {{ t("schedulerReadyContexts") }}: {{ data.ready_browser_workers }} · {{ t("schedulerBusyContexts") }}:
+            {{ data.busy_browser_workers }} · {{ t("schedulerIdleContexts") }}: {{ data.idle_browser_workers }} ·
+            {{ t("schedulerInitializingContexts") }}: {{ data.initializing_browser_workers }} ·
+            {{ t("schedulerReconnectingContexts") }}: {{ data.reconnecting_browser_workers }} ·
+            {{ t("schedulerUnavailableContexts") }}: {{ data.unavailable_browser_workers }} /
+            {{ data.max_browser_workers }}
         </p>
+        <div class="scheduler-table">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Context</th>
+                        <th>{{ t("schedulerStatus") }}</th>
+                        <th>{{ t("schedulerInflight") }}</th>
+                        <th>WS Epoch</th>
+                        <th>{{ t("schedulerLastDisconnect") }}</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr v-for="context in data.contexts" :key="context.auth_index">
+                        <td>#{{ context.auth_index }}</td>
+                        <td>{{ context.state }}</td>
+                        <td>{{ context.inflight }}</td>
+                        <td>{{ context.connection_epoch || "—" }}</td>
+                        <td>{{ context.last_disconnect_reason || "—" }}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <p v-if="data.metrics">
+            {{ t("schedulerLocalTransport") }}: {{ data.metrics.local_transport }} ·
+            {{ t("schedulerDispatchTimeout") }}: {{ data.metrics.dispatch_timeout }} ·
+            {{ t("schedulerUpstreamErrors") }}: {{ data.metrics.upstream_error }}
+        </p>
+        <div v-if="data.metrics" class="scheduler-table">
+            <table>
+                <thead>
+                    <tr>
+                        <th>{{ t("schedulerTiming") }}</th>
+                        <th>p50</th>
+                        <th>p95</th>
+                        <th>p99</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr v-for="(timing, name) in data.metrics.timings" :key="name">
+                        <td>{{ name }}</td>
+                        <td>{{ timing.p50 ?? "—" }} ms</td>
+                        <td>{{ timing.p95 ?? "—" }} ms</td>
+                        <td>{{ timing.p99 ?? "—" }} ms</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
         <button :disabled="busy" @click="resetAllRateLimits">
             {{ t("schedulerResetAll429") }}
         </button>

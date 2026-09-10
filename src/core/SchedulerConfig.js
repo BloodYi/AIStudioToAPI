@@ -22,6 +22,9 @@ function loadSchedulerConfig(env = process.env) {
         Number.isSafeInteger(legacyContexts) && legacyContexts > 0 ? legacyContexts : 1
     );
     const globalConcurrency = integer("GLOBAL_MAX_CONCURRENCY", maxWorkers);
+    const contextMaxConcurrency = integer("CONTEXT_MAX_CONCURRENCY", 0, 0);
+    const contextPoolMinReady = integer("CONTEXT_POOL_MIN_READY", maxWorkers, 0);
+    if (contextPoolMinReady > maxWorkers) throw new Error("CONTEXT_POOL_MIN_READY exceeds MAX_BROWSER_WORKERS");
     const accountConcurrency = integer("ACCOUNT_MAX_CONCURRENCY", 0, 0);
     const accountModelConcurrency = object("ACCOUNT_MODEL_MAX_CONCURRENCY");
     for (const value of Object.values(accountModelConcurrency)) {
@@ -58,6 +61,9 @@ function loadSchedulerConfig(env = process.env) {
         accountConcurrency,
         accountModelConcurrency,
         allocation,
+        contextInitConcurrency: integer("CONTEXT_INIT_CONCURRENCY", 2),
+        contextMaxConcurrency,
+        contextPoolMinReady,
         dynamic: env.ENABLE_DYNAMIC_WORKER_ALLOCATION !== "false",
         enabled: strategy !== "legacy",
         globalConcurrency,
@@ -65,10 +71,13 @@ function loadSchedulerConfig(env = process.env) {
         maxWorkers,
         modelConcurrency,
         queueSize: integer("MODEL_QUEUE_SIZE", 100, 0),
-        queueTimeoutMs: integer("MODEL_QUEUE_TIMEOUT_MS", 120000),
+        queueTimeoutMs: integer("REQUEST_DISPATCH_TIMEOUT_MS", integer("MODEL_QUEUE_TIMEOUT_MS", 120000)),
         rateLimitCooldownMs: integer("RATE_LIMIT_COOLDOWN", 3600) * 1000,
+        readyContextOnly: env.SCHEDULER_READY_CONTEXT_ONLY !== "false",
         statePath: env.SCHEDULER_STATE_PATH || path.join(process.cwd(), "data", "scheduler-state.json"),
         strategy,
+        streamEarlyHeaders: env.STREAM_EARLY_HEADERS !== "false",
+        streamKeepaliveIntervalMs: integer("STREAM_KEEPALIVE_INTERVAL_MS", 10000, 1000),
         tempErrorCooldownMs: integer("TEMP_ERROR_COOLDOWN", 30) * 1000,
     };
 }

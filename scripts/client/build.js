@@ -233,7 +233,7 @@ class RequestProcessor {
         // Browser-side safety cap. Server-side timeouts can be configured with env vars.
         const IDLE_TIMEOUT_DURATION = 300000; // 300 seconds (5 minutes)
         const abortController = new AbortController();
-        const activeOperation = { abortController, requestAttemptId };
+        const activeOperation = { abortController, requestAttemptId, startedAt: performance.now(), ttfbMs: null };
         this.activeOperations.set(operationId, activeOperation);
 
         let timeoutId = null;
@@ -265,6 +265,10 @@ class RequestProcessor {
                 const requestConfig = this._buildRequestConfig(requestSpec, abortController.signal);
 
                 const response = await fetch(requestUrl, requestConfig);
+                activeOperation.ttfbMs = Math.round(performance.now() - activeOperation.startedAt);
+                Logger.debug(
+                    `Fetch headers received for #${operationId} in ${activeOperation.ttfbMs}ms; active fetches=${this.activeOperations.size}`
+                );
 
                 if (!response.ok) {
                     const errorBody = await response.text();
@@ -934,6 +938,10 @@ class ProxySystem extends EventTarget {
         this.connectionManager.transmit({
             event_type: "response_headers",
             headers: headerMap,
+            metrics: {
+                active_fetches: this.requestProcessor.activeOperations.size,
+                upstream_ttfb_ms: this.requestProcessor.activeOperations.get(operationId)?.ttfbMs ?? null,
+            },
             request_attempt_id: requestAttemptId,
             request_id: operationId,
             status: response.status,
@@ -961,12 +969,25 @@ class ProxySystem extends EventTarget {
 
     _sendErrorResponse(error, operationId, requestAttemptId) {
         if (!operationId) return;
+        const status = Number(error.status) || 0;
+        const kind =
+            status === 429
+                ? "upstream_rate_limited"
+                : status >= 500
+                  ? "upstream_5xx"
+                  : status
+                    ? "upstream"
+                    : "transport";
         this.connectionManager.transmit({
+            cooldown: status === 429 || status >= 500,
             event_type: "error",
+            kind,
             message: `Proxy browser error: ${error.message || "Unknown error"}`,
+            reason: kind === "transport" ? "connection_lost" : kind,
             request_attempt_id: requestAttemptId,
             request_id: operationId,
-            status: error.status || 504,
+            retryable: status === 429 || status >= 500 || kind === "transport",
+            status: error.status || 503,
         });
         // --- Core modification: Use different log wording based on error type ---
         if (error.name === "AbortError") {

@@ -291,3 +291,93 @@ test("a model needing a cold account eventually gets a context under sustained h
     scheduler.release(b);
     scheduler.close();
 });
+
+test("ready-only scheduling spreads leases and signals cold context demand", async () => {
+    const scheduler = setup(
+        { contextMaxConcurrency: 0, globalConcurrency: 12, maxWorkers: 3, readyContextOnly: true },
+        4
+    );
+    const ready = new Set([0, 1, 2]);
+    const demands = [];
+    scheduler.browserManager = {
+        isContextReady: index => ready.has(index),
+        requestContext: (index, model) => demands.push({ index, model }),
+    };
+    const leases = await Promise.all(Array.from({ length: 12 }, () => scheduler.acquire("a")));
+    assert.deepEqual(
+        [0, 1, 2].map(index => scheduler.account(index).inflight),
+        [4, 4, 4]
+    );
+    leases.forEach(lease => scheduler.release(lease));
+    ready.clear();
+    const controller = new AbortController();
+    const waiting = scheduler.acquire("cold", new Set(), controller.signal);
+    assert.deepEqual(demands.at(-1), { index: 0, model: "cold" });
+    controller.abort();
+    await assert.rejects(waiting, /Client disconnected/);
+    scheduler.close();
+});
+
+test("local queue and WebSocket failures never cool account-model state", async () => {
+    const scheduler = setup({}, 1);
+    for (const reason of ["page_closed", "connection_lost", "grace_period_timeout"]) {
+        const lease = await scheduler.acquire("a");
+        scheduler.failure(lease, { code: "QUEUE_CLOSED", reason });
+        assert.equal(lease.slot.cooldown_until, 0);
+        assert.equal(lease.slot.failure_count, 0);
+        scheduler.release(lease);
+    }
+    assert.equal(scheduler.metrics.local_transport, 3);
+    scheduler.close();
+});
+
+test("new context configuration validates pool and capacity limits", () => {
+    const config = loadConfig({
+        CONTEXT_INIT_CONCURRENCY: "3",
+        CONTEXT_MAX_CONCURRENCY: "5",
+        CONTEXT_POOL_MIN_READY: "4",
+        MAX_BROWSER_WORKERS: "6",
+        REQUEST_DISPATCH_TIMEOUT_MS: "25000",
+    });
+    assert.equal(config.contextInitConcurrency, 3);
+    assert.equal(config.contextMaxConcurrency, 5);
+    assert.equal(config.contextPoolMinReady, 4);
+    assert.equal(config.queueTimeoutMs, 25000);
+    assert.throws(() => loadConfig({ CONTEXT_POOL_MIN_READY: "3", MAX_BROWSER_WORKERS: "2" }));
+});
+
+test("100 requests spread across 12 ready contexts without header-style serialization", async () => {
+    const scheduler = setup(
+        { contextMaxConcurrency: 0, globalConcurrency: 100, maxWorkers: 12, readyContextOnly: true },
+        12
+    );
+    scheduler.browserManager = { isContextReady: () => true, requestContext() {} };
+    const leases = await Promise.all(Array.from({ length: 100 }, () => scheduler.acquire("a")));
+    const distribution = Array.from({ length: 12 }, (_, index) => scheduler.account(index).inflight);
+    assert.equal(
+        distribution.reduce((sum, value) => sum + value, 0),
+        100
+    );
+    assert.ok(Math.max(...distribution) - Math.min(...distribution) <= 1);
+    leases.forEach(lease => scheduler.release(lease));
+    scheduler.close();
+});
+
+test("cold model demand does not block requests using an existing ready context", async () => {
+    const scheduler = setup({ contextPoolMinReady: 1, globalConcurrency: 2, maxWorkers: 2, readyContextOnly: true }, 2);
+    scheduler.slot(scheduler.account(0), "cold-model").unsupported = true;
+    const demanded = [];
+    scheduler.browserManager = {
+        isContextReady: index => index === 0,
+        requestContext: index => demanded.push(index),
+    };
+    const controller = new AbortController();
+    const cold = scheduler.acquire("cold-model", new Set(), controller.signal);
+    const hot = await scheduler.acquire("hot-model");
+    assert.equal(hot.account.index, 0);
+    assert.ok(demanded.includes(1));
+    controller.abort();
+    await assert.rejects(cold);
+    scheduler.release(hot);
+    scheduler.close();
+});

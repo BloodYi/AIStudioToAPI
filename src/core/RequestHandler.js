@@ -252,6 +252,13 @@ class RequestHandler {
 
     _isConnectionResetError(error) {
         if (!error) return false;
+        if (
+            error.kind === "transport" ||
+            ["page_closed", "context_closed", "connection_lost", "reconnect_cleanup", "grace_period_timeout"].includes(
+                error.reason
+            )
+        )
+            return true;
         // Check for QueueClosedError type
         if (error instanceof QueueClosedError) return true;
         // Check for error code
@@ -316,7 +323,7 @@ class RequestHandler {
 
         try {
             const errorMessage = `Stream interrupted: ${error.reason === "page_closed" ? "Account context closed" : error.reason || "Connection lost"}`;
-            this._markTrackedResponseError(res, errorMessage, 503);
+            this._markTrackedResponseError(res, errorMessage, 503, "local_transport");
 
             if (format === "claude") {
                 // Claude format: event: error\ndata: {...}
@@ -388,6 +395,7 @@ class RequestHandler {
             let errorPayload;
             let trackingStatus = 500;
             let trackingMessage = String(error?.message ?? error);
+            let trackingOutcome = "error";
 
             if (error.code === "QUEUE_TIMEOUT" || error instanceof QueueTimeoutError) {
                 // True timeout error - 504
@@ -446,6 +454,7 @@ class RequestHandler {
             } else if (error.code === "QUEUE_CLOSED" || error instanceof QueueClosedError) {
                 // Queue closed (account switch, system reset, etc.) - 503
                 trackingStatus = 503;
+                trackingOutcome = "local_transport";
                 trackingMessage = `Service unavailable: ${trackingMessage}`;
                 if (format === "openai") {
                     errorPayload = {
@@ -502,7 +511,7 @@ class RequestHandler {
                 throw error;
             }
 
-            this._markTrackedResponseError(res, trackingMessage, trackingStatus);
+            this._markTrackedResponseError(res, trackingMessage, trackingStatus, trackingOutcome);
         } catch (writeError) {
             this.logger.debug(`[Request] Failed to write fake stream error to client: ${writeError.message}`);
             // If write failed or unexpected error, rethrow original error
@@ -1354,11 +1363,13 @@ class RequestHandler {
                         this.authSwitcher.failureCount = 0;
                     }
 
-                    res.status(200).set({
-                        "Cache-Control": "no-cache",
-                        Connection: "keep-alive",
-                        "Content-Type": "text/event-stream",
-                    });
+                    if (!res.headersSent) {
+                        res.status(200).set({
+                            "Cache-Control": "no-cache",
+                            Connection: "keep-alive",
+                            "Content-Type": "text/event-stream",
+                        });
+                    }
                     this.logger.info(`[Request] OpenAI streaming response (Real Mode) started...`);
                     await this._streamOpenAIResponse(currentQueue, res, model, requestId);
                 } else {
@@ -1770,11 +1781,13 @@ class RequestHandler {
                         this.authSwitcher.failureCount = 0;
                     }
 
-                    res.status(200).set({
-                        "Cache-Control": "no-cache",
-                        Connection: "keep-alive",
-                        "Content-Type": "text/event-stream",
-                    });
+                    if (!res.headersSent) {
+                        res.status(200).set({
+                            "Cache-Control": "no-cache",
+                            Connection: "keep-alive",
+                            "Content-Type": "text/event-stream",
+                        });
+                    }
                     this.logger.info(`[Request] OpenAI Response API streaming response (Real Mode) started...`);
                     await this._streamOpenAIResponseAPIResponse(currentQueue, res, model, {
                         requestId,
@@ -2145,11 +2158,13 @@ class RequestHandler {
                         this.authSwitcher.failureCount = 0;
                     }
 
-                    res.status(200).set({
-                        "Cache-Control": "no-cache",
-                        Connection: "keep-alive",
-                        "Content-Type": "text/event-stream",
-                    });
+                    if (!res.headersSent) {
+                        res.status(200).set({
+                            "Cache-Control": "no-cache",
+                            Connection: "keep-alive",
+                            "Content-Type": "text/event-stream",
+                        });
+                    }
                     this.logger.info(`[Request] Claude streaming response (Real Mode) started...`);
                     await this._streamClaudeResponse(currentQueue, res, model, requestId);
                 } else {
@@ -3832,6 +3847,7 @@ class RequestHandler {
     }
 
     _setResponseHeaders(res, headerMessage, req) {
+        if (res.headersSent) return;
         res.status(headerMessage.status || 200);
         const headers = headerMessage.headers || {};
 
@@ -3930,7 +3946,12 @@ class RequestHandler {
                             errorMessage = `Service unavailable: ${errorMsg}`;
                         }
 
-                        this._markTrackedResponseError(res, errorMessage, errorCode);
+                        this._markTrackedResponseError(
+                            res,
+                            errorMessage,
+                            errorCode,
+                            this._isConnectionResetError(error) ? "local_transport" : "error"
+                        );
 
                         if (format === "response_api") {
                             if (res.__responseApiSeq == null) res.__responseApiSeq = 0;
@@ -3997,7 +4018,13 @@ class RequestHandler {
                             status = 503;
                             errorType = this._getDefaultErrorType(format, status);
                         }
-                        this._sendErrorChunkToClient(res, `Processing failed: ${errorMsg}`, status, errorType);
+                        this._sendErrorChunkToClient(
+                            res,
+                            `Processing failed: ${errorMsg}`,
+                            status,
+                            errorType,
+                            this._isConnectionResetError(error) ? "local_transport" : "error"
+                        );
                     } catch (writeError) {
                         const writeErrorMsg = String(writeError?.message ?? writeError);
                         this.logger.error(
@@ -4087,7 +4114,7 @@ class RequestHandler {
         );
     }
 
-    _sendErrorChunkToClient(res, message, statusCode = 500, errorType = null) {
+    _sendErrorChunkToClient(res, message, statusCode = 500, errorType = null, outcome = "error") {
         const format = this._resolveErrorFormat(res);
         const resolvedErrorType = errorType || this._getDefaultErrorType(format, statusCode);
         if (!res.headersSent) {
@@ -4095,7 +4122,7 @@ class RequestHandler {
             res.setHeader("Cache-Control", "no-cache");
             res.setHeader("Connection", "keep-alive");
         }
-        this._markTrackedResponseError(res, message, statusCode);
+        this._markTrackedResponseError(res, message, statusCode, outcome);
         // Check if response is still writable before attempting to write
         if (this._isResponseWritable(res)) {
             try {

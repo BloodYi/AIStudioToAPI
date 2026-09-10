@@ -20,6 +20,24 @@ class ScheduledRequestHandler extends RequestHandler {
         this.controller = new AbortController();
         this.response = res;
         this.incomingRequest = req;
+        this._acceptedAt = Date.now();
+        res.__modelOutputStarted = false;
+        res.__keepaliveSent = false;
+        if (typeof res.write === "function") {
+            const write = res.write.bind(res);
+            res.write = (chunk, ...args) => {
+                const text = Buffer.isBuffer(chunk) ? chunk.toString() : String(chunk ?? "");
+                if (!/^:\s*(?:accepted|keep-alive)\s*\n\n$/.test(text) && text !== "event: ping\ndata: {}\n\n") {
+                    if (!res.__modelOutputStarted)
+                        this.scheduler.observe("model_first_output_ms", Date.now() - this._acceptedAt);
+                    res.__modelOutputStarted = true;
+                    this._stopEarlyStreamKeepalive();
+                } else if (text.includes("keep-alive") || text.startsWith("event: ping")) {
+                    res.__keepaliveSent = true;
+                }
+                return write(chunk, ...args);
+            };
+        }
         this.onClose = () => {
             if (!res.writableFinished) this.controller.abort();
         };
@@ -30,20 +48,46 @@ class ScheduledRequestHandler extends RequestHandler {
                 if (property === "createMessageQueue")
                     return (...args) => {
                         const queue = target.createMessageQueue(...args);
-                        const dequeue = queue.dequeue.bind(queue);
-                        const lease = this.lease;
+                        let activeQueue = queue;
+                        let dequeue = activeQueue.dequeue.bind(activeQueue);
                         let fileBody = "";
                         queue.dequeue = async (...params) => {
-                            const message = await dequeue(...params);
-                            if (message.event_type === "error") this.scheduler.failure(lease, message);
-                            if (lease.model === "__files__") {
+                            let message;
+                            // A queue may move to another ready context before model output starts.
+                            // Keep the wrapper stable so RequestHandler's streaming loops do not need
+                            // to know that the underlying attempt changed.
+                            // eslint-disable-next-line no-constant-condition
+                            while (true) {
+                                try {
+                                    message = await dequeue(...params);
+                                    if (
+                                        message.event_type === "error" &&
+                                        classifyError(message) === "transport" &&
+                                        !this.response.__modelOutputStarted
+                                    ) {
+                                        activeQueue = await this._retryTransportQueue(message, target);
+                                        dequeue = activeQueue.dequeue.bind(activeQueue);
+                                        continue;
+                                    }
+                                    break;
+                                } catch (error) {
+                                    if (classifyError(error) !== "transport" || this.response.__modelOutputStarted)
+                                        throw error;
+                                    activeQueue = await this._retryTransportQueue(error, target);
+                                    dequeue = activeQueue.dequeue.bind(activeQueue);
+                                }
+                            }
+                            if (message.event_type === "error") this.scheduler.failure(this.lease, message);
+                            if (message.metrics?.upstream_ttfb_ms != null)
+                                this.scheduler.observe("upstream_ttfb_ms", message.metrics.upstream_ttfb_ms);
+                            if (this.lease.model === "__files__") {
                                 if (message.headers)
-                                    rememberUploadHeaders(this.scheduler, message.headers, lease.account.key);
+                                    rememberUploadHeaders(this.scheduler, message.headers, this.lease.account.key);
                                 if (message.data && fileBody.length < 1048576) fileBody += message.data;
                                 if (message.type === "STREAM_END") {
                                     try {
                                         for (const key of fileKeys(JSON.parse(fileBody)))
-                                            this.scheduler.fileAffinities.set(key, lease.account.key);
+                                            this.scheduler.fileAffinities.set(key, this.lease.account.key);
                                         this.scheduler.saveSoon();
                                     } catch {
                                         /* Non-JSON file operation response. */
@@ -95,6 +139,7 @@ class ScheduledRequestHandler extends RequestHandler {
         if (owners.size > 1)
             throw Object.assign(new Error("Files from different accounts cannot be combined"), { status: 400 });
         this.affinity = [...owners][0] || null;
+        this._beginEarlyStreamIfNeeded(proxyRequest);
         await this.selectNext();
         this._updateTrackedRequest(proxyRequest.request_id, {
             initialAccountName: this._getAccountNameForIndex(this.currentAuthIndex),
@@ -115,7 +160,14 @@ class ScheduledRequestHandler extends RequestHandler {
             this.excluded.add(this.lease.account.key);
             this.authSwitcher.currentAuthIndex = this.lease.account.index;
             try {
-                await this.browserManager.ensureWorkerContext(this.currentAuthIndex);
+                if (
+                    this.scheduler.config.readyContextOnly &&
+                    this.scheduler.browserManager &&
+                    !this.browserManager.isContextReady(this.currentAuthIndex)
+                )
+                    throw Object.assign(new Error("Selected context is no longer ready"), {
+                        reason: "connection_lost",
+                    });
                 if (this.controller.signal.aborted)
                     throw Object.assign(new Error("Client disconnected"), { reason: "client_disconnect" });
                 this.browserManager.notifyUserActivity(this.currentAuthIndex);
@@ -132,7 +184,7 @@ class ScheduledRequestHandler extends RequestHandler {
     }
 
     _shouldRetryError(error) {
-        return ["account", "rate_limited", "unsupported", "temporary"].includes(classifyError(error));
+        return ["account", "rate_limited", "unsupported", "temporary", "transport"].includes(classifyError(error));
     }
 
     async _prepareImmediateStatusRetry(error, requestId, tracker, sourceAuthIndex) {
@@ -141,7 +193,7 @@ class ScheduledRequestHandler extends RequestHandler {
         if (
             !this._shouldRetryError(error) ||
             this.controller.signal.aborted ||
-            this.response.headersSent ||
+            this.response.__modelOutputStarted ||
             this.excluded.size > this.scheduler.config.maxRetries
         )
             return false;
@@ -231,11 +283,81 @@ class ScheduledRequestHandler extends RequestHandler {
     }
 
     _markTrackedResponseError(res, message, statusCode, outcome) {
-        if (this.lease?.attempted) this.scheduler.failure(this.lease, { message, status: statusCode });
+        if (this.lease?.attempted) {
+            const error =
+                outcome === "local_transport"
+                    ? { kind: "transport", message, reason: "connection_lost", status: statusCode }
+                    : { message, status: statusCode };
+            this.scheduler.failure(this.lease, error);
+        }
         return super._markTrackedResponseError(res, message, statusCode, outcome);
     }
 
+    async _retryTransportQueue(error, registry) {
+        if (
+            this.controller.signal.aborted ||
+            this.response.__modelOutputStarted ||
+            this.excluded.size > this.scheduler.config.maxRetries
+        )
+            throw error;
+        const failedAuthIndex = this.currentAuthIndex;
+        this._cancelCurrentAttemptBeforeRetry(this.proxyRequest, failedAuthIndex);
+        this.scheduler.failure(this.lease, error);
+        this.scheduler.release(this.lease);
+        this.lease = null;
+        await this.selectNext();
+        this._advanceProxyRequestAttempt(this.proxyRequest);
+        const queue = registry.createMessageQueue(
+            this.proxyRequest.request_id,
+            this.currentAuthIndex,
+            this.proxyRequest.request_attempt_id
+        );
+        this._forwardRequest(this.proxyRequest);
+        return queue;
+    }
+
+    _sendErrorResponse(res, status, message, errorType = null) {
+        if (res.headersSent && !res.writableEnded) {
+            this._sendErrorChunkToClient(res, message, Number(status) || 500, errorType);
+            res.end();
+            return;
+        }
+        return super._sendErrorResponse(res, status, message, errorType);
+    }
+
+    _beginEarlyStreamIfNeeded(proxyRequest) {
+        const requestedStream =
+            this.incomingRequest?.body?.stream === true ||
+            String(this.incomingRequest?.path || proxyRequest.path).includes("streamGenerateContent");
+        if (!requestedStream || !this.scheduler.config.streamEarlyHeaders || this.response.headersSent) return;
+        this.response.status(200).set({
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+            "Content-Type": "text/event-stream",
+            "X-Accel-Buffering": "no",
+        });
+        this.response.flushHeaders?.();
+        this.response.write(": accepted\n\n");
+        this.scheduler.observe("http_headers_ms", Date.now() - this._acceptedAt);
+        const sendKeepalive = () => {
+            if (this.controller.signal.aborted || this.response.writableEnded || this.response.__modelOutputStarted) {
+                this._stopEarlyStreamKeepalive();
+                return;
+            }
+            this.response.write(": keep-alive\n\n");
+        };
+        this._earlyStreamKeepalive = setInterval(sendKeepalive, this.scheduler.config.streamKeepaliveIntervalMs);
+        this._earlyStreamKeepalive.unref?.();
+    }
+
+    _stopEarlyStreamKeepalive() {
+        if (!this._earlyStreamKeepalive) return;
+        clearInterval(this._earlyStreamKeepalive);
+        this._earlyStreamKeepalive = null;
+    }
+
     finish() {
+        this._stopEarlyStreamKeepalive();
         this.response.removeListener("close", this.onClose);
         const success =
             !this.controller.signal.aborted && !this.response.__usageTrackingOutcome && this.response.statusCode < 400;
@@ -248,7 +370,10 @@ async function dispatch(parent, method, req, res) {
     try {
         await handler[method](req, res);
     } catch (error) {
-        if (!handler.controller.signal.aborted) handler._sendErrorResponse(res, error.status || 503, error.message);
+        if (!handler.controller.signal.aborted) {
+            if (res.headersSent) handler._handleRequestError(error, res);
+            else handler._sendErrorResponse(res, error.status || 503, error.message);
+        }
     } finally {
         handler.finish();
     }

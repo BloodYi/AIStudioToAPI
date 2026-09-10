@@ -147,8 +147,9 @@ class ProxyServerSystem extends EventEmitter {
 
         if (this.scheduler) {
             this.logger.info(
-                `[Scheduler] Model-aware context workers enabled (${this.config.scheduler.maxWorkers}); contexts initialize on demand.`
+                `[Scheduler] Model-aware ready-context pool enabled (${this.config.scheduler.maxWorkers} max, ${this.config.scheduler.contextPoolMinReady} warm).`
             );
+            this.browserManager.startContextPool();
             this.emit("started");
             return;
         }

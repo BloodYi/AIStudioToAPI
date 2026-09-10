@@ -160,7 +160,9 @@ test("retry budget is enforced for real streaming, with no repeated account", as
         fixture.sent.map(entry => entry.index),
         [0, 1]
     );
-    assert.equal(res.statusCode, 429);
+    assert.equal(res.statusCode, 200);
+    assert.match(res.body, /^: accepted/);
+    assert.match(res.body, /"error"/);
     assert.equal(fixture.scheduler.snapshot().active_workers, 0);
     fixture.scheduler.close();
 });
@@ -173,6 +175,39 @@ test("late streaming errors mark the actual model status without replaying outpu
     assert.match(res.body, /hello/);
     assert.equal(fixture.scheduler.account(0).models.a.rate_limited, true);
     assert.equal(fixture.scheduler.account(0).models.a.success_count, 0);
+    fixture.scheduler.close();
+});
+
+test("pre-output connection loss migrates a stream after early headers", async () => {
+    const fixture = setup(index => (index === 0 ? [success[0]] : success));
+    const res = new Response();
+    const running = fixture.handler.processOpenAIRequest(request("a", true), res);
+    await new Promise(resolve => setImmediate(resolve));
+    fixture.registry.closeMessageQueuesForEpoch(0, 1, "connection_lost");
+    await running;
+    assert.deepEqual(
+        fixture.sent.map(entry => entry.index),
+        [0, 1]
+    );
+    assert.match(res.body, /^: accepted/);
+    assert.match(res.body, /hello/);
+    assert.equal(fixture.scheduler.account(0).models.a.cooldown_until, 0);
+    fixture.scheduler.close();
+});
+
+test("connection loss after model output sends an error without replaying", async () => {
+    const fixture = setup(() => [success[0], success[1]]);
+    const res = new Response();
+    const running = fixture.handler.processOpenAIRequest(request("a", true), res);
+    for (let i = 0; i < 5 && !res.body.includes("hello"); i++) {
+        await new Promise(resolve => setImmediate(resolve));
+    }
+    fixture.registry.closeMessageQueuesForEpoch(0, 1, "connection_lost");
+    await running;
+    assert.equal(fixture.sent.length, 1);
+    assert.match(res.body, /hello/);
+    assert.match(res.body, /Stream interrupted/);
+    assert.equal(fixture.scheduler.account(0).models.a.cooldown_until, 0);
     fixture.scheduler.close();
 });
 
@@ -217,6 +252,24 @@ test("client disconnect while queued is removed without upstream work", async ()
     res.emit("close");
     await running;
     assert.equal(fixture.sent.length, 0);
+    assert.equal(fixture.scheduler.pending.length, 0);
+    fixture.scheduler.release(blocker);
+    fixture.scheduler.close();
+});
+
+test("early streaming headers keep the connection alive while dispatch waits and clean up on disconnect", async () => {
+    const fixture = setup(() => success, {
+        scheduler: { globalConcurrency: 1, streamKeepaliveIntervalMs: 5 },
+    });
+    const blocker = await fixture.scheduler.acquire("a");
+    const res = new Response();
+    const running = fixture.handler.processOpenAIRequest(request("a", true), res);
+    await new Promise(resolve => setTimeout(resolve, 16));
+    assert.match(res.body, /^: accepted\n\n/);
+    assert.match(res.body, /: keep-alive/);
+    res.destroyed = true;
+    res.emit("close");
+    await running;
     assert.equal(fixture.scheduler.pending.length, 0);
     fixture.scheduler.release(blocker);
     fixture.scheduler.close();
