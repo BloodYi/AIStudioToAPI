@@ -5,6 +5,7 @@ const RequestHandler = require("../src/core/RequestHandler");
 const ConnectionRegistry = require("../src/core/ConnectionRegistry");
 const { ModelScheduler } = require("../src/core/ModelScheduler");
 const loadConfig = require("../src/core/SchedulerConfig");
+const StatusRoutes = require("../src/routes/StatusRoutes");
 const logger = { debug() {}, error() {}, info() {}, warn() {} };
 class Response extends EventEmitter {
     constructor() {
@@ -128,6 +129,68 @@ function request(model = "flash", stream = false, path = "/v1/chat/completions")
         rawBody: Buffer.from(JSON.stringify(body)),
     };
 }
+
+function setupSchedulerResetRoute(scheduler) {
+    const routes = new Map();
+    const app = {};
+    for (const method of ["delete", "get", "post", "put", "use"])
+        app[method] = (route, ...handlers) => {
+            if (method === "post") routes.set(route, handlers);
+        };
+    const serverSystem = { config: {}, distIndexPath: "", logger, scheduler };
+    const isAuthenticated = (req, res, next) =>
+        req.authenticated ? next() : res.status(401).json({ error: "Unauthorized" });
+    new StatusRoutes(serverSystem).setupRoutes(app, isAuthenticated);
+    return async authenticated => {
+        const handlers = routes.get("/api/scheduler/reset-all");
+        const response = {
+            body: null,
+            json(body) {
+                this.body = body;
+                return this;
+            },
+            status(code) {
+                this.statusCode = code;
+                return this;
+            },
+            statusCode: 200,
+        };
+        let index = 0;
+        const next = () => handlers[++index]({ authenticated }, response, next);
+        await handlers[0]({ authenticated }, response, next);
+        return response;
+    };
+}
+
+test("reset-all scheduler route enforces authentication and reports legacy and change counts", async () => {
+    const reset = setupSchedulerResetRoute({
+        resetAllAccounts: () => ({ reset_account_count: 2, reset_model_count: 3 }),
+    });
+    let response = await reset(false);
+    assert.equal(response.statusCode, 401);
+    assert.deepEqual(response.body, { error: "Unauthorized" });
+    response = await reset(true);
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.body, {
+        reset_account_count: 2,
+        reset_model_count: 3,
+        success: true,
+    });
+
+    response = await setupSchedulerResetRoute(null)(true);
+    assert.equal(response.statusCode, 409);
+    assert.deepEqual(response.body, { error: "Scheduler is in legacy mode" });
+
+    response = await setupSchedulerResetRoute({
+        resetAllAccounts: () => ({ reset_account_count: 0, reset_model_count: 0 }),
+    })(true);
+    assert.deepEqual(response.body, {
+        reset_account_count: 0,
+        reset_model_count: 0,
+        success: true,
+    });
+});
+
 for (const stream of [false, true]) {
     test(`OpenAI ${stream ? "real stream" : "buffered"} retries quota on another account and keeps global account unchanged`, async () => {
         const fixture = setup(index =>
@@ -144,6 +207,7 @@ for (const stream of [false, true]) {
         assert.ok(fixture.sent.every(entry => entry.request.path.includes("/flash:")));
         assert.equal(fixture.scheduler.account(0).models.flash.rate_limited, true);
         assert.equal(fixture.scheduler.account(1).models.flash.success_count, 1);
+        assert.equal(fixture.scheduler.snapshot().models.find(model => model.model === "flash").daily_requests, 2);
         assert.equal(fixture.browser.currentAuthIndex, 99);
         assert.equal(fixture.scheduler.snapshot().active_workers, 0);
         fixture.scheduler.close();
@@ -337,6 +401,10 @@ test("503 and model permissions retry but malformed client requests do not", asy
         await fixture.handler.processOpenAIRequest(request("a", true), res);
         assert.equal(fixture.sent.length, expected);
         assert.equal(fixture.scheduler.account(0).healthy, true);
+        if (status === 403) {
+            assert.equal(fixture.scheduler.account(0).models.a.unsupported, false);
+            assert.ok(fixture.scheduler.account(0).models.a.cooldown_until > Date.now());
+        }
         fixture.scheduler.close();
     }
 });

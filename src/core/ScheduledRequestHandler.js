@@ -184,7 +184,9 @@ class ScheduledRequestHandler extends RequestHandler {
     }
 
     _shouldRetryError(error) {
-        return ["account", "rate_limited", "unsupported", "temporary", "transport"].includes(classifyError(error));
+        return ["account", "rate_limited", "risk_controlled", "unsupported", "temporary", "transport"].includes(
+            classifyError(error)
+        );
     }
 
     async _prepareImmediateStatusRetry(error, requestId, tracker, sourceAuthIndex) {

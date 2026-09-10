@@ -13,6 +13,23 @@
             {{ t("schedulerUnavailableContexts") }}: {{ data.unavailable_browser_workers }} /
             {{ data.max_browser_workers }}
         </p>
+        <div class="quota-summary" :title="t('schedulerEstimatedQuotaTooltip')">
+            <div>
+                <strong>{{ t("schedulerEstimatedQuota") }}</strong>
+                <p>{{ t("schedulerEstimatedQuotaHint") }}</p>
+            </div>
+            <span>{{ formatNumber(data.estimated_remaining_quota) }} {{ t("schedulerQuotaUnit") }}</span>
+        </div>
+        <div class="scheduler-actions">
+            <button :disabled="busy" @click="resetAllRateLimits">
+                {{ t("schedulerResetAll429") }}
+            </button>
+            <button :disabled="busy" @click="resetAllAccounts">
+                {{ t("schedulerResetAllAccounts") }}
+            </button>
+        </div>
+        <p v-if="rateLimitsReset" role="status">{{ t("schedulerResetAll429Success") }}</p>
+        <p v-if="allAccountsResetMessage" role="status">{{ allAccountsResetMessage }}</p>
         <div class="scheduler-table">
             <table>
                 <thead>
@@ -60,16 +77,12 @@
                 </tbody>
             </table>
         </div>
-        <button :disabled="busy" @click="resetAllRateLimits">
-            {{ t("schedulerResetAll429") }}
-        </button>
-        <p v-if="rateLimitsReset" role="status">{{ t("schedulerResetAll429Success") }}</p>
         <div class="scheduler-table">
             <table>
                 <thead>
                     <tr>
                         <th>{{ t("schedulerModel") }}</th>
-                        <th>{{ t("schedulerRequests") }}</th>
+                        <th>{{ t("schedulerTodayRequests") }}</th>
                         <th>{{ t("schedulerSuccess") }}</th>
                         <th>{{ t("schedulerErrors") }}</th>
                         <th>{{ t("schedulerAvailable") }}</th>
@@ -82,7 +95,7 @@
                 <tbody>
                     <tr v-for="model in data.models" :key="model.model">
                         <td>{{ model.model }}</td>
-                        <td>{{ model.requests }}</td>
+                        <td>{{ model.daily_requests }}</td>
                         <td>{{ model.success }}</td>
                         <td>{{ model.failures }}</td>
                         <td>{{ model.available_accounts }}</td>
@@ -111,7 +124,7 @@
                                 <th>{{ t("schedulerModel") }}</th>
                                 <th>{{ t("schedulerStatus") }}</th>
                                 <th>{{ t("schedulerInflight") }}</th>
-                                <th>{{ t("schedulerRequests") }}</th>
+                                <th>{{ t("schedulerTodayRequests") }}</th>
                                 <th>{{ t("schedulerErrors") }}</th>
                                 <th>{{ t("schedulerCooldown") }}</th>
                                 <th>{{ t("schedulerLastError") }}</th>
@@ -123,7 +136,7 @@
                                 <td>{{ model }}</td>
                                 <td>{{ slot.status }}</td>
                                 <td>{{ slot.inflight }}</td>
-                                <td>{{ slot.request_count }}</td>
+                                <td>{{ slot.daily_requests }}</td>
                                 <td>{{ slot.failure_count }}</td>
                                 <td>
                                     {{ slot.cooldown_until ? new Date(slot.cooldown_until).toLocaleString() : "—" }}
@@ -148,19 +161,36 @@
 </template>
 <script setup>
 import { ref } from "vue";
-defineProps({ data: { default: null, type: Object }, t: { required: true, type: Function } });
+const props = defineProps({ data: { default: null, type: Object }, t: { required: true, type: Function } });
 const emit = defineEmits(["refresh"]);
 const busy = ref(false);
 const error = ref("");
 const rateLimitsReset = ref(false);
+const allAccountsResetMessage = ref("");
+function formatNumber(value) {
+    return Number(value || 0).toLocaleString();
+}
 async function resetAllRateLimits() {
-    rateLimitsReset.value = await sendReset("/api/scheduler/reset-rate-limits", {});
+    rateLimitsReset.value = Boolean(await sendReset("/api/scheduler/reset-rate-limits", {}));
+}
+async function resetAllAccounts() {
+    if (!window.confirm(props.t("schedulerResetAllAccountsConfirm"))) return;
+    const result = await sendReset("/api/scheduler/reset-all", {});
+    if (!result) return;
+    allAccountsResetMessage.value =
+        result.reset_account_count || result.reset_model_count
+            ? props.t("schedulerResetAllAccountsSuccess", {
+                  accounts: result.reset_account_count,
+                  models: result.reset_model_count,
+              })
+            : props.t("schedulerResetAllAccountsNoChanges");
 }
 async function reset(accountId, model) {
     await sendReset("/api/scheduler/reset", { account_id: accountId, model });
 }
 async function sendReset(url, body) {
     rateLimitsReset.value = false;
+    allAccountsResetMessage.value = "";
     busy.value = true;
     error.value = "";
     try {
@@ -169,9 +199,11 @@ async function sendReset(url, body) {
             headers: { "Content-Type": "application/json" },
             method: "POST",
         });
-        if (!response.ok) throw new Error((await response.json()).error);
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok)
+            throw new Error(result.error || result.message || `${response.status} ${response.statusText}`);
         emit("refresh");
-        return true;
+        return result;
     } catch (failure) {
         error.value = failure.message;
         return false;
@@ -187,6 +219,32 @@ async function sendReset(url, body) {
 .scheduler-table {
     overflow-x: auto;
 }
+.quota-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 14px 16px;
+    margin: 14px 0;
+    border: 1px solid var(--border-light);
+    border-radius: 8px;
+    background: rgba(var(--color-primary-rgb), 0.08);
+}
+.quota-summary p {
+    margin: 4px 0 0;
+    color: var(--text-secondary);
+}
+.quota-summary span {
+    font-size: 1.4rem;
+    font-weight: 700;
+    white-space: nowrap;
+}
+.scheduler-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 12px;
+}
 table {
     width: 100%;
     border-collapse: collapse;
@@ -199,5 +257,11 @@ td {
 }
 summary {
     cursor: pointer;
+}
+@media (max-width: 600px) {
+    .quota-summary {
+        align-items: flex-start;
+        flex-direction: column;
+    }
 }
 </style>

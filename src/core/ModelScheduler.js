@@ -3,6 +3,31 @@ const path = require("path");
 const { isUserAbortedError } = require("../utils/CustomErrors");
 
 const schedulerError = (message, status = 503) => Object.assign(new Error(message), { status });
+const PACIFIC_TIMEZONE = "America/Los_Angeles";
+const PACIFIC_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
+    day: "2-digit",
+    month: "2-digit",
+    timeZone: PACIFIC_TIMEZONE,
+    year: "numeric",
+});
+const DAILY_QUOTAS = Object.freeze({ flash: 100, pro: 10 });
+
+function getModelDailyQuota(model) {
+    const segments = String(model || "")
+        .toLowerCase()
+        .split("-");
+    if (segments.includes("flash")) return DAILY_QUOTAS.flash;
+    if (segments.includes("pro")) return DAILY_QUOTAS.pro;
+    return null;
+}
+
+function isValidDateKey(value) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (!match) return false;
+    const [, year, month, day] = match.map(Number);
+    const date = new Date(Date.UTC(year, month - 1, day));
+    return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
 
 function classifyError(error = {}) {
     if (isUserAbortedError(error) || error.reason === "client_disconnect") return "aborted";
@@ -19,9 +44,10 @@ function classifyError(error = {}) {
         ].includes(error.kind || error.reason)
     )
         return "transport";
-    if (error.accountUnhealthy) return "account";
     const status = Number(error.status ?? error.code);
     const message = String(error.message || "");
+    if (status === 403) return "risk_controlled";
+    if (error.accountUnhealthy) return "account";
     if (/^unsupported$/i.test(message.trim())) return "unsupported";
     if (
         error.isAuthExpired ||
@@ -72,11 +98,30 @@ class ModelScheduler {
         return account;
     }
 
-    slot(account, model) {
+    getPacificDateKey(now = Date.now()) {
+        const parts = Object.fromEntries(
+            PACIFIC_DATE_FORMATTER.formatToParts(new Date(now))
+                .filter(part => part.type !== "literal")
+                .map(part => [part.type, part.value])
+        );
+        return `${parts.year}-${parts.month}-${parts.day}`;
+    }
+
+    rolloverDailyUsage(slot, now = Date.now()) {
+        const date = this.getPacificDateKey(now);
+        if (slot.daily_request_date === date) return false;
+        slot.daily_request_count = 0;
+        slot.daily_request_date = date;
+        return true;
+    }
+
+    slot(account, model, now = Date.now()) {
         if (!Object.hasOwn(account.models, model))
             account.models[model] = {
                 consecutive_failures: 0,
                 cooldown_until: 0,
+                daily_request_count: 0,
+                daily_request_date: this.getPacificDateKey(now),
                 failure_count: 0,
                 inflight: 0,
                 last_error: null,
@@ -87,7 +132,8 @@ class ModelScheduler {
                 unsupported: false,
             };
         const slot = account.models[model];
-        if (slot.cooldown_until && slot.cooldown_until <= Date.now()) {
+        if (this.rolloverDailyUsage(slot, now)) this.saveSoon();
+        if (slot.cooldown_until && slot.cooldown_until <= now) {
             slot.rate_limited = false;
             slot.cooldown_until = 0;
         }
@@ -286,9 +332,12 @@ class ModelScheduler {
 
     startAttempt(lease) {
         if (!lease || lease.attempted || lease.released) return;
+        const now = Date.now();
         lease.attempted = true;
+        this.rolloverDailyUsage(lease.slot, now);
+        lease.slot.daily_request_count++;
         lease.slot.request_count++;
-        lease.slot.last_used_at = Date.now();
+        lease.slot.last_used_at = now;
         this.saveSoon();
     }
 
@@ -316,7 +365,7 @@ class ModelScheduler {
             slot.rate_limited = true;
             slot.cooldown_until = Date.now() + this.config.rateLimitCooldownMs;
         }
-        if (kind === "temporary")
+        if (kind === "temporary" || kind === "risk_controlled")
             slot.cooldown_until =
                 Date.now() + this.config.tempErrorCooldownMs * Math.min(4, 2 ** (slot.consecutive_failures - 1));
         this.saveSoon();
@@ -353,6 +402,41 @@ class ModelScheduler {
         return resetCount;
     }
 
+    resetAllAccounts() {
+        let resetAccountCount = 0;
+        let resetModelCount = 0;
+        // Limit the override to accounts that are currently valid rotation candidates.
+        for (const index of this.authSource.getRotationIndices()) {
+            const account = this.account(index);
+            if (!account.healthy || account.last_error !== null) {
+                account.healthy = true;
+                account.last_error = null;
+                resetAccountCount++;
+            }
+            for (const slot of Object.values(account.models)) {
+                if (
+                    !slot.unsupported &&
+                    !slot.rate_limited &&
+                    !slot.cooldown_until &&
+                    !slot.consecutive_failures &&
+                    slot.last_error === null
+                )
+                    continue;
+                Object.assign(slot, {
+                    consecutive_failures: 0,
+                    cooldown_until: 0,
+                    last_error: null,
+                    rate_limited: false,
+                    unsupported: false,
+                });
+                resetModelCount++;
+            }
+        }
+        this.flush();
+        this.drain();
+        return { reset_account_count: resetAccountCount, reset_model_count: resetModelCount };
+    }
+
     reset(index, model) {
         const account = this.account(index);
         if (account.inflight) throw schedulerError("Account has active requests", 409);
@@ -374,6 +458,7 @@ class ModelScheduler {
     }
 
     snapshot() {
+        const now = Date.now();
         const indices = this.authSource.getRotationIndices();
         for (const index of this.authSource.availableIndices) this.account(index);
         const models = new Set([
@@ -381,11 +466,22 @@ class ModelScheduler {
             ...this.pending.map(item => item.model),
             ...[...this.accounts.values()].flatMap(account => Object.keys(account.models)),
         ]);
+        const quotaModels = [...models]
+            .map(model => ({ limit: getModelDailyQuota(model), model }))
+            .filter(entry => entry.limit !== null);
+        const quotaAccounts = indices.map(index => this.account(index));
+        let estimatedRemainingQuota = 0;
+        for (const account of quotaAccounts) {
+            for (const { limit, model } of quotaModels) {
+                const slot = this.slot(account, model, now);
+                estimatedRemainingQuota += Math.max(0, limit - slot.daily_request_count);
+            }
+        }
         const accounts = [...this.accounts.values()].map(account => ({
             ...account,
             models: Object.fromEntries(
                 Object.keys(account.models).map(model => {
-                    const slot = this.slot(account, model);
+                    const slot = this.slot(account, model, now);
                     const available =
                         account.healthy && indices.includes(account.index) && !slot.unsupported && !slot.cooldown_until;
                     return [
@@ -393,6 +489,7 @@ class ModelScheduler {
                         {
                             ...slot,
                             available,
+                            daily_requests: slot.daily_request_count,
                             status:
                                 !account.healthy || !indices.includes(account.index)
                                     ? "UNHEALTHY"
@@ -418,6 +515,7 @@ class ModelScheduler {
             active_workers: this.workers.filter(worker => worker.lease).length,
             busy_browser_workers: busyContexts,
             contexts,
+            estimated_remaining_quota: estimatedRemainingQuota,
             idle_browser_workers: contextCount("READY"),
             idle_workers: this.workers.filter(worker => !worker.lease).length,
             initializing_browser_workers: contextCount("INITIALIZING"),
@@ -429,6 +527,7 @@ class ModelScheduler {
                     active_workers: this.active(model),
                     available_accounts: this.eligibleAccounts(model, new Set()).length,
                     configured_workers: this.config.allocation[model] || { min: 0, preferred: 1 },
+                    daily_requests: slots.reduce((sum, slot) => sum + slot.daily_request_count, 0),
                     failures: slots.reduce((sum, slot) => sum + slot.failure_count, 0),
                     model,
                     queue_length: this.pending.filter(item => item.model === model).length,
@@ -439,9 +538,15 @@ class ModelScheduler {
                 };
             }),
             queued_requests: this.pending.length,
+            quota_tracked_accounts: quotaAccounts.length,
+            quota_tracked_models: quotaModels.length,
             ready_browser_workers: readyContexts,
             reconnecting_browser_workers: contextCount("RECONNECTING"),
             unavailable_browser_workers: contextCount("UNAVAILABLE"),
+            usage_window: {
+                date: this.getPacificDateKey(now),
+                timezone: PACIFIC_TIMEZONE,
+            },
             workers: this.workers.map(worker => ({
                 account_id: worker.lease?.account.index ?? null,
                 id: worker.id,
@@ -485,16 +590,33 @@ class ModelScheduler {
         if (!this.config.statePath) return;
         try {
             const data = JSON.parse(fs.readFileSync(this.config.statePath, "utf8"));
-            if (data.version !== 1 || !Array.isArray(data.accounts)) throw new Error("Unsupported scheduler state");
+            if (![1, 2].includes(data.version) || !Array.isArray(data.accounts))
+                throw new Error("Unsupported scheduler state");
             this.fileAffinities = new Map(data.fileAffinities || []);
             for (const account of data.accounts) {
                 if (typeof account.key !== "string" || !account.models || typeof account.models !== "object")
                     throw new Error("Invalid account state");
                 account.models = Object.assign(Object.create(null), account.models);
                 account.inflight = 0;
-                for (const slot of Object.values(account.models)) slot.inflight = 0;
+                for (const slot of Object.values(account.models)) {
+                    if (data.version === 1) {
+                        slot.daily_request_count = 0;
+                        slot.daily_request_date = this.getPacificDateKey();
+                    } else if (
+                        !Number.isInteger(slot.daily_request_count) ||
+                        slot.daily_request_count < 0 ||
+                        !isValidDateKey(slot.daily_request_date)
+                    ) {
+                        throw new Error("Invalid daily scheduler state");
+                    }
+                    slot.inflight = 0;
+                }
                 this.accounts.set(account.key, account);
             }
+            if (data.version === 1)
+                this.logger.warn(
+                    "[Scheduler] Upgraded version 1 state: today's Pacific-time request counts start at zero; cumulative statistics were preserved."
+                );
         } catch (error) {
             if (error.code !== "ENOENT") {
                 this.accounts.clear();
@@ -528,7 +650,7 @@ class ModelScheduler {
                 JSON.stringify({
                     accounts: [...this.accounts.values()],
                     fileAffinities: [...this.fileAffinities],
-                    version: 1,
+                    version: 2,
                 }),
                 {
                     mode: 0o600,
@@ -549,4 +671,4 @@ class ModelScheduler {
         this.flush();
     }
 }
-module.exports = { classifyError, ModelScheduler };
+module.exports = { classifyError, getModelDailyQuota, ModelScheduler };

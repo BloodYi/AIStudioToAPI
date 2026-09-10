@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { ModelScheduler, classifyError } = require("../src/core/ModelScheduler");
+const { ModelScheduler, classifyError, getModelDailyQuota } = require("../src/core/ModelScheduler");
 const loadConfig = require("../src/core/SchedulerConfig");
 const logger = { error() {}, warn() {} };
 function setup(overrides = {}, count = 8) {
@@ -54,6 +54,9 @@ test("permissions, account failures and manual recovery have distinct scope", as
     const scheduler = setup({}, 1);
     const a = await scheduler.acquire("a");
     scheduler.failure(a, { message: "PERMISSION_DENIED", status: 403 });
+    assert.equal(a.account.healthy, true);
+    assert.equal(a.slot.unsupported, false);
+    assert.ok(a.slot.cooldown_until > Date.now());
     scheduler.release(a);
     await assert.rejects(scheduler.acquire("a"));
     const b = await scheduler.acquire("b");
@@ -65,7 +68,9 @@ test("permissions, account failures and manual recovery have distinct scope", as
     scheduler.reset(0);
     const recovered = await scheduler.acquire("a");
     scheduler.release(recovered);
-    assert.equal(classifyError({ message: "Forbidden", status: 403 }), "request");
+    assert.equal(classifyError({ message: "Forbidden", status: 403 }), "risk_controlled");
+    assert.equal(classifyError({ message: "PERMISSION_DENIED", status: 403 }), "risk_controlled");
+    assert.equal(classifyError({ message: "model unsupported for account" }), "unsupported");
     assert.equal(classifyError({ message: "Invalid request", status: 400 }), "request");
     assert.equal(classifyError({ status: 503 }), "temporary");
     scheduler.close();
@@ -153,6 +158,8 @@ test("state persists across restart but leases never do", async () => {
     const second = setup({ statePath }, 1);
     const slot = second.slot(second.account(0), "a");
     assert.equal(slot.request_count, 1);
+    assert.equal(slot.daily_request_count, 1);
+    assert.equal(slot.daily_request_date, first.getPacificDateKey());
     assert.equal(slot.failure_count, 1);
     assert.equal(slot.inflight, 0);
     assert.equal(slot.rate_limited, true);
@@ -160,6 +167,108 @@ test("state persists across restart but leases never do", async () => {
     first.close();
     second.close();
     fs.rmSync(directory, { recursive: true });
+});
+
+test("Pacific date keys honor PST, PDT and daylight-saving transitions", () => {
+    const scheduler = setup({}, 1);
+    assert.equal(scheduler.getPacificDateKey(Date.parse("2026-01-01T07:59:59Z")), "2025-12-31");
+    assert.equal(scheduler.getPacificDateKey(Date.parse("2026-01-01T08:00:00Z")), "2026-01-01");
+    assert.equal(scheduler.getPacificDateKey(Date.parse("2026-07-01T06:59:59Z")), "2026-06-30");
+    assert.equal(scheduler.getPacificDateKey(Date.parse("2026-07-01T07:00:00Z")), "2026-07-01");
+    assert.equal(scheduler.getPacificDateKey(Date.parse("2026-03-08T07:59:59Z")), "2026-03-07");
+    assert.equal(scheduler.getPacificDateKey(Date.parse("2026-03-08T08:00:00Z")), "2026-03-08");
+    assert.equal(scheduler.getPacificDateKey(Date.parse("2026-11-01T09:30:00Z")), "2026-11-01");
+    scheduler.close();
+});
+
+test("daily attempts count once per lease and roll over without changing cumulative usage", async () => {
+    const scheduler = setup({ allocation: { flash: { min: 0, preferred: 1 } } }, 1);
+    const lease = await scheduler.acquire("flash");
+    scheduler.startAttempt(lease);
+    scheduler.startAttempt(lease);
+    assert.equal(lease.slot.daily_request_count, 1);
+    assert.equal(lease.slot.request_count, 1);
+    scheduler.release(lease);
+
+    lease.slot.daily_request_date = "2000-01-01";
+    lease.slot.daily_request_count = 9;
+    lease.slot.request_count = 10;
+    const snapshot = scheduler.snapshot();
+    assert.equal(lease.slot.daily_request_count, 0);
+    assert.equal(lease.slot.request_count, 10);
+    assert.equal(snapshot.models.find(model => model.model === "flash").daily_requests, 0);
+    assert.equal(snapshot.accounts[0].models.flash.daily_requests, 0);
+    scheduler.close();
+});
+
+test("version 1 state preserves cumulative values and initializes daily usage at zero", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "scheduler-v1-"));
+    const statePath = path.join(directory, "state.json");
+    fs.writeFileSync(
+        statePath,
+        JSON.stringify({
+            accounts: [
+                {
+                    healthy: true,
+                    key: "auth-0",
+                    last_error: null,
+                    models: { flash: { inflight: 3, request_count: 42 } },
+                },
+            ],
+            fileAffinities: [],
+            version: 1,
+        })
+    );
+    const scheduler = setup({ statePath }, 1);
+    const slot = scheduler.slot(scheduler.account(0), "flash");
+    assert.equal(slot.request_count, 42);
+    assert.equal(slot.daily_request_count, 0);
+    assert.equal(slot.daily_request_date, scheduler.getPacificDateKey());
+    assert.equal(slot.inflight, 0);
+    scheduler.close();
+    fs.rmSync(directory, { recursive: true });
+});
+
+test("quota estimates use valid accounts, hyphen segments and clamp each slot at zero", () => {
+    assert.equal(getModelDailyQuota("gemini-3-flash"), 100);
+    assert.equal(getModelDailyQuota("gemini-3-flash-lite"), 100);
+    assert.equal(getModelDailyQuota("gemini-3-pro-preview"), 10);
+    assert.equal(getModelDailyQuota("gemini-profile"), null);
+    assert.equal(getModelDailyQuota("flashlight"), null);
+    assert.equal(getModelDailyQuota("imagen-flash"), 100);
+    assert.equal(getModelDailyQuota("__files__"), null);
+
+    const auth = {
+        accountNameMap: new Map([
+            [0, "first@example.com"],
+            [2, "second@example.com"],
+        ]),
+        availableIndices: [0, 1, 2, 3],
+        getRotationIndices: () => [0, 2],
+    };
+    const config = {
+        ...loadConfig({ MAX_BROWSER_WORKERS: "4" }),
+        allocation: {
+            "gemini-3-flash": { min: 0, preferred: 1 },
+            "gemini-3-flash-lite": { min: 0, preferred: 1 },
+            "gemini-3-pro-preview": { min: 0, preferred: 1 },
+            "text-embedding": { min: 0, preferred: 1 },
+        },
+        statePath: null,
+    };
+    const scheduler = new ModelScheduler(config, auth, logger);
+    const firstFlash = scheduler.slot(scheduler.account(0), "gemini-3-flash");
+    const secondFlash = scheduler.slot(scheduler.account(2), "gemini-3-flash");
+    firstFlash.daily_request_count = 120;
+    secondFlash.daily_request_count = 3;
+    scheduler.account(0).healthy = false;
+    firstFlash.rate_limited = true;
+    const snapshot = scheduler.snapshot();
+    assert.equal(snapshot.quota_tracked_accounts, 2);
+    assert.equal(snapshot.quota_tracked_models, 3);
+    assert.equal(snapshot.estimated_remaining_quota, 317);
+    assert.equal(snapshot.models.find(model => model.model === "gemini-3-flash").daily_requests, 123);
+    scheduler.close();
 });
 
 test("configuration validates capacity and honors legacy mode", () => {
@@ -178,7 +287,7 @@ test("corrupt state is backed up and inflight reset does not persist a lock", ()
     assert.equal(scheduler.accounts.size, 0);
     assert.ok(fs.readdirSync(directory).some(name => name.includes(".corrupt-")));
     scheduler.close();
-    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 1);
+    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 2);
     fs.rmSync(directory, { recursive: true });
 });
 
@@ -213,6 +322,59 @@ test("bulk 429 reset preserves other failures, statistics and active leases", as
     scheduler.startAttempt(active);
     scheduler.failure(active, { status: 429 });
     assert.equal(active.slot.rate_limited, true);
+    scheduler.release(active);
+    scheduler.close();
+});
+
+test("enabling all rotation accounts clears scheduler blocks but preserves usage and active leases", async () => {
+    const scheduler = setup({ globalConcurrency: 2, maxWorkers: 1 }, 2);
+    const active = await scheduler.acquire("flash");
+    scheduler.startAttempt(active);
+    Object.assign(active.account, { healthy: false, last_error: "login failed" });
+    Object.assign(active.slot, {
+        consecutive_failures: 3,
+        cooldown_until: Date.now() + 60000,
+        failure_count: 7,
+        last_error: "risk",
+        rate_limited: true,
+        success_count: 5,
+        unsupported: true,
+    });
+    const second = scheduler.slot(scheduler.account(1), "pro");
+    second.cooldown_until = Date.now() + 30000;
+    second.consecutive_failures = 1;
+    second.last_error = "temporary";
+    const usageBefore = {
+        daily: active.slot.daily_request_count,
+        failures: active.slot.failure_count,
+        requests: active.slot.request_count,
+        success: active.slot.success_count,
+    };
+
+    assert.deepEqual(scheduler.resetAllAccounts(), { reset_account_count: 1, reset_model_count: 2 });
+    assert.equal(active.account.healthy, true);
+    assert.equal(active.account.last_error, null);
+    assert.equal(active.account.inflight, 1);
+    assert.equal(active.slot.inflight, 1);
+    assert.equal(active.worker.lease, active);
+    assert.equal(active.slot.unsupported, false);
+    assert.equal(active.slot.rate_limited, false);
+    assert.equal(active.slot.cooldown_until, 0);
+    assert.equal(active.slot.consecutive_failures, 0);
+    assert.equal(active.slot.last_error, null);
+    assert.deepEqual(
+        {
+            daily: active.slot.daily_request_count,
+            failures: active.slot.failure_count,
+            requests: active.slot.request_count,
+            success: active.slot.success_count,
+        },
+        usageBefore
+    );
+    assert.deepEqual(scheduler.resetAllAccounts(), { reset_account_count: 0, reset_model_count: 0 });
+
+    scheduler.failure(active, { status: 403 });
+    assert.ok(active.slot.cooldown_until > Date.now());
     scheduler.release(active);
     scheduler.close();
 });
