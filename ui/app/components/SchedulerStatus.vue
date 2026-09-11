@@ -8,6 +8,9 @@
         <div class="quota-section" :title="t('schedulerEstimatedQuotaTooltip')">
             <strong>{{ t("schedulerEstimatedQuota") }}（{{ data.usage_window?.date }} PT）</strong>
             <p>{{ t("schedulerEstimatedQuotaHint") }}</p>
+            <p v-if="!data.quota_by_model?.length" class="scheduler-empty">
+                {{ t("schedulerNoVisibleQuota") }}
+            </p>
             <div class="quota-grid">
                 <div v-for="quota in data.quota_by_model" :key="quota.model" class="quota-card">
                     <strong>{{ quota.model }}</strong>
@@ -22,9 +25,25 @@
         <div class="scheduler-actions">
             <button :disabled="busy" @click="resetAllRateLimits">{{ t("schedulerResetAll429") }}</button>
             <button :disabled="busy" @click="resetAllAccounts">{{ t("schedulerResetAllAccounts") }}</button>
+            <details class="hidden-models" :open="hiddenModelsOpen" @toggle="toggleHiddenModels">
+                <summary :aria-expanded="hiddenModelsOpen">
+                    {{ t("schedulerHiddenModels", { count: hiddenModels.length }) }}
+                </summary>
+                <p v-if="hiddenModelsLoading">{{ t("schedulerHiddenModelsLoading") }}</p>
+                <p v-else-if="!hiddenModels.length" class="scheduler-empty">{{ t("schedulerNoHiddenModels") }}</p>
+                <ul v-else>
+                    <li v-for="model in hiddenModels" :key="model">
+                        <span>{{ model }}</span>
+                        <button :disabled="busy || operatingModel === model" @click="setModelVisibility(model, false)">
+                            {{ t("schedulerShowModel") }}
+                        </button>
+                    </li>
+                </ul>
+            </details>
         </div>
         <p v-if="rateLimitsReset" role="status">{{ t("schedulerResetAll429Success") }}</p>
         <p v-if="allAccountsResetMessage" role="status">{{ allAccountsResetMessage }}</p>
+        <p v-if="modelVisibilityMessage" role="status">{{ modelVisibilityMessage }}</p>
         <details :open="contextsOpen" @toggle="toggleContexts">
             <summary :aria-expanded="contextsOpen">
                 Context {{ t("schedulerStatus") }} · READY {{ contextSummary.ready || 0 }} · BUSY
@@ -71,9 +90,13 @@
                         <th>{{ t("schedulerQueued") }}</th>
                         <th>{{ t("schedulerWorkers") }}</th>
                         <th>Min / Preferred</th>
+                        <th>{{ t("schedulerActions") }}</th>
                     </tr>
                 </thead>
                 <tbody>
+                    <tr v-if="!data.models?.length">
+                        <td colspan="8" class="scheduler-empty">{{ t("schedulerNoVisibleModels") }}</td>
+                    </tr>
                     <tr v-for="model in data.models" :key="model.model">
                         <td>{{ model.model }}</td>
                         <td>{{ model.daily_requests }}</td>
@@ -82,6 +105,11 @@
                         <td>{{ model.queue_length }}</td>
                         <td>{{ model.active_workers }}</td>
                         <td>{{ model.configured_workers.min }} / {{ model.configured_workers.preferred }}</td>
+                        <td>
+                            <button :disabled="busy || operatingModel === model.model" @click="hideModel(model.model)">
+                                {{ t("schedulerHideModel") }}
+                            </button>
+                        </td>
                     </tr>
                 </tbody>
             </table>
@@ -143,21 +171,27 @@
     </section>
 </template>
 <script setup>
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 const props = defineProps({ data: { default: null, type: Object }, t: { required: true, type: Function } });
 const emit = defineEmits(["refresh"]);
 const busy = ref(false),
     error = ref(""),
     rateLimitsReset = ref(false),
-    allAccountsResetMessage = ref("");
+    allAccountsResetMessage = ref(""),
+    modelVisibilityMessage = ref(""),
+    operatingModel = ref("");
 const contextsOpen = ref(false),
     accountsOpen = ref(false),
+    hiddenModelsOpen = ref(false),
     contexts = ref([]),
     accounts = ref([]),
-    expandedAccounts = ref(new Set());
+    expandedAccounts = ref(new Set()),
+    hiddenModels = ref([]),
+    hiddenModelsLoading = ref(false);
 const contextSummary = computed(() => props.data?.contexts_summary || {});
 let contextsController = null;
 let accountsController = null;
+let hiddenModelsController = null;
 const formatNumber = value => Number(value || 0).toLocaleString();
 async function getJson(url, signal) {
     const response = await fetch(url, { signal });
@@ -209,6 +243,28 @@ async function fetchAccounts(force = false) {
         if (accountsController === controller) accountsController = null;
     }
 }
+async function fetchHiddenModels(force = false) {
+    if (hiddenModelsController) {
+        if (!force) return;
+        hiddenModelsController.abort();
+    }
+    const controller = new AbortController();
+    hiddenModelsController = controller;
+    hiddenModelsLoading.value = true;
+    try {
+        const result = await getJson("/api/scheduler/models/hidden", controller.signal);
+        if (result) hiddenModels.value = result.models || [];
+    } finally {
+        if (hiddenModelsController === controller) {
+            hiddenModelsController = null;
+            hiddenModelsLoading.value = false;
+        }
+    }
+}
+function toggleHiddenModels(event) {
+    hiddenModelsOpen.value = event.currentTarget.open;
+    if (hiddenModelsOpen.value) fetchHiddenModels(true).catch(setError);
+}
 function toggleContexts(event) {
     contextsOpen.value = event.currentTarget.open;
     if (contextsOpen.value) fetchContexts(true).catch(setError);
@@ -257,7 +313,9 @@ watch(
 onBeforeUnmount(() => {
     contextsController?.abort();
     accountsController?.abort();
+    hiddenModelsController?.abort();
 });
+onMounted(() => fetchHiddenModels().catch(setError));
 async function resetAllRateLimits() {
     rateLimitsReset.value = Boolean(await sendReset("/api/scheduler/reset-rate-limits", {}));
 }
@@ -275,6 +333,38 @@ async function resetAllAccounts() {
 }
 async function reset(accountId, model) {
     await sendReset("/api/scheduler/reset", { account_id: accountId, model });
+}
+async function hideModel(model) {
+    if (!window.confirm(props.t("schedulerHideModelConfirm", { model }))) return;
+    await setModelVisibility(model, true);
+}
+async function setModelVisibility(model, hidden) {
+    rateLimitsReset.value = false;
+    allAccountsResetMessage.value = "";
+    modelVisibilityMessage.value = "";
+    operatingModel.value = model;
+    error.value = "";
+    try {
+        const response = await fetch(`/api/scheduler/models/${hidden ? "hide" : "show"}`, {
+            body: JSON.stringify({ model }),
+            headers: { "Content-Type": "application/json" },
+            method: "POST",
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok)
+            throw new Error(result.error || result.message || `${response.status} ${response.statusText}`);
+        modelVisibilityMessage.value = props.t(hidden ? "schedulerHideModelSuccess" : "schedulerShowModelSuccess", {
+            model: result.model,
+        });
+        await Promise.all([fetchHiddenModels(true), accountsOpen.value ? fetchAccounts(true) : Promise.resolve()]);
+        emit("refresh");
+        return result;
+    } catch (failure) {
+        setError(failure);
+        return false;
+    } finally {
+        operatingModel.value = "";
+    }
 }
 async function sendReset(url, body) {
     rateLimitsReset.value = false;
@@ -342,6 +432,25 @@ async function sendReset(url, body) {
     flex-wrap: wrap;
     gap: 8px;
     margin-bottom: 12px;
+}
+.hidden-models {
+    margin: 0;
+}
+.hidden-models ul {
+    min-width: min(420px, 80vw);
+    padding: 8px 0;
+    margin: 0;
+    list-style: none;
+}
+.hidden-models li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 4px 0;
+}
+.scheduler-empty {
+    color: var(--text-secondary);
 }
 details {
     margin: 12px 0;

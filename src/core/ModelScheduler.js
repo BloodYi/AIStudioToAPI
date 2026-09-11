@@ -11,6 +11,17 @@ const PACIFIC_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
     year: "numeric",
 });
 const DAILY_QUOTAS = Object.freeze({ flash: 100, pro: 10 });
+const MAX_MODEL_NAME_LENGTH = 200;
+
+function normalizeModelName(model) {
+    if (typeof model !== "string") throw schedulerError("Model must be a non-empty string", 400);
+    const normalized = model.trim().replace(/^models\//, "");
+    if (!normalized || normalized.length > MAX_MODEL_NAME_LENGTH)
+        throw schedulerError(`Model must contain 1-${MAX_MODEL_NAME_LENGTH} characters`, 400);
+    if (normalized.startsWith("__") || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(normalized))
+        throw schedulerError("Invalid model name", 400);
+    return normalized;
+}
 
 function getModelDailyQuota(model) {
     const normalized = String(model || "").toLowerCase();
@@ -74,6 +85,7 @@ class ModelScheduler {
         this.logger = logger;
         this.accounts = new Map();
         this.fileAffinities = new Map();
+        this.hiddenModels = new Set();
         this.pending = [];
         this.workers = Array.from({ length: config.globalConcurrency }, (_, id) => ({ id, lease: null }));
         this.sequence = 0;
@@ -469,6 +481,38 @@ class ModelScheduler {
         ]);
     }
 
+    _visibleSnapshotModels() {
+        return new Set([...this._snapshotModels()].filter(model => !this.hiddenModels.has(model)));
+    }
+
+    hideModel(model) {
+        const normalized = normalizeModelName(model);
+        if (!this._snapshotModels().has(normalized)) throw schedulerError(`Unknown scheduler model ${normalized}`, 404);
+        if (this.hiddenModels.has(normalized)) return { changed: false, hidden: true, model: normalized };
+        this.hiddenModels.add(normalized);
+        this.sequence++;
+        this.flush();
+        return { changed: true, hidden: true, model: normalized };
+    }
+
+    showModel(model) {
+        const normalized = normalizeModelName(model);
+        const changed = this.hiddenModels.delete(normalized);
+        if (changed) {
+            this.sequence++;
+            this.flush();
+        }
+        return { changed, hidden: false, model: normalized };
+    }
+
+    isModelHidden(model) {
+        return this.hiddenModels.has(normalizeModelName(model));
+    }
+
+    hiddenModelsSnapshot() {
+        return [...this.hiddenModels].sort((a, b) => a.localeCompare(b));
+    }
+
     _slotStatus(account, slot, rotationIndices) {
         if (!account.healthy || !rotationIndices.includes(account.index)) return "UNHEALTHY";
         if (slot.unsupported) return "UNSUPPORTED";
@@ -481,7 +525,7 @@ class ModelScheduler {
         const now = Date.now();
         const indices = this.authSource.getRotationIndices();
         for (const index of indices) this.account(index);
-        const models = this._snapshotModels();
+        const models = this._visibleSnapshotModels();
         const quotaModels = [...models]
             .map(model => ({ limit: getModelDailyQuota(model), model }))
             .filter(entry => entry.limit !== null)
@@ -582,6 +626,7 @@ class ModelScheduler {
                     inflight: account.inflight,
                     key: account.key,
                     models: Object.keys(account.models)
+                        .filter(model => !this.hiddenModels.has(model))
                         .sort()
                         .map(model => {
                             const slot = this.slot(account, model, now);
@@ -673,8 +718,13 @@ class ModelScheduler {
         if (!this.config.statePath) return;
         try {
             const data = JSON.parse(fs.readFileSync(this.config.statePath, "utf8"));
-            if (![1, 2, 3].includes(data.version) || !Array.isArray(data.accounts))
+            if (![1, 2, 3, 4].includes(data.version) || !Array.isArray(data.accounts))
                 throw new Error("Unsupported scheduler state");
+            if (data.version === 4) {
+                if (!Array.isArray(data.hiddenModels) || data.hiddenModels.some(model => typeof model !== "string"))
+                    throw new Error("Invalid hidden scheduler models");
+                this.hiddenModels = new Set(data.hiddenModels.map(normalizeModelName));
+            }
             this.fileAffinities = new Map(data.fileAffinities || []);
             for (const account of data.accounts) {
                 if (typeof account.key !== "string" || !account.models || typeof account.models !== "object")
@@ -712,6 +762,7 @@ class ModelScheduler {
             if (error.code !== "ENOENT") {
                 this.accounts.clear();
                 this.fileAffinities.clear();
+                this.hiddenModels.clear();
                 this.logger.warn(`[Scheduler] Cannot load state: ${error.message}`);
                 // Preserve malformed state for diagnosis before a new snapshot replaces it.
                 try {
@@ -741,7 +792,8 @@ class ModelScheduler {
                 JSON.stringify({
                     accounts: [...this.accounts.values()],
                     fileAffinities: [...this.fileAffinities],
-                    version: 3,
+                    hiddenModels: this.hiddenModelsSnapshot(),
+                    version: 4,
                 }),
                 {
                     mode: 0o600,
@@ -762,4 +814,4 @@ class ModelScheduler {
         this.flush();
     }
 }
-module.exports = { classifyError, getModelDailyQuota, ModelScheduler };
+module.exports = { classifyError, getModelDailyQuota, ModelScheduler, normalizeModelName };

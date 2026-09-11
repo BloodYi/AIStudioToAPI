@@ -132,6 +132,33 @@ class StatusRoutes {
             if (ids.some(id => !valid.has(id))) return res.status(400).json({ error: "Unknown account ID" });
             this._sendJsonWithEtag(req, res, scheduler.accountsSnapshot(ids));
         });
+        app.get("/api/scheduler/models/hidden", isAuthenticated, (req, res) => {
+            const scheduler = this.serverSystem.scheduler;
+            if (!scheduler) return res.status(409).json({ error: "Scheduler is in legacy mode" });
+            res.json({ models: scheduler.hiddenModelsSnapshot() });
+        });
+        app.post("/api/scheduler/models/hide", isAuthenticated, (req, res) => {
+            const scheduler = this.serverSystem.scheduler;
+            if (!scheduler) return res.status(409).json({ error: "Scheduler is in legacy mode" });
+            try {
+                const result = scheduler.hideModel(req.body?.model);
+                this.logger.info(`[Scheduler] Admin hid model from dashboard: ${result.model}`);
+                res.json({ success: true, ...result });
+            } catch (error) {
+                res.status(error.status || 500).json({ error: error.message });
+            }
+        });
+        app.post("/api/scheduler/models/show", isAuthenticated, (req, res) => {
+            const scheduler = this.serverSystem.scheduler;
+            if (!scheduler) return res.status(409).json({ error: "Scheduler is in legacy mode" });
+            try {
+                const result = scheduler.showModel(req.body?.model);
+                this.logger.info(`[Scheduler] Admin restored model to dashboard: ${result.model}`);
+                res.json({ success: true, ...result });
+            } catch (error) {
+                res.status(error.status || 500).json({ error: error.message });
+            }
+        });
         app.post("/api/scheduler/reset-rate-limits", isAuthenticated, (req, res) => {
             const scheduler = this.serverSystem.scheduler;
             if (!scheduler) return res.status(409).json({ error: "Scheduler is in legacy mode" });

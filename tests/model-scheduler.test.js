@@ -169,6 +169,113 @@ test("state persists across restart but leases never do", async () => {
     fs.rmSync(directory, { recursive: true });
 });
 
+test("hidden models are filtered only from management snapshots and remain schedulable", async () => {
+    const scheduler = setup(
+        {
+            allocation: {
+                "gemini-3-flash": { min: 0, preferred: 1 },
+                "gemini-3-pro": { min: 0, preferred: 1 },
+            },
+        },
+        1
+    );
+    const account = scheduler.account(0);
+    const slot = scheduler.slot(account, "gemini-3-flash");
+    Object.assign(slot, {
+        cooldown_until: Date.now() + 60000,
+        daily_failure_count: 2,
+        daily_request_count: 7,
+        failure_count: 3,
+        last_error: "quota",
+        rate_limited: true,
+        request_count: 9,
+    });
+    const before = { ...slot };
+
+    const revision = scheduler.sequence;
+    assert.deepEqual(scheduler.hideModel(" models/gemini-3-flash "), {
+        changed: true,
+        hidden: true,
+        model: "gemini-3-flash",
+    });
+    assert.ok(scheduler.sequence > revision);
+    assert.deepEqual(scheduler.hideModel("gemini-3-flash"), {
+        changed: false,
+        hidden: true,
+        model: "gemini-3-flash",
+    });
+    assert.deepEqual(scheduler.hiddenModelsSnapshot(), ["gemini-3-flash"]);
+    assert.equal(scheduler._snapshotModels().has("gemini-3-flash"), true);
+    assert.equal(
+        scheduler.summarySnapshot().models.some(model => model.model === "gemini-3-flash"),
+        false
+    );
+    assert.equal(
+        scheduler.summarySnapshot().quota_by_model.some(model => model.model === "gemini-3-flash"),
+        false
+    );
+    assert.equal(Object.hasOwn(scheduler.snapshot().accounts[0].models, "gemini-3-flash"), false);
+    assert.deepEqual(slot, before);
+
+    slot.cooldown_until = 0;
+    slot.rate_limited = false;
+    const lease = await scheduler.acquire("gemini-3-flash");
+    scheduler.startAttempt(lease);
+    scheduler.release(lease, true);
+    assert.equal(scheduler.isModelHidden("gemini-3-flash"), true);
+    assert.equal(slot.request_count, 10);
+    assert.equal(
+        scheduler.summarySnapshot().models.some(model => model.model === "gemini-3-flash"),
+        false
+    );
+
+    assert.deepEqual(scheduler.showModel("gemini-3-flash"), {
+        changed: true,
+        hidden: false,
+        model: "gemini-3-flash",
+    });
+    assert.equal(scheduler.snapshot().accounts[0].models["gemini-3-flash"].request_count, 10);
+    assert.equal(scheduler.showModel("gemini-3-flash").changed, false);
+    assert.throws(
+        () => scheduler.hideModel("__files__"),
+        error => error.status === 400
+    );
+    assert.throws(
+        () => scheduler.hideModel("missing-model"),
+        error => error.status === 404
+    );
+    scheduler.hideModel("gemini-3-flash");
+    scheduler.hideModel("gemini-3-pro");
+    const emptySnapshot = scheduler.snapshot();
+    assert.deepEqual(emptySnapshot.models, []);
+    assert.deepEqual(emptySnapshot.quota_by_model, []);
+    assert.equal(emptySnapshot.estimated_remaining_quota, 0);
+    assert.equal(emptySnapshot.quota_tracked_models, 0);
+    assert.deepEqual(emptySnapshot.accounts[0].models, {});
+    scheduler.close();
+});
+
+test("hidden models persist in version 4 state and legacy states default to visible", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "scheduler-hidden-"));
+    const statePath = path.join(directory, "state.json");
+    const first = setup({ allocation: { flash: { min: 0, preferred: 1 } }, statePath }, 1);
+    first.hideModel("flash");
+    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 4);
+    const second = setup({ allocation: { flash: { min: 0, preferred: 1 } }, statePath }, 1);
+    assert.deepEqual(second.hiddenModelsSnapshot(), ["flash"]);
+    first.close();
+    second.close();
+
+    const legacy = JSON.parse(fs.readFileSync(statePath));
+    legacy.version = 3;
+    delete legacy.hiddenModels;
+    fs.writeFileSync(statePath, JSON.stringify(legacy));
+    const third = setup({ allocation: { flash: { min: 0, preferred: 1 } }, statePath }, 1);
+    assert.deepEqual(third.hiddenModelsSnapshot(), []);
+    third.close();
+    fs.rmSync(directory, { recursive: true });
+});
+
 test("Pacific date keys honor PST, PDT and daylight-saving transitions", () => {
     const scheduler = setup({}, 1);
     assert.equal(scheduler.getPacificDateKey(Date.parse("2026-01-01T07:59:59Z")), "2025-12-31");
@@ -313,7 +420,7 @@ test("corrupt state is backed up and inflight reset does not persist a lock", ()
     assert.equal(scheduler.accounts.size, 0);
     assert.ok(fs.readdirSync(directory).some(name => name.includes(".corrupt-")));
     scheduler.close();
-    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 3);
+    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 4);
     fs.rmSync(directory, { recursive: true });
 });
 

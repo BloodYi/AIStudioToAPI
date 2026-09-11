@@ -159,3 +159,65 @@ test("dashboard and scheduler detail routes keep heavy fields out of realtime re
     assert.deepEqual(invoke("/api/scheduler/accounts", { ids: "0" }).body.accounts[0].models, []);
     assert.equal(invoke("/api/scheduler/accounts", { ids: "bad" }).statusCode, 400);
 });
+
+test("scheduler model visibility routes authenticate and return stable results", async () => {
+    const routes = new Map();
+    const app = {};
+    for (const method of ["delete", "get", "post", "put", "use"])
+        app[method] = (route, ...handlers) => routes.set(`${method}:${route}`, handlers);
+    const hidden = new Set(["z-model", "a-model"]);
+    const scheduler = {
+        hiddenModelsSnapshot: () => [...hidden].sort(),
+        hideModel(model) {
+            if (model === "missing") throw Object.assign(new Error("Unknown scheduler model missing"), { status: 404 });
+            const changed = !hidden.has(model);
+            hidden.add(model);
+            return { changed, hidden: true, model };
+        },
+        showModel(model) {
+            const changed = hidden.delete(model);
+            return { changed, hidden: false, model };
+        },
+        workers: [],
+    };
+    const serverSystem = { config: {}, distIndexPath: "", logger, requestHandler: {}, scheduler };
+    const isAuthenticated = (req, res, next) =>
+        req.authenticated ? next() : res.status(401).json({ error: "Unauthorized" });
+    new StatusRoutes(serverSystem).setupRoutes(app, isAuthenticated);
+
+    const invoke = async (method, route, { authenticated = true, body } = {}) => {
+        const response = {
+            json(value) {
+                this.body = value;
+                return this;
+            },
+            status(code) {
+                this.statusCode = code;
+                return this;
+            },
+            statusCode: 200,
+        };
+        const handlers = routes.get(`${method}:${route}`);
+        let index = 0;
+        const request = { authenticated, body };
+        const next = () => handlers[++index](request, response, next);
+        await handlers[0](request, response, next);
+        return response;
+    };
+
+    assert.equal((await invoke("post", "/api/scheduler/models/hide", { authenticated: false })).statusCode, 401);
+    assert.deepEqual((await invoke("get", "/api/scheduler/models/hidden")).body.models, ["a-model", "z-model"]);
+    assert.deepEqual((await invoke("post", "/api/scheduler/models/hide", { body: { model: "new-model" } })).body, {
+        changed: true,
+        hidden: true,
+        model: "new-model",
+        success: true,
+    });
+    assert.equal((await invoke("post", "/api/scheduler/models/hide", { body: { model: "missing" } })).statusCode, 404);
+    assert.deepEqual((await invoke("post", "/api/scheduler/models/show", { body: { model: "new-model" } })).body, {
+        changed: true,
+        hidden: false,
+        model: "new-model",
+        success: true,
+    });
+});
