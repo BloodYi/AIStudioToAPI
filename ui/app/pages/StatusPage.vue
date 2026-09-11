@@ -2846,6 +2846,7 @@ const t = (key, options) => {
 // Stats tab state (reused from UsageStatsPage)
 const statsState = reactive({
     accounts: [],
+    models: [],
     records: [],
     startedAt: null,
     summary: {
@@ -2855,6 +2856,7 @@ const statsState = reactive({
         errorCount: 0,
         formatBreakdown: [],
         requestCategoryBreakdown: [],
+        streamModeBreakdown: [],
         successCount: 0,
         successRate: 0,
         totalRequests: 0,
@@ -3230,6 +3232,13 @@ const recordsPaginationResetKey = computed(() =>
 
 // Computed: summary recalculated from filtered records
 const filteredSummary = computed(() => {
+    if (!hasActiveStatsFilters.value) {
+        return {
+            ...statsState.summary,
+            failedRequests: statsState.summary.errorCount,
+            streamModeBreakdown: statsState.summary.streamModeBreakdown || [],
+        };
+    }
     const records = filteredRecords.value;
     if (!records.length) {
         return {
@@ -3301,6 +3310,7 @@ const filteredSummary = computed(() => {
 
 // Computed: per-account stats recalculated from filtered records
 const filteredAccounts = computed(() => {
+    if (!hasActiveStatsFilters.value) return statsState.accounts;
     const records = filteredRecords.value;
     if (!records.length) return [];
     const accountMap = {};
@@ -3353,6 +3363,7 @@ const filteredAccounts = computed(() => {
 });
 
 const filteredModels = computed(() => {
+    if (!hasActiveStatsFilters.value) return statsState.models;
     const records = filteredRecords.value;
     if (!records.length) return [];
 
@@ -3498,6 +3509,7 @@ const fetchUsageStats = async (signal, includeRecords = true) => {
     const data = await res.json();
     const recordsData = recordsRes ? await recordsRes.json() : null;
     statsState.accounts = data.accounts || [];
+    statsState.models = data.models || [];
     if (recordsData) {
         if (usageDatasetRevision !== recordsData.dataset_revision || latestUsageSequence === null) {
             statsState.records = recordsData.records || [];

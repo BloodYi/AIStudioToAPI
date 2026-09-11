@@ -57,6 +57,12 @@ class UsageStatsService {
         if (!this.categoryStats) {
             this.categoryStats = new Map();
         }
+        if (!this.streamModeStats) {
+            this.streamModeStats = new Map();
+        }
+        if (!this.modelStats) {
+            this.modelStats = new Map();
+        }
         if (this.sequence === undefined) {
             this.sequence = 0;
         }
@@ -185,7 +191,9 @@ class UsageStatsService {
         this._updateSummary(record);
         this._updateBreakdown(this.formatStats, record.apiFormat);
         this._updateBreakdown(this.categoryStats, record.requestCategory);
+        this._updateBreakdown(this.streamModeStats, record.streamMode);
         this._updateAccountStats(record);
+        this._updateModelStats(record);
 
         // Append record to file (one line per record)
         this._appendRecord(record);
@@ -236,6 +244,7 @@ class UsageStatsService {
         return {
             accounts,
             dataset_revision: this.datasetRevision,
+            models: this._serializeModelStats(),
             startedAt: this.startedAt,
             summary: {
                 abortedCount: this.summary.abortedCount,
@@ -244,6 +253,7 @@ class UsageStatsService {
                 errorCount: this.summary.errorCount,
                 formatBreakdown: this._serializeBreakdown(this.formatStats),
                 requestCategoryBreakdown: this._serializeBreakdown(this.categoryStats),
+                streamModeBreakdown: this._serializeBreakdown(this.streamModeStats),
                 successCount: this.summary.successCount,
                 successRate,
                 totalRequests,
@@ -622,12 +632,16 @@ class UsageStatsService {
         this.accountStats = new Map();
         this.formatStats = new Map();
         this.categoryStats = new Map();
+        this.streamModeStats = new Map();
+        this.modelStats = new Map();
 
         for (const record of this.records) {
             this._updateSummary(record);
             this._updateBreakdown(this.formatStats, record.apiFormat);
             this._updateBreakdown(this.categoryStats, record.requestCategory);
+            this._updateBreakdown(this.streamModeStats, record.streamMode);
             this._updateAccountStats(record);
+            this._updateModelStats(record);
         }
     }
 
@@ -695,6 +709,49 @@ class UsageStatsService {
         }
 
         this.accountStats.set(accountKey, existing);
+    }
+
+    _updateModelStats(record) {
+        const modelKey = record.model || "unknown";
+        const existing = this.modelStats.get(modelKey) || {
+            abortedCount: 0,
+            accountCounts: {},
+            errorCount: 0,
+            modelKey,
+            successCount: 0,
+            totalDurationMs: 0,
+            totalRequests: 0,
+        };
+        existing.totalRequests += 1;
+        existing.totalDurationMs += this._normalizeDurationMs(record.durationMs);
+        if (record.outcome === "success") existing.successCount += 1;
+        else if (record.outcome === "aborted") existing.abortedCount += 1;
+        else existing.errorCount += 1;
+
+        const accountKey = record.accountKey || this._buildAccountKey(record.finalAuthIndex, record.finalAccountName);
+        const account = existing.accountCounts[accountKey] || {
+            accountName: record.finalAccountName,
+            authIndex: record.finalAuthIndex,
+            count: 0,
+            error: 0,
+            key: accountKey,
+        };
+        account.count += 1;
+        if (record.outcome === "error") account.error += 1;
+        existing.accountCounts[accountKey] = account;
+        this.modelStats.set(modelKey, existing);
+    }
+
+    _serializeModelStats() {
+        return [...this.modelStats.values()]
+            .map(model => ({
+                ...model,
+                accountCounts: Object.values(model.accountCounts).sort((a, b) => b.count - a.count),
+                avgDurationMs: model.totalRequests > 0 ? Math.round(model.totalDurationMs / model.totalRequests) : 0,
+                successRate:
+                    model.totalRequests > 0 ? Number(((model.successCount / model.totalRequests) * 100).toFixed(1)) : 0,
+            }))
+            .sort((a, b) => b.totalRequests - a.totalRequests);
     }
 
     _serializeBreakdown(sourceMap) {
@@ -770,6 +827,7 @@ class UsageStatsService {
     static createEmptySnapshot() {
         return {
             accounts: [],
+            models: [],
             records: [],
             startedAt: null,
             summary: {
@@ -779,6 +837,7 @@ class UsageStatsService {
                 errorCount: 0,
                 formatBreakdown: [],
                 requestCategoryBreakdown: [],
+                streamModeBreakdown: [],
                 successCount: 0,
                 successRate: 0,
                 totalRequests: 0,

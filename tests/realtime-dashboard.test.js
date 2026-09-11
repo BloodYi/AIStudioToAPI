@@ -19,6 +19,11 @@ test("usage summary is bounded and records use stable opaque cursors", async () 
     const summary = service.getSummarySnapshot();
     assert.equal(Object.hasOwn(summary, "records"), false);
     assert.equal(summary.summary.totalRequests, 25);
+    assert.equal(summary.summary.successCount + summary.summary.errorCount, 25);
+    assert.equal(
+        summary.models.reduce((total, model) => total + model.totalRequests, 0),
+        25
+    );
 
     const first = service.queryRecords({ limit: 10 });
     const second = service.queryRecords({ cursor: first.next_cursor, limit: 10 });
