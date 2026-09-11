@@ -13,9 +13,9 @@ const PACIFIC_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 const DAILY_QUOTAS = Object.freeze({ flash: 100, pro: 10 });
 
 function getModelDailyQuota(model) {
-    const segments = String(model || "")
-        .toLowerCase()
-        .split("-");
+    const normalized = String(model || "").toLowerCase();
+    if (normalized.startsWith("__") || normalized.includes("embedding") || normalized.includes("imagen")) return null;
+    const segments = normalized.split("-");
     if (segments.includes("flash")) return DAILY_QUOTAS.flash;
     if (segments.includes("pro")) return DAILY_QUOTAS.pro;
     return null;
@@ -111,6 +111,7 @@ class ModelScheduler {
         const date = this.getPacificDateKey(now);
         if (slot.daily_request_date === date) return false;
         slot.daily_request_count = 0;
+        slot.daily_failure_count = 0;
         slot.daily_request_date = date;
         return true;
     }
@@ -120,6 +121,7 @@ class ModelScheduler {
             account.models[model] = {
                 consecutive_failures: 0,
                 cooldown_until: 0,
+                daily_failure_count: 0,
                 daily_request_count: 0,
                 daily_request_date: this.getPacificDateKey(now),
                 failure_count: 0,
@@ -354,6 +356,8 @@ class ModelScheduler {
         }
         lease.recorded = true;
         const { account, slot } = lease;
+        this.rolloverDailyUsage(slot);
+        slot.daily_failure_count++;
         slot.failure_count++;
         this.metrics.upstream_error++;
         slot.consecutive_failures++;
@@ -457,96 +461,175 @@ class ModelScheduler {
         this.drain();
     }
 
-    snapshot() {
-        const now = Date.now();
-        const indices = this.authSource.getRotationIndices();
-        for (const index of this.authSource.availableIndices) this.account(index);
-        const models = new Set([
+    _snapshotModels() {
+        return new Set([
             ...Object.keys(this.config.allocation),
             ...this.pending.map(item => item.model),
             ...[...this.accounts.values()].flatMap(account => Object.keys(account.models)),
         ]);
+    }
+
+    _slotStatus(account, slot, rotationIndices) {
+        if (!account.healthy || !rotationIndices.includes(account.index)) return "UNHEALTHY";
+        if (slot.unsupported) return "UNSUPPORTED";
+        if (slot.rate_limited) return "RATE_LIMITED";
+        if (slot.cooldown_until) return "COOLDOWN";
+        return "HEALTHY";
+    }
+
+    summarySnapshot() {
+        const now = Date.now();
+        const indices = this.authSource.getRotationIndices();
+        for (const index of indices) this.account(index);
+        const models = this._snapshotModels();
         const quotaModels = [...models]
             .map(model => ({ limit: getModelDailyQuota(model), model }))
-            .filter(entry => entry.limit !== null);
+            .filter(entry => entry.limit !== null)
+            .sort((a, b) => a.model.localeCompare(b.model));
         const quotaAccounts = indices.map(index => this.account(index));
-        let estimatedRemainingQuota = 0;
-        for (const account of quotaAccounts) {
-            for (const { limit, model } of quotaModels) {
+        const quotaByModel = quotaModels.map(({ limit, model }) => {
+            let dailyRequests = 0;
+            let estimatedRemainingQuota = 0;
+            for (const account of quotaAccounts) {
                 const slot = this.slot(account, model, now);
+                dailyRequests += slot.daily_request_count;
                 estimatedRemainingQuota += Math.max(0, limit - slot.daily_request_count);
             }
-        }
-        const accounts = [...this.accounts.values()].map(account => ({
-            ...account,
-            models: Object.fromEntries(
-                Object.keys(account.models).map(model => {
-                    const slot = this.slot(account, model, now);
-                    const available =
-                        account.healthy && indices.includes(account.index) && !slot.unsupported && !slot.cooldown_until;
-                    return [
-                        model,
-                        {
-                            ...slot,
-                            available,
-                            daily_requests: slot.daily_request_count,
-                            status:
-                                !account.healthy || !indices.includes(account.index)
-                                    ? "UNHEALTHY"
-                                    : slot.unsupported
-                                      ? "UNSUPPORTED"
-                                      : slot.rate_limited
-                                        ? "RATE_LIMITED"
-                                        : slot.cooldown_until
-                                          ? "COOLDOWN"
-                                          : "HEALTHY",
-                        },
-                    ];
-                })
-            ),
-        }));
+            return {
+                daily_requests: dailyRequests,
+                estimated_remaining_quota: estimatedRemainingQuota,
+                model,
+                quota_per_account: limit,
+                tracked_accounts: quotaAccounts.length,
+            };
+        });
         const contexts = this.browserManager?.getContextPoolSnapshot?.() || [];
         const contextCount = state => contexts.filter(context => context.state === state).length;
         const busyContexts = contextCount("BUSY");
-        const readyContexts = contextCount("READY") + busyContexts;
+        const readyContexts = contextCount("READY");
         return {
-            accounts,
             active_browser_workers: busyContexts,
             active_workers: this.workers.filter(worker => worker.lease).length,
             busy_browser_workers: busyContexts,
-            contexts,
-            estimated_remaining_quota: estimatedRemainingQuota,
-            idle_browser_workers: contextCount("READY"),
+            contexts_summary: {
+                busy: busyContexts,
+                initializing: contextCount("INITIALIZING"),
+                max: this.config.maxWorkers,
+                ready: readyContexts,
+                reconnecting: contextCount("RECONNECTING"),
+                unavailable: contextCount("UNAVAILABLE"),
+            },
+            idle_browser_workers: readyContexts,
             idle_workers: this.workers.filter(worker => !worker.lease).length,
             initializing_browser_workers: contextCount("INITIALIZING"),
             max_browser_workers: this.config.maxWorkers,
             metrics: this.metricsSnapshot(),
-            models: [...models].map(model => {
-                const slots = accounts.map(account => account.models[model]).filter(Boolean);
-                return {
-                    active_workers: this.active(model),
-                    available_accounts: this.eligibleAccounts(model, new Set()).length,
-                    configured_workers: this.config.allocation[model] || { min: 0, preferred: 1 },
-                    daily_requests: slots.reduce((sum, slot) => sum + slot.daily_request_count, 0),
-                    failures: slots.reduce((sum, slot) => sum + slot.failure_count, 0),
-                    model,
-                    queue_length: this.pending.filter(item => item.model === model).length,
-                    rate_limited_accounts: slots.filter(slot => slot.rate_limited).length,
-                    ready_accounts: this.readyCandidates(model, new Set()).length,
-                    requests: slots.reduce((sum, slot) => sum + slot.request_count, 0),
-                    success: slots.reduce((sum, slot) => sum + slot.success_count, 0),
-                };
-            }),
+            models: [...models]
+                .map(model => {
+                    const slots = [...this.accounts.values()]
+                        .map(account => (Object.hasOwn(account.models, model) ? this.slot(account, model, now) : null))
+                        .filter(Boolean);
+                    return {
+                        active_workers: this.active(model),
+                        available_accounts: this.eligibleAccounts(model, new Set()).length,
+                        configured_workers: this.config.allocation[model] || { min: 0, preferred: 1 },
+                        daily_requests: slots.reduce((sum, slot) => sum + slot.daily_request_count, 0),
+                        model,
+                        queue_length: this.pending.filter(item => item.model === model).length,
+                        rate_limited_accounts: slots.filter(slot => slot.rate_limited).length,
+                        ready_accounts: this.readyCandidates(model, new Set()).length,
+                    };
+                })
+                .sort((a, b) => a.model.localeCompare(b.model)),
             queued_requests: this.pending.length,
-            quota_tracked_accounts: quotaAccounts.length,
-            quota_tracked_models: quotaModels.length,
-            ready_browser_workers: readyContexts,
+            quota_by_model: quotaByModel,
+            ready_browser_workers: readyContexts + busyContexts,
             reconnecting_browser_workers: contextCount("RECONNECTING"),
             unavailable_browser_workers: contextCount("UNAVAILABLE"),
             usage_window: {
                 date: this.getPacificDateKey(now),
                 timezone: PACIFIC_TIMEZONE,
             },
+        };
+    }
+
+    contextsSnapshot() {
+        const contexts = this.browserManager?.getContextPoolSnapshot?.() || [];
+        return {
+            contexts: contexts.map(context => ({
+                auth_index: context.auth_index,
+                connection_epoch: context.connection_epoch || null,
+                inflight: context.inflight || 0,
+                last_disconnect_reason: context.last_disconnect_reason
+                    ? String(context.last_disconnect_reason).slice(0, 500)
+                    : null,
+                state: context.state,
+            })),
+            revision: `contexts:${this.sequence}:${contexts.length}`,
+        };
+    }
+
+    accountsSnapshot(indices) {
+        const rotationIndices = this.authSource.getRotationIndices();
+        const requested = indices === undefined ? rotationIndices : indices;
+        const now = Date.now();
+        return {
+            accounts: requested.map(index => {
+                const account = this.account(index);
+                return {
+                    healthy: account.healthy,
+                    index: account.index,
+                    inflight: account.inflight,
+                    key: account.key,
+                    models: Object.keys(account.models)
+                        .sort()
+                        .map(model => {
+                            const slot = this.slot(account, model, now);
+                            return {
+                                cooldown_until: slot.cooldown_until || null,
+                                daily_failures: slot.daily_failure_count,
+                                daily_requests: slot.daily_request_count,
+                                inflight: slot.inflight,
+                                last_error: slot.last_error ? String(slot.last_error).slice(0, 500) : null,
+                                model,
+                                status: this._slotStatus(account, slot, rotationIndices),
+                            };
+                        }),
+                };
+            }),
+            revision: `accounts:${this.sequence}`,
+        };
+    }
+
+    snapshot() {
+        const summary = this.summarySnapshot();
+        const details = this.accountsSnapshot([...this.accounts.values()].map(account => account.index));
+        const accounts = details.accounts.map(account => ({
+            ...account,
+            models: Object.fromEntries(
+                account.models.map(slot => {
+                    const internal = this.account(account.index).models[slot.model];
+                    return [slot.model, { ...internal, ...slot }];
+                })
+            ),
+        }));
+        const quotaTotal = summary.quota_by_model.reduce((sum, item) => sum + item.estimated_remaining_quota, 0);
+        return {
+            ...summary,
+            accounts,
+            contexts: this.contextsSnapshot().contexts,
+            estimated_remaining_quota: quotaTotal,
+            models: summary.models.map(model => {
+                const slots = [...this.accounts.values()].map(account => account.models[model.model]).filter(Boolean);
+                return {
+                    ...model,
+                    failures: slots.reduce((sum, slot) => sum + slot.failure_count, 0),
+                    requests: slots.reduce((sum, slot) => sum + slot.request_count, 0),
+                    success: slots.reduce((sum, slot) => sum + slot.success_count, 0),
+                };
+            }),
+            quota_tracked_accounts: this.authSource.getRotationIndices().length,
+            quota_tracked_models: summary.quota_by_model.length,
             workers: this.workers.map(worker => ({
                 account_id: worker.lease?.account.index ?? null,
                 id: worker.id,
@@ -590,7 +673,7 @@ class ModelScheduler {
         if (!this.config.statePath) return;
         try {
             const data = JSON.parse(fs.readFileSync(this.config.statePath, "utf8"));
-            if (![1, 2].includes(data.version) || !Array.isArray(data.accounts))
+            if (![1, 2, 3].includes(data.version) || !Array.isArray(data.accounts))
                 throw new Error("Unsupported scheduler state");
             this.fileAffinities = new Map(data.fileAffinities || []);
             for (const account of data.accounts) {
@@ -601,6 +684,7 @@ class ModelScheduler {
                 for (const slot of Object.values(account.models)) {
                     if (data.version === 1) {
                         slot.daily_request_count = 0;
+                        slot.daily_failure_count = 0;
                         slot.daily_request_date = this.getPacificDateKey();
                     } else if (
                         !Number.isInteger(slot.daily_request_count) ||
@@ -609,6 +693,9 @@ class ModelScheduler {
                     ) {
                         throw new Error("Invalid daily scheduler state");
                     }
+                    if (data.version === 2) slot.daily_failure_count = 0;
+                    if (!Number.isInteger(slot.daily_failure_count) || slot.daily_failure_count < 0)
+                        throw new Error("Invalid daily scheduler failure state");
                     slot.inflight = 0;
                 }
                 this.accounts.set(account.key, account);
@@ -616,6 +703,10 @@ class ModelScheduler {
             if (data.version === 1)
                 this.logger.warn(
                     "[Scheduler] Upgraded version 1 state: today's Pacific-time request counts start at zero; cumulative statistics were preserved."
+                );
+            if (data.version === 2)
+                this.logger.warn(
+                    "[Scheduler] Upgraded version 2 state: today's Pacific-time failure counts start at zero; cumulative statistics were preserved."
                 );
         } catch (error) {
             if (error.code !== "ENOENT") {
@@ -650,7 +741,7 @@ class ModelScheduler {
                 JSON.stringify({
                     accounts: [...this.accounts.values()],
                     fileAffinities: [...this.fileAffinities],
-                    version: 2,
+                    version: 3,
                 }),
                 {
                     mode: 0o600,

@@ -201,6 +201,27 @@ test("daily attempts count once per lease and roll over without changing cumulat
     scheduler.close();
 });
 
+test("upstream failures use the Pacific daily window while aborts and transport errors do not", async () => {
+    const scheduler = setup({}, 1);
+    const lease = await scheduler.acquire("gemini-3-flash");
+    scheduler.startAttempt(lease);
+    scheduler.failure(lease, { message: "quota", status: 429 });
+    assert.equal(lease.slot.daily_failure_count, 1);
+    assert.equal(scheduler.accountsSnapshot([lease.account.index]).accounts[0].models[0].daily_failures, 1);
+    scheduler.release(lease);
+
+    const aborted = { account: lease.account, recorded: false, slot: lease.slot };
+    scheduler.failure(aborted, { reason: "client_disconnect" });
+    assert.equal(aborted.slot.daily_failure_count, 1);
+
+    aborted.slot.daily_request_date = "2000-01-01";
+    const cumulativeFailures = aborted.slot.failure_count;
+    scheduler.summarySnapshot();
+    assert.equal(aborted.slot.daily_failure_count, 0);
+    assert.equal(aborted.slot.failure_count, cumulativeFailures);
+    scheduler.close();
+});
+
 test("version 1 state preserves cumulative values and initializes daily usage at zero", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "scheduler-v1-"));
     const statePath = path.join(directory, "state.json");
@@ -235,7 +256,7 @@ test("quota estimates use valid accounts, hyphen segments and clamp each slot at
     assert.equal(getModelDailyQuota("gemini-3-pro-preview"), 10);
     assert.equal(getModelDailyQuota("gemini-profile"), null);
     assert.equal(getModelDailyQuota("flashlight"), null);
-    assert.equal(getModelDailyQuota("imagen-flash"), 100);
+    assert.equal(getModelDailyQuota("imagen-flash"), null);
     assert.equal(getModelDailyQuota("__files__"), null);
 
     const auth = {
@@ -267,6 +288,11 @@ test("quota estimates use valid accounts, hyphen segments and clamp each slot at
     assert.equal(snapshot.quota_tracked_accounts, 2);
     assert.equal(snapshot.quota_tracked_models, 3);
     assert.equal(snapshot.estimated_remaining_quota, 317);
+    assert.deepEqual(
+        snapshot.quota_by_model.map(item => item.model),
+        ["gemini-3-flash", "gemini-3-flash-lite", "gemini-3-pro-preview"]
+    );
+    assert.equal(snapshot.quota_by_model.find(item => item.model === "gemini-3-flash").estimated_remaining_quota, 97);
     assert.equal(snapshot.models.find(model => model.model === "gemini-3-flash").daily_requests, 123);
     scheduler.close();
 });
@@ -287,7 +313,7 @@ test("corrupt state is backed up and inflight reset does not persist a lock", ()
     assert.equal(scheduler.accounts.size, 0);
     assert.ok(fs.readdirSync(directory).some(name => name.includes(".corrupt-")));
     scheduler.close();
-    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 2);
+    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 3);
     fs.rmSync(directory, { recursive: true });
 });
 

@@ -47,6 +47,8 @@ class LoggingService {
     constructor(serviceName = "ProxyServer") {
         this.serviceName = serviceName;
         this.logBuffer = [];
+        this.logEntries = [];
+        this.logSequence = 0;
         this.displayLimit = 100;
         this.maxBufferSize = 1000;
     }
@@ -98,12 +100,33 @@ class LoggingService {
         const formatted = `[${level}] ${timestamp} [${this.serviceName}] - ${message}`;
 
         this.logBuffer.push(formatted);
+        this.logEntries.push({ line: formatted, sequence: ++this.logSequence });
         // Physical hard limit for memory safety
         if (this.logBuffer.length > this.maxBufferSize) {
             this.logBuffer.shift();
+            this.logEntries.shift();
         }
 
         return formatted;
+    }
+
+    getLogsAfter(after) {
+        const latest = this.logSequence;
+        const oldest = this.logEntries[0]?.sequence ?? latest + 1;
+        const hasCursor = after !== undefined && after !== null && after !== "";
+        const cursor = hasCursor ? Number(after) : null;
+        if (hasCursor && (!Number.isInteger(cursor) || cursor < 0)) {
+            throw Object.assign(new Error("Invalid log cursor"), { status: 400 });
+        }
+        const reset = !hasCursor || cursor < oldest - 1 || cursor > latest;
+        const entries = reset
+            ? this.logEntries.slice(-this.displayLimit)
+            : this.logEntries.filter(entry => entry.sequence > cursor);
+        return {
+            cursor: entries.at(-1)?.sequence ?? latest,
+            lines: entries.map(entry => entry.line),
+            reset,
+        };
     }
 
     info(message) {

@@ -7,6 +7,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const archiver = require("archiver");
 const VersionChecker = require("../utils/VersionChecker");
 const LoggingService = require("../utils/LoggingService");
@@ -47,6 +48,14 @@ class StatusRoutes {
         });
     }
 
+    _sendJsonWithEtag(req, res, body, includeGeneratedAt = false) {
+        const etag = `"${crypto.createHash("sha1").update(JSON.stringify(body)).digest("base64url")}"`;
+        res.setHeader("ETag", etag);
+        res.setHeader("Cache-Control", "private, no-cache");
+        if (req.headers?.["if-none-match"] === etag) return res.status(304).end();
+        return res.json(includeGeneratedAt ? { generated_at: new Date().toISOString(), ...body } : body);
+    }
+
     /**
      * Setup status and management routes
      */
@@ -76,6 +85,52 @@ class StatusRoutes {
 
         app.get("/api/scheduler", isAuthenticated, (req, res) => {
             res.json(this.serverSystem.scheduler?.snapshot() || { enabled: false });
+        });
+        app.get("/api/dashboard/realtime", isAuthenticated, (req, res) => {
+            const scheduler = this.serverSystem.scheduler?.summarySnapshot();
+            const core = this._getStatusData(false);
+            this._sendJsonWithEtag(
+                req,
+                res,
+                {
+                    revision: scheduler ? `scheduler:${this.serverSystem.scheduler.sequence}` : "legacy",
+                    scheduler: scheduler
+                        ? { ...scheduler, revision: `scheduler:${this.serverSystem.scheduler.sequence}` }
+                        : { enabled: false },
+                    status: {
+                        browser_connected: core.status.browserConnected,
+                        service_connected: true,
+                    },
+                },
+                true
+            );
+        });
+        app.get("/api/scheduler/contexts", isAuthenticated, (req, res) => {
+            const scheduler = this.serverSystem.scheduler;
+            if (!scheduler) return res.status(409).json({ error: "Scheduler is in legacy mode" });
+            this._sendJsonWithEtag(req, res, scheduler.contextsSnapshot());
+        });
+        app.get("/api/scheduler/accounts", isAuthenticated, (req, res) => {
+            const scheduler = this.serverSystem.scheduler;
+            if (!scheduler) return res.status(409).json({ error: "Scheduler is in legacy mode" });
+            const rawIds = req.query.ids;
+            if (rawIds === undefined || rawIds === "") {
+                const accounts = this.serverSystem.authSource.getRotationIndices().map(index => {
+                    const account = scheduler.account(index);
+                    return { healthy: account.healthy, index, inflight: account.inflight, key: account.key };
+                });
+                return this._sendJsonWithEtag(req, res, {
+                    accounts,
+                    revision: `accounts:${scheduler.sequence}`,
+                });
+            }
+            const parts = String(rawIds).split(",");
+            if (parts.length > 20 || parts.some(part => !/^\d+$/.test(part)))
+                return res.status(400).json({ error: "ids must contain at most 20 account IDs" });
+            const ids = [...new Set(parts.map(Number))];
+            const valid = new Set(this.serverSystem.authSource.availableIndices);
+            if (ids.some(id => !valid.has(id))) return res.status(400).json({ error: "Unknown account ID" });
+            this._sendJsonWithEtag(req, res, scheduler.accountsSnapshot(ids));
         });
         app.post("/api/scheduler/reset-rate-limits", isAuthenticated, (req, res) => {
             const scheduler = this.serverSystem.scheduler;
@@ -243,6 +298,38 @@ class StatusRoutes {
         app.get("/api/usage-stats", isAuthenticated, (req, res) => {
             const snapshot = this.serverSystem.usageStatsService?.getSnapshot();
             res.json(snapshot || UsageStatsService.createEmptySnapshot());
+        });
+
+        app.get("/api/usage-stats/summary", isAuthenticated, (req, res) => {
+            const snapshot = this.serverSystem.usageStatsService?.getSummarySnapshot();
+            res.json(snapshot || UsageStatsService.createEmptySummarySnapshot());
+        });
+
+        app.get("/api/usage-stats/records", isAuthenticated, (req, res) => {
+            try {
+                const result = this.serverSystem.usageStatsService?.queryRecords(req.query) || {
+                    dataset_revision: 0,
+                    has_more: false,
+                    next_cursor: null,
+                    records: [],
+                    reset: false,
+                };
+                res.json(result);
+            } catch (error) {
+                res.status(error.status || 500).json({ error: error.message });
+            }
+        });
+
+        app.get("/api/logs", isAuthenticated, (req, res) => {
+            try {
+                res.json(this.logger.getLogsAfter(req.query.after));
+            } catch (error) {
+                res.status(error.status || 500).json({ error: error.message });
+            }
+        });
+
+        app.get("/api/status/core", isAuthenticated, (req, res) => {
+            res.json(this._getStatusData(false));
         });
 
         app.get("/api/usage-stats/download", isAuthenticated, async (req, res) => {
@@ -1024,7 +1111,7 @@ class StatusRoutes {
         });
     }
 
-    _getStatusData() {
+    _getStatusData(includeLogs = true) {
         const { config, requestHandler, authSource, browserManager } = this.serverSystem;
         const initialIndices = authSource.initialIndices || [];
         const invalidIndices = initialIndices.filter(i => !authSource.availableIndices.includes(i));
@@ -1062,9 +1149,8 @@ class StatusRoutes {
                 ? `${requestHandler.failureCount} / ${config.failureThreshold}`
                 : requestHandler.failureCount;
 
-        return {
+        const result = {
             logCount: displayLogs.length,
-            logs: displayLogs.join("\n"),
             status: {
                 accountDetails,
                 activeContextsCount: browserManager.contexts.size,
@@ -1100,6 +1186,8 @@ class StatusRoutes {
                 usageCount,
             },
         };
+        if (includeLogs) result.logs = displayLogs.join("\n");
+        return result;
     }
 }
 

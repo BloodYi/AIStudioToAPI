@@ -3469,8 +3469,19 @@ const formatAccount = (authIndex, accountName) => {
     }
     return `#${authIndex} ${accountName || "N/A"}`;
 };
-const fetchUsageStats = async () => {
-    const res = await fetch("/api/usage-stats");
+let latestUsageSequence = null;
+let usageDatasetRevision = null;
+const fetchUsageStats = async (signal, includeRecords = true) => {
+    const requests = [fetch("/api/usage-stats/summary", { signal })];
+    if (includeRecords) {
+        const after =
+            latestUsageSequence === null
+                ? ""
+                : `&after_sequence=${latestUsageSequence}&dataset_revision=${usageDatasetRevision}`;
+        requests.push(fetch(`/api/usage-stats/records?limit=100${after}`, { signal }));
+    }
+    const [summaryRes, recordsRes] = await Promise.all(requests);
+    const res = summaryRes;
     if (res.redirected) {
         window.location.href = res.url;
         return;
@@ -3483,9 +3494,23 @@ const fetchUsageStats = async () => {
         throw new Error(`HTTP ${res.status}`);
     }
 
+    if (recordsRes && !recordsRes.ok) throw new Error(`HTTP ${recordsRes.status}`);
     const data = await res.json();
+    const recordsData = recordsRes ? await recordsRes.json() : null;
     statsState.accounts = data.accounts || [];
-    statsState.records = data.records || [];
+    if (recordsData) {
+        if (usageDatasetRevision !== recordsData.dataset_revision || latestUsageSequence === null) {
+            statsState.records = recordsData.records || [];
+        } else if (recordsData.records?.length) {
+            const existing = new Set(statsState.records.map(record => record.sequence));
+            statsState.records = [
+                ...recordsData.records.filter(record => !existing.has(record.sequence)),
+                ...statsState.records,
+            ];
+        }
+        usageDatasetRevision = recordsData.dataset_revision;
+        latestUsageSequence = recordsData.latest_sequence ?? latestUsageSequence;
+    }
     statsState.startedAt = data.startedAt || null;
     statsState.summary = {
         ...statsState.summary,
@@ -3655,15 +3680,31 @@ const handleFilterChange = field => {
     }
 };
 
-const scheduleUpdate = () => {
+const POLL_INTERVAL_MS = 5000;
+let pollInFlight = false;
+let pollController = null;
+let immediateRefreshRequested = false;
+const scheduleUpdate = delay => {
     if (!isActive) return;
-    const randomInterval = 4000 + Math.floor(Math.random() * 3000);
-    updateTimer = setTimeout(async () => {
-        await Promise.all([updateContent(), fetchUsageStats()]).catch(err => {
-            console.error("Error fetching data:", err.message || err);
-        });
-        scheduleUpdate();
-    }, randomInterval);
+    clearTimeout(updateTimer);
+    updateTimer = setTimeout(runPollingRound, Math.max(0, delay));
+};
+const runPollingRound = async () => {
+    if (!isActive || pollInFlight || document.hidden) return scheduleUpdate(POLL_INTERVAL_MS);
+    pollInFlight = true;
+    const startedAt = Date.now();
+    pollController = new AbortController();
+    try {
+        await updateContent(pollController.signal);
+    } catch (err) {
+        if (err.name !== "AbortError") console.error("Error fetching data:", err.message || err);
+    } finally {
+        pollInFlight = false;
+        pollController = null;
+        const delay = immediateRefreshRequested ? 0 : POLL_INTERVAL_MS - (Date.now() - startedAt);
+        immediateRefreshRequested = false;
+        scheduleUpdate(delay);
+    }
 };
 
 const getApiErrorMessage = data => {
@@ -3687,6 +3728,9 @@ const switchTab = tabName => {
     }
 
     activeTab.value = tabName;
+    immediateRefreshRequested = true;
+    pollController?.abort();
+    scheduleUpdate(0);
 
     if (tabName === "logs") {
         nextTick(() => {
@@ -4467,7 +4511,7 @@ const updateStatus = data => {
     state.failureCount = data.status.failureCount;
     state.logCount = data.logCount || 0;
     state.logMaxCount = data.status.logMaxCount || 100;
-    state.logs = data.logs || "";
+    if (Object.hasOwn(data, "logs")) state.logs = data.logs || "";
     state.isSystemBusy = data.status.isSystemBusy;
 
     nextTick(() => {
@@ -4477,11 +4521,28 @@ const updateStatus = data => {
 
 let updateTimer = null;
 let isActive = true;
+let logCursor = null;
 
-const updateContent = async () => {
+const fetchIncrementalLogs = async signal => {
+    const query = logCursor === null ? "" : `?after=${logCursor}`;
+    const response = await fetch(`/api/logs${query}`, { signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const incoming = data.lines || [];
+    if (data.reset) state.logs = incoming.join("\n");
+    else if (incoming.length) state.logs = [state.logs, ...incoming].filter(Boolean).join("\n");
+    if (state.logs) state.logs = state.logs.split("\n").slice(-state.logMaxCount).join("\n");
+    logCursor = data.cursor;
+    state.logCount = state.logs ? state.logs.split("\n").length : 0;
+};
+
+const updateContent = async signal => {
     const dot = document.querySelector(".dot");
     try {
-        const res = await fetch("/api/status");
+        const requests = [fetch("/api/status/core", { signal })];
+        if (activeTab.value === "home") requests.push(fetch("/api/dashboard/realtime", { signal }));
+        const responses = await Promise.all(requests);
+        const res = responses[0];
         if (res.redirected) {
             window.location.href = res.url;
             return;
@@ -4499,9 +4560,19 @@ const updateContent = async () => {
             if (state.serviceConnected) dot.classList.add("status-running");
             else dot.classList.remove("status-running");
         }
-        schedulerData.value = data.scheduler || null;
         updateStatus(data);
+        if (activeTab.value === "home") {
+            if (responses[1].status === 304) return;
+            if (!responses[1].ok) throw new Error(`HTTP ${responses[1].status}`);
+            const dashboard = await responses[1].json();
+            schedulerData.value = dashboard.scheduler || null;
+        } else if (activeTab.value === "stats") {
+            await fetchUsageStats(signal, recordsCurrentPage.value === 1);
+        } else if (activeTab.value === "logs") {
+            await fetchIncrementalLogs(signal);
+        }
     } catch (err) {
+        if (err.name === "AbortError") throw err;
         console.error("Error fetching status:", err.message || err);
         state.serviceConnected = false;
     }
@@ -4987,6 +5058,14 @@ const checkForUpdates = async () => {
     }
 };
 
+const handleVisibilityChange = () => {
+    if (!document.hidden) {
+        immediateRefreshRequested = true;
+        pollController?.abort();
+        scheduleUpdate(0);
+    }
+};
+
 // Theme handling is now managed by useTheme composable
 
 onMounted(() => {
@@ -5002,8 +5081,8 @@ onMounted(() => {
     syncStatsFiltersViewport(statsFiltersMobileMediaQuery);
     statsFiltersMobileMediaQuery.addEventListener("change", syncStatsFiltersViewport);
 
-    updateContent().finally(scheduleUpdate);
-    fetchUsageStats().finally(scheduleUpdate);
+    scheduleUpdate(0);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
 
     // Check for updates once on initial load
     checkForUpdates();
@@ -5014,12 +5093,14 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
     isActive = false;
+    pollController?.abort();
     if (updateTimer) {
         clearTimeout(updateTimer);
     }
     if (statsFiltersMobileMediaQuery) {
         statsFiltersMobileMediaQuery.removeEventListener("change", syncStatsFiltersViewport);
     }
+    document.removeEventListener("visibilitychange", handleVisibilityChange);
     // Clean up global function
     delete window.__copyEnvVar;
 });

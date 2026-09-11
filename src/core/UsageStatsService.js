@@ -17,6 +17,7 @@ class UsageStatsService {
         this.enabled = enabled !== false;
         this.appendPromise = Promise.resolve();
         this.isImportingStats = false;
+        this.datasetRevision = 1;
 
         if (this.enabled) {
             // Ensure data directory exists
@@ -193,8 +194,14 @@ class UsageStatsService {
     }
 
     getSnapshot() {
+        return { ...this.getSummarySnapshot(), records: this.enabled ? this.records.slice().reverse() : [] };
+    }
+
+    getSummarySnapshot() {
         if (!this.enabled) {
-            return UsageStatsService.createEmptySnapshot();
+            const empty = UsageStatsService.createEmptySnapshot();
+            delete empty.records;
+            return { ...empty, dataset_revision: this.datasetRevision };
         }
 
         const totalRequests = this.summary.totalRequests;
@@ -228,8 +235,7 @@ class UsageStatsService {
 
         return {
             accounts,
-            // Return full request history for display and client-side filtering
-            records: this.records.slice().reverse(),
+            dataset_revision: this.datasetRevision,
             startedAt: this.startedAt,
             summary: {
                 abortedCount: this.summary.abortedCount,
@@ -244,6 +250,115 @@ class UsageStatsService {
                 uniqueAccountPairs: this.accountStats.size,
                 uptimeSeconds: Math.max(0, Math.floor((Date.now() - this.startedAtMs) / 1000)),
             },
+        };
+    }
+
+    queryRecords(options = {}) {
+        if (!this.enabled) {
+            return { dataset_revision: this.datasetRevision, has_more: false, next_cursor: null, records: [] };
+        }
+        const allowedLimits = new Set([10, 20, 50, 100]);
+        const limit = Number(options.limit || 20);
+        if (!allowedLimits.has(limit)) throw Object.assign(new Error("Invalid records limit"), { status: 400 });
+
+        if (options.after_sequence !== undefined) {
+            const afterSequence = Number(options.after_sequence);
+            if (!Number.isSafeInteger(afterSequence) || afterSequence < 0)
+                throw Object.assign(new Error("Invalid records sequence"), { status: 400 });
+            if (Number(options.dataset_revision) !== this.datasetRevision) {
+                return {
+                    dataset_revision: this.datasetRevision,
+                    has_more: this.records.length > limit,
+                    latest_sequence: this.sequence,
+                    next_cursor: null,
+                    records: this.records.slice(-limit).reverse(),
+                    reset: true,
+                };
+            }
+            const matching = this.records.filter(record => record.sequence > afterSequence);
+            const selected = matching.slice(0, limit);
+            const records = selected.slice().reverse();
+            return {
+                dataset_revision: this.datasetRevision,
+                has_more: matching.length > limit,
+                latest_sequence: selected.at(-1)?.sequence ?? afterSequence,
+                next_cursor: null,
+                records,
+                reset: false,
+            };
+        }
+
+        let beforeSequence = Infinity;
+        if (options.cursor) {
+            try {
+                const cursor = JSON.parse(Buffer.from(String(options.cursor), "base64url").toString("utf8"));
+                if (cursor.revision !== this.datasetRevision || !Number.isInteger(cursor.before)) {
+                    return {
+                        dataset_revision: this.datasetRevision,
+                        has_more: this.records.length > 0,
+                        next_cursor: null,
+                        records: [],
+                        reset: true,
+                    };
+                }
+                beforeSequence = cursor.before;
+            } catch {
+                throw Object.assign(new Error("Invalid records cursor"), { status: 400 });
+            }
+        }
+
+        const values = value => {
+            if (value === undefined || value === null || value === "") return null;
+            return new Set((Array.isArray(value) ? value : String(value).split(",")).map(item => String(item)));
+        };
+        const model = values(options.model);
+        const outcome = values(options.outcome);
+        const statusCode = values(options.status_code);
+        const authIndex = values(options.auth_index);
+        const apiFormat = values(options.api_format);
+        const requestCategory = values(options.request_category);
+        const streamMode = values(options.stream_mode);
+        const clientIp = values(options.client_ip);
+        const from = options.from ? Date.parse(options.from) : null;
+        const to = options.to ? Date.parse(options.to) : null;
+        if ((options.from && !Number.isFinite(from)) || (options.to && !Number.isFinite(to)))
+            throw Object.assign(new Error("Invalid records time range"), { status: 400 });
+
+        const matches = record => {
+            if ((record.sequence || 0) >= beforeSequence) return false;
+            if (model && !model.has(String(record.model ?? ""))) return false;
+            if (outcome && !outcome.has(String(record.outcome ?? ""))) return false;
+            if (statusCode && !statusCode.has(String(record.statusCode ?? ""))) return false;
+            if (authIndex && !authIndex.has(String(record.finalAuthIndex ?? ""))) return false;
+            if (apiFormat && !apiFormat.has(String(record.apiFormat ?? ""))) return false;
+            if (requestCategory && !requestCategory.has(String(record.requestCategory ?? ""))) return false;
+            if (streamMode && !streamMode.has(String(record.streamMode ?? ""))) return false;
+            if (clientIp && !clientIp.has(String(record.clientIp ?? ""))) return false;
+            const timestamp = Date.parse(record.finishedAt);
+            if (from !== null && timestamp < from) return false;
+            if (to !== null && timestamp > to) return false;
+            return true;
+        };
+        const ordered = [];
+        for (let index = this.records.length - 1; index >= 0 && ordered.length <= limit; index--) {
+            const record = this.records[index];
+            if (matches(record)) ordered.push(record);
+        }
+        const hasMore = ordered.length > limit;
+        const records = ordered.slice(0, limit);
+        const lastSequence = records.at(-1)?.sequence;
+        return {
+            dataset_revision: this.datasetRevision,
+            has_more: hasMore,
+            latest_sequence: this.sequence,
+            next_cursor:
+                hasMore && Number.isInteger(lastSequence)
+                    ? Buffer.from(JSON.stringify({ before: lastSequence, revision: this.datasetRevision })).toString(
+                          "base64url"
+                      )
+                    : null,
+            records,
+            reset: false,
         };
     }
 
@@ -482,6 +597,7 @@ class UsageStatsService {
      */
     _replaceRecords(records) {
         this.records = records;
+        this.datasetRevision = (this.datasetRevision || 0) + 1;
         this.sequence = 0;
         for (const record of records) {
             if (record.sequence > this.sequence) {
@@ -670,6 +786,12 @@ class UsageStatsService {
                 uptimeSeconds: 0,
             },
         };
+    }
+
+    static createEmptySummarySnapshot() {
+        const snapshot = UsageStatsService.createEmptySnapshot();
+        delete snapshot.records;
+        return { ...snapshot, dataset_revision: 0 };
     }
 }
 
