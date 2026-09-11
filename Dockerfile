@@ -70,10 +70,12 @@ RUN ARCH=$(uname -m) && \
 # Layer is rebuilt when source code changes
 COPY --chown=node:node main.js ./
 COPY --chown=node:node vite.config.js ./
+COPY --chown=node:node vite.public.config.js ./
 COPY --chown=node:node src ./src
 COPY --chown=node:node configs ./configs
 COPY --chown=node:node scripts ./scripts
 COPY --chown=node:node ui ./ui
+COPY --chown=node:node ui-public ./ui-public
 
 # Build frontend assets with Vite
 # VERSION is passed from docker build-args for version display in UI
@@ -87,7 +89,7 @@ RUN npm prune --omit=dev && npm cache clean --force
 USER root
 
 # Expose application ports
-EXPOSE 7860
+EXPOSE 7860 7861
 
 # Configure runtime environment
 ENV NODE_ENV=production \

@@ -263,6 +263,56 @@ class UsageStatsService {
         };
     }
 
+    /**
+     * Return a deliberately small public projection. Never build this from
+     * getSummarySnapshot(): that object contains account and request metadata.
+     */
+    getPublicSummarySnapshot(visibleModels = []) {
+        const modelKeys = [...new Set(visibleModels.map(value => String(value)))].sort((a, b) => a.localeCompare(b));
+        if (!this.enabled) {
+            return {
+                enabled: false,
+                models: modelKeys.map(modelKey => ({
+                    averageDurationMs: null,
+                    failedRequests: null,
+                    modelKey,
+                    successRate: null,
+                    totalRequests: null,
+                })),
+                summary: {
+                    averageDurationMs: null,
+                    failedRequests: null,
+                    successRate: null,
+                    totalRequests: null,
+                },
+            };
+        }
+
+        const project = (stats = {}) => {
+            const totalRequests = Number.isSafeInteger(stats.totalRequests) ? Math.max(0, stats.totalRequests) : 0;
+            const successCount = Number.isSafeInteger(stats.successCount) ? Math.max(0, stats.successCount) : 0;
+            const errorCount = Number.isSafeInteger(stats.errorCount) ? Math.max(0, stats.errorCount) : 0;
+            const abortedCount = Number.isSafeInteger(stats.abortedCount) ? Math.max(0, stats.abortedCount) : 0;
+            const totalDurationMs = Number.isFinite(stats.totalDurationMs) ? Math.max(0, stats.totalDurationMs) : 0;
+            return {
+                averageDurationMs: totalRequests
+                    ? Math.min(Number.MAX_SAFE_INTEGER, Math.round(totalDurationMs / totalRequests))
+                    : null,
+                failedRequests: Math.min(Number.MAX_SAFE_INTEGER, errorCount + abortedCount),
+                successRate: totalRequests
+                    ? Number((Math.min(1, successCount / totalRequests) * 100).toFixed(1))
+                    : null,
+                totalRequests,
+            };
+        };
+
+        return {
+            enabled: true,
+            models: modelKeys.map(modelKey => ({ modelKey, ...project(this.modelStats.get(modelKey)) })),
+            summary: project(this.summary),
+        };
+    }
+
     queryRecords(options = {}) {
         if (!this.enabled) {
             return { dataset_revision: this.datasetRevision, has_more: false, next_cursor: null, records: [] };

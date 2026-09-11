@@ -597,6 +597,58 @@ class ModelScheduler {
         };
     }
 
+    /**
+     * Side-effect-free scheduler projection for the anonymous dashboard.
+     * Missing accounts and slots are interpreted as their default state rather
+     * than being materialized through account() / slot().
+     */
+    publicSummarySnapshot() {
+        const now = Date.now();
+        const date = this.getPacificDateKey(now);
+        const indices = this.authSource.getRotationIndices();
+        const models = [...this._visibleSnapshotModels()].sort((a, b) => a.localeCompare(b));
+        const accountFor = index => {
+            const key = this.authSource.accountNameMap.get(index) || `auth-${index}`;
+            return this.accounts.get(key) || null;
+        };
+        const slotFor = (account, model) => account?.models?.[model] || null;
+        const dailyRequests = slot => (slot?.daily_request_date === date ? slot.daily_request_count || 0 : 0);
+        const isRateLimited = slot =>
+            Boolean(slot?.rate_limited && (!slot.cooldown_until || slot.cooldown_until > now));
+        const isAvailable = (account, slot) =>
+            (account?.healthy ?? true) && !slot?.unsupported && (!slot?.cooldown_until || slot.cooldown_until <= now);
+
+        return {
+            active: this.workers.filter(worker => worker.lease).length,
+            limit: this.workers.length,
+            models: models.map(model => {
+                const accountSlots = indices.map(index => {
+                    const account = accountFor(index);
+                    return { account, slot: slotFor(account, model) };
+                });
+                const quotaPerAccount = getModelDailyQuota(model);
+                const today = accountSlots.reduce((sum, item) => sum + dailyRequests(item.slot), 0);
+                return {
+                    active: this.active(model),
+                    availableAccounts: accountSlots.filter(item => isAvailable(item.account, item.slot)).length,
+                    estimatedRemaining:
+                        quotaPerAccount === null
+                            ? null
+                            : accountSlots.reduce(
+                                  (sum, item) => sum + Math.max(0, quotaPerAccount - dailyRequests(item.slot)),
+                                  0
+                              ),
+                    model,
+                    queued: this.pending.filter(item => item.model === model).length,
+                    rateLimitedAccounts: accountSlots.filter(item => isRateLimited(item.slot)).length,
+                    todayRequests: today,
+                };
+            }),
+            queued: this.pending.length,
+            usageWindow: { date, timezone: PACIFIC_TIMEZONE },
+        };
+    }
+
     contextsSnapshot() {
         const contexts = this.browserManager?.getContextPoolSnapshot?.() || [];
         return {

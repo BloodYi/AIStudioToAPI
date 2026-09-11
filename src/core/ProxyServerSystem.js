@@ -23,6 +23,7 @@ const RequestHandler = require("./RequestHandler");
 const UsageStatsService = require("./UsageStatsService");
 const ConfigLoader = require("../utils/ConfigLoader");
 const WebRoutes = require("../routes/WebRoutes");
+const PublicDashboardServer = require("../public/PublicDashboardServer");
 
 /**
  * Proxy Server System
@@ -116,6 +117,7 @@ class ProxyServerSystem extends EventEmitter {
         this.browserManager.setSystemBusyProvider(() => this.requestHandler?.isSystemBusy === true);
 
         this.httpServer = null;
+        this.publicDashboardServer = null;
         this.wsServer = null;
         this.webRoutes = new WebRoutes(this);
     }
@@ -123,7 +125,21 @@ class ProxyServerSystem extends EventEmitter {
     async start(initialAuthIndex = null) {
         this.logger.info("[System] Starting flexible startup process...");
         await this._startHttpServer();
-        await this._startWebSocketServer();
+        try {
+            await this._startWebSocketServer();
+            if (this.config.publicDashboard.enabled) {
+                this.publicDashboardServer = new PublicDashboardServer({
+                    config: this.config.publicDashboard,
+                    logger: this.logger,
+                    scheduler: this.scheduler,
+                    usageStatsService: this.usageStatsService,
+                });
+                await this.publicDashboardServer.start();
+            }
+        } catch (error) {
+            await this._closeNetworkServers();
+            throw error;
+        }
         this.logger.info(`[System] Proxy server system startup complete.`);
 
         // Start periodic cleanup of stale message queues (every 5 minutes)
@@ -351,8 +367,11 @@ class ProxyServerSystem extends EventEmitter {
         this.httpServer.headersTimeout = 125000;
         this.httpServer.requestTimeout = 120000;
 
-        return new Promise(resolve => {
+        return new Promise((resolve, reject) => {
+            const onError = error => reject(error);
+            this.httpServer.once("error", onError);
             this.httpServer.listen(this.config.httpPort, this.config.host, () => {
+                this.httpServer.off("error", onError);
                 this.logger.info(
                     `[System] HTTP server is listening on http://${this.config.host}:${this.config.httpPort}`
                 );
@@ -649,6 +668,11 @@ class ProxyServerSystem extends EventEmitter {
             await this.browserManager.closeBrowser();
         }
 
+        await this._closeNetworkServers();
+        this.logger.info("[System] Shutdown complete");
+    }
+
+    async _closeNetworkServers() {
         // Close servers and wait for them to finish closing
         const closeServer = (server, name) =>
             new Promise(resolve => {
@@ -668,10 +692,10 @@ class ProxyServerSystem extends EventEmitter {
             });
 
         await Promise.all([
+            this.publicDashboardServer?.close(),
             closeServer(this.wsServer, "WebSocket server"),
             closeServer(this.httpServer, "HTTP server"),
         ]);
-        this.logger.info("[System] Shutdown complete");
     }
 }
 

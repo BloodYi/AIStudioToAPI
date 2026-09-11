@@ -1,0 +1,287 @@
+:root {
+    background: #f4f7fb;
+    color: #172033;
+    color-scheme: light dark;
+    font-family: Inter, "Noto Sans SC", system-ui, sans-serif;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+}
+
+main {
+    margin: auto;
+    padding: 48px 0 72px;
+    width: min(1180px, calc(100% - 32px));
+}
+
+header {
+    align-items: flex-start;
+    display: flex;
+    gap: 24px;
+    justify-content: space-between;
+}
+
+h1 {
+    font-size: clamp(32px, 5vw, 54px);
+    letter-spacing: -0.04em;
+    margin: 4px 0 8px;
+}
+
+h2 {
+    font-size: 20px;
+    margin: 42px 0 16px;
+}
+
+h3 {
+    font-size: 17px;
+    margin: 0;
+    overflow-wrap: anywhere;
+}
+
+.eyebrow {
+    color: #4964d8;
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 0.18em;
+    margin: 0;
+}
+
+.updated,
+.muted,
+.helper {
+    color: #667085;
+}
+
+.helper {
+    font-size: 13px;
+    line-height: 1.7;
+}
+
+.status {
+    background: #e3f8ed;
+    border-radius: 99px;
+    color: #137a4b;
+    font-size: 13px;
+    font-weight: 700;
+    padding: 9px 13px;
+}
+
+.status.warning {
+    background: #fff1cf;
+    color: #9a5b00;
+}
+
+.notice {
+    background: #fff;
+    border: 1px solid #dbe2f2;
+    border-radius: 14px;
+    display: flex;
+    gap: 12px;
+    margin-top: 28px;
+    padding: 18px 20px;
+}
+
+.notice strong {
+    color: #4964d8;
+    flex: 0 0 auto;
+}
+
+.overview {
+    display: grid;
+    gap: 12px;
+    grid-template-columns: repeat(5, 1fr);
+}
+
+.overview article,
+.model-card {
+    background: #fff;
+    border: 1px solid #e1e6f0;
+    border-radius: 16px;
+    box-shadow: 0 8px 30px rgba(32, 53, 96, 0.06);
+}
+
+.overview article {
+    padding: 18px;
+}
+
+.overview span {
+    color: #667085;
+    display: block;
+    font-size: 13px;
+}
+
+.overview b {
+    display: block;
+    font-size: 22px;
+    margin-top: 10px;
+}
+
+.models {
+    display: grid;
+    gap: 14px;
+    grid-template-columns: repeat(3, 1fr);
+}
+
+.model-card {
+    padding: 20px;
+}
+
+.quota {
+    background: #edf1ff;
+    border-radius: 12px;
+    display: grid;
+    gap: 5px 10px;
+    grid-template-columns: 1fr auto;
+    margin: 18px 0;
+    padding: 14px;
+}
+
+.quota span {
+    color: #526070;
+    font-size: 12px;
+}
+
+.quota b {
+    font-size: 24px;
+    grid-row: 2;
+}
+
+.quota em {
+    align-self: center;
+    background: #dce4ff;
+    border-radius: 6px;
+    color: #3e57bd;
+    font-size: 11px;
+    font-style: normal;
+    font-weight: 800;
+    grid-row: 2;
+    padding: 3px 7px;
+}
+
+dl {
+    margin: 0;
+}
+
+dl div {
+    border-bottom: 1px solid #edf0f5;
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 0;
+}
+
+dl div:last-child {
+    border: 0;
+}
+
+dt {
+    color: #667085;
+}
+
+dd {
+    font-weight: 700;
+    margin: 0;
+}
+
+.table-wrap {
+    background: #fff;
+    border: 1px solid #e1e6f0;
+    border-radius: 16px;
+    overflow-x: auto;
+}
+
+table {
+    border-collapse: collapse;
+    white-space: nowrap;
+    width: 100%;
+}
+
+th,
+td {
+    border-bottom: 1px solid #edf0f5;
+    padding: 15px 18px;
+    text-align: right;
+}
+
+th:first-child {
+    text-align: left;
+}
+
+tbody tr:last-child > * {
+    border-bottom: 0;
+}
+
+.empty {
+    background: #fff;
+    border-radius: 16px;
+    margin-top: 40px;
+    padding: 40px;
+    text-align: center;
+}
+
+@media (width <= 900px) {
+    .overview {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .models {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (width <= 600px) {
+    main {
+        padding-top: 28px;
+    }
+
+    header,
+    .notice {
+        flex-direction: column;
+    }
+
+    .models {
+        grid-template-columns: 1fr;
+    }
+
+    .overview {
+        grid-template-columns: 1fr 1fr;
+    }
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        background: #10141d;
+        color: #ecf0f8;
+    }
+
+    .updated,
+    .muted,
+    .helper,
+    .overview span,
+    dt {
+        color: #a8b0c0;
+    }
+
+    .notice,
+    .overview article,
+    .model-card,
+    .table-wrap,
+    .empty {
+        background: #191f2a;
+        border-color: #303847;
+    }
+
+    .quota {
+        background: #222d50;
+    }
+
+    dl div,
+    th,
+    td {
+        border-color: #303847;
+    }
+}

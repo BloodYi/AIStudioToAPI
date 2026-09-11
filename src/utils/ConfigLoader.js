@@ -37,6 +37,12 @@ class ConfigLoader {
             immediateSwitchStatusCodes: [429, 503],
             maxContexts: 1,
             maxRetries: 3,
+            publicDashboard: {
+                corsOrigins: [],
+                enabled: false,
+                host: "0.0.0.0",
+                port: 7861,
+            },
             retryDelay: 2000,
             safetySettingsThreshold: "OFF",
             streamingMode: "real",
@@ -53,6 +59,36 @@ class ConfigLoader {
             config.httpPort = Number.isFinite(parsed) ? parsed : config.httpPort;
         }
         if (process.env.HOST) config.host = process.env.HOST;
+        config.publicDashboard.host = process.env.PUBLIC_DASHBOARD_HOST || config.host;
+        config.publicDashboard.enabled = process.env.PUBLIC_DASHBOARD_ENABLED?.toLowerCase() === "true";
+        if (process.env.PUBLIC_DASHBOARD_PORT !== undefined) {
+            const rawPort = String(process.env.PUBLIC_DASHBOARD_PORT).trim();
+            const parsed = Number(rawPort);
+            if (!/^\d+$/.test(rawPort) || !Number.isSafeInteger(parsed) || parsed < 1 || parsed > 65535) {
+                throw new Error("Invalid PUBLIC_DASHBOARD_PORT: expected an integer between 1 and 65535");
+            }
+            config.publicDashboard.port = parsed;
+        }
+        if (process.env.PUBLIC_DASHBOARD_CORS_ORIGINS) {
+            config.publicDashboard.corsOrigins = process.env.PUBLIC_DASHBOARD_CORS_ORIGINS.split(",").map(value => {
+                const origin = value.trim();
+                let parsed;
+                try {
+                    parsed = new URL(origin);
+                } catch {
+                    throw new Error(`Invalid PUBLIC_DASHBOARD_CORS_ORIGINS origin: ${origin}`);
+                }
+                if (
+                    !["http:", "https:"].includes(parsed.protocol) ||
+                    parsed.origin !== origin ||
+                    parsed.username ||
+                    parsed.password
+                ) {
+                    throw new Error(`Invalid PUBLIC_DASHBOARD_CORS_ORIGINS origin: ${origin}`);
+                }
+                return origin;
+            });
+        }
         if (process.env.STREAMING_MODE) config.streamingMode = process.env.STREAMING_MODE;
         if (process.env.FAILURE_THRESHOLD) {
             const parsed = parseInt(process.env.FAILURE_THRESHOLD, 10);
@@ -127,6 +163,10 @@ class ConfigLoader {
             config.enableAuthUpdate = process.env.ENABLE_AUTH_UPDATE.toLowerCase() !== "false";
         if (process.env.ENABLE_USAGE_STATS)
             config.enableUsageStats = process.env.ENABLE_USAGE_STATS.toLowerCase() !== "false";
+
+        if (config.publicDashboard.enabled && [config.httpPort, config.wsPort].includes(config.publicDashboard.port)) {
+            throw new Error("PUBLIC_DASHBOARD_PORT must differ from PORT and the internal WebSocket port");
+        }
 
         let rawCodes = process.env.IMMEDIATE_SWITCH_STATUS_CODES;
         let codesSource = "environment variable";
@@ -210,6 +250,13 @@ class ConfigLoader {
         this.logger.info(`  Default Safety Threshold: ${config.safetySettingsThreshold}`);
         this.logger.info(`  Auto Update Auth: ${config.enableAuthUpdate}`);
         this.logger.info(`  Usage Stats: ${config.enableUsageStats}`);
+        this.logger.info(
+            `  Public Dashboard: ${
+                config.publicDashboard.enabled
+                    ? `Enabled (${config.publicDashboard.host}:${config.publicDashboard.port})`
+                    : "Disabled"
+            }`
+        );
         this.logger.info(`  Max Contexts: ${config.maxContexts === 0 ? "Unlimited" : config.maxContexts}`);
         this.logger.info(
             `  Usage-based Switch Threshold: ${
