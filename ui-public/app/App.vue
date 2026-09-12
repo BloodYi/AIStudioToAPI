@@ -1,6 +1,12 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
+const isDev = Boolean(import.meta.env.DEV);
+const activeMockPreset = ref("standard");
+const useMock = ref(isDev);
+const availablePresets = ref([]);
+let mockPresets = null;
+
 const data = ref(null);
 const error = ref(false);
 const loading = ref(true);
@@ -22,6 +28,25 @@ const updatedAt = computed(() =>
 );
 
 async function refresh() {
+    if (import.meta.env.DEV && useMock.value) {
+        if (!mockPresets) {
+            const module = await import("./mockData.js");
+            mockPresets = module.mockPresets;
+            availablePresets.value = Object.entries(mockPresets).map(([key, val]) => ({
+                key,
+                label: val.label,
+            }));
+        }
+        const preset = mockPresets[activeMockPreset.value] || mockPresets.standard;
+        data.value = {
+            ...preset.data,
+            generated_at: new Date().toISOString(),
+        };
+        error.value = false;
+        loading.value = false;
+        return;
+    }
+
     if (controller) return;
     controller = new AbortController();
     try {
@@ -64,10 +89,32 @@ onBeforeUnmount(() => {
     controller?.abort();
     document.removeEventListener("visibilitychange", onVisibilityChange);
 });
+
+function onMockChange() {
+    refresh();
+}
 </script>
 
 <template>
     <main>
+        <aside v-if="isDev" class="dev-toolbar" aria-label="开发调试工具栏">
+            <div class="dev-toolbar-badge">开发调试模式</div>
+            <label class="dev-toolbar-toggle">
+                <input v-model="useMock" type="checkbox" @change="onMockChange" />
+                <span>Mock 数据</span>
+            </label>
+            <select
+                v-if="useMock && availablePresets.length"
+                v-model="activeMockPreset"
+                class="dev-toolbar-select"
+                @change="onMockChange"
+            >
+                <option v-for="item in availablePresets" :key="item.key" :value="item.key">
+                    {{ item.label }}
+                </option>
+            </select>
+        </aside>
+
         <header>
             <div>
                 <p class="eyebrow">PUBLIC STATUS</p>

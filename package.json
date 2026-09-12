@@ -8,6 +8,7 @@
         "dev": "concurrently --kill-others --handle-input \"npm run dev:server\" \"npm run dev:ui\"",
         "dev:server": "cross-env NODE_ENV=development nodemon main.js",
         "dev:ui": "vite build --watch",
+        "dev:public": "vite --config vite.public.config.js",
         "predev": "npm run build:ui && npm run prepare",
         "build:ui": "vite build && npm run build:public",
         "build:public": "vite build --config vite.public.config.js",

@@ -12,4 +12,9 @@ module.exports = defineConfig({
     plugins: [vue()],
     publicDir: false,
     root: "ui-public/app",
+    server: {
+        host: true,
+        port: 5174,
+        strictPort: true,
+    },
 });

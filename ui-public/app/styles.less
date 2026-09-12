@@ -223,6 +223,50 @@ tbody tr:last-child > * {
     text-align: center;
 }
 
+.dev-toolbar {
+    align-items: center;
+    background: #fff;
+    border: 1px solid #dbe2f2;
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+    display: flex;
+    flex-wrap: wrap;
+    font-size: 13px;
+    gap: 12px;
+    margin-bottom: 24px;
+    padding: 10px 16px;
+}
+
+.dev-toolbar-badge {
+    background: #edf2fe;
+    border-radius: 4px;
+    color: #4964d8;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    padding: 3px 8px;
+}
+
+.dev-toolbar-toggle {
+    align-items: center;
+    cursor: pointer;
+    display: inline-flex;
+    gap: 6px;
+    user-select: none;
+}
+
+.dev-toolbar-select {
+    background: #f8fafc;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    color: inherit;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 13px;
+    outline: none;
+    padding: 4px 8px;
+}
+
 @media (width <= 900px) {
     .overview {
         grid-template-columns: repeat(2, 1fr);
@@ -282,6 +326,21 @@ tbody tr:last-child > * {
     dl div,
     th,
     td {
+        border-color: #303847;
+    }
+
+    .dev-toolbar {
+        background: #191f2a;
+        border-color: #303847;
+    }
+
+    .dev-toolbar-badge {
+        background: #242c3d;
+        color: #7b94ff;
+    }
+
+    .dev-toolbar-select {
+        background: #141822;
         border-color: #303847;
     }
 }
