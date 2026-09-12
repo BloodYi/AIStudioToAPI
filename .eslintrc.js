@@ -27,7 +27,7 @@ module.exports = {
         },
         {
             // Vue Single File Components
-            files: ["ui/**/*.vue"],
+            files: ["{ui,ui-public}/**/*.vue"],
             extends: [
                 "eslint:recommended",
                 "plugin:vue/vue3-recommended",
