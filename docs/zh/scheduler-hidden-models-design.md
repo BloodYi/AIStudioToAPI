@@ -115,11 +115,7 @@ this.hiddenModels = new Set();
 示例：
 
 ```json
-[
-    "gemini-3-flash-preview",
-    "gemini-3.5-flash",
-    "gemini-3.6-flash"
-]
+["gemini-3-flash-preview", "gemini-3.5-flash", "gemini-3.6-flash"]
 ```
 
 ### 5.2 持久化位置
@@ -138,13 +134,10 @@ this.hiddenModels = new Set();
 
 ```json
 {
-    "version": 4,
-    "hiddenModels": [
-        "gemini-3.5-flash",
-        "gemini-3.6-flash"
-    ],
-    "accounts": [],
-    "fileAffinities": []
+  "version": 4,
+  "hiddenModels": ["gemini-3.5-flash", "gemini-3.6-flash"],
+  "accounts": [],
+  "fileAffinities": []
 }
 ```
 
@@ -250,10 +243,10 @@ Content-Type: application/json
 
 ```json
 {
-    "success": true,
-    "model": "gemini-3.5-flash",
-    "hidden": true,
-    "changed": true
+  "success": true,
+  "model": "gemini-3.5-flash",
+  "hidden": true,
+  "changed": true
 }
 ```
 
@@ -272,10 +265,10 @@ Content-Type: application/json
 
 ```json
 {
-    "success": true,
-    "model": "gemini-3.5-flash",
-    "hidden": false,
-    "changed": true
+  "success": true,
+  "model": "gemini-3.5-flash",
+  "hidden": false,
+  "changed": true
 }
 ```
 
@@ -289,10 +282,7 @@ GET /api/scheduler/models/hidden
 
 ```json
 {
-    "models": [
-        "gemini-3-flash-preview",
-        "gemini-3.5-flash"
-    ]
+  "models": ["gemini-3-flash-preview", "gemini-3.5-flash"]
 }
 ```
 
@@ -375,19 +365,19 @@ gemini-3.6-flash          恢复显示
 
 ## 9. 显示边界
 
-| 页面或数据 | 隐藏后是否显示 | 说明 |
-| --- | --- | --- |
-| 预估剩余额度卡片 | 否 | 不再计算到前端展示合计 |
-| 模型调度汇总表 | 否 | 整行隐藏 |
-| 账号与模型详情 | 否 | 所有账号下均隐藏 |
-| 已移除模型列表 | 是 | 用于恢复显示 |
-| 历史请求记录 | 是 | 保留审计能力 |
-| 使用统计图表 | 是 | 不修改统计数据 |
-| `/v1/models` | 不受影响 | 继续由 `models.json` 生成 |
-| `/v1beta/models` | 不受影响 | 继续由 `models.json` 生成 |
-| `configs/models.json` | 不受影响 | 不写入、不删除 |
-| 调度和账号轮换 | 不受影响 | 继续使用完整状态 |
-| 429 和冷却状态 | 继续生效 | 隐藏不等于重置 |
+| 页面或数据            | 隐藏后是否显示 | 说明                      |
+| --------------------- | -------------- | ------------------------- |
+| 预估剩余额度卡片      | 否             | 不再计算到前端展示合计    |
+| 模型调度汇总表        | 否             | 整行隐藏                  |
+| 账号与模型详情        | 否             | 所有账号下均隐藏          |
+| 已移除模型列表        | 是             | 用于恢复显示              |
+| 历史请求记录          | 是             | 保留审计能力              |
+| 使用统计图表          | 是             | 不修改统计数据            |
+| `/v1/models`          | 不受影响       | 继续由 `models.json` 生成 |
+| `/v1beta/models`      | 不受影响       | 继续由 `models.json` 生成 |
+| `configs/models.json` | 不受影响       | 不写入、不删除            |
+| 调度和账号轮换        | 不受影响       | 继续使用完整状态          |
+| 429 和冷却状态        | 继续生效       | 隐藏不等于重置            |
 
 ## 10. 特殊场景
 

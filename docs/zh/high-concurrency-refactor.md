@@ -316,14 +316,14 @@ connection_epoch
 
 MessageQueue close reason 分为：
 
-| 分类 | 示例 | 是否重试 | 是否 cooldown |
-| --- | --- | --- | --- |
-| 正常结束 | `request_complete` | 否 | 否 |
-| 客户端取消 | `client_disconnect` | 否 | 否 |
-| attempt 替换 | `retry_replaced` | 已进入新 attempt | 否 |
-| context/WS 故障 | `page_closed`、`connection_lost` | 未输出内容时立即重试 | 否 |
-| 上游 429 | `upstream_rate_limited` | 换账号重试 | account × model cooldown |
-| 上游临时错误 | `upstream_5xx` | 换账号重试 | 可配置短 cooldown |
+| 分类            | 示例                             | 是否重试             | 是否 cooldown            |
+| --------------- | -------------------------------- | -------------------- | ------------------------ |
+| 正常结束        | `request_complete`               | 否                   | 否                       |
+| 客户端取消      | `client_disconnect`              | 否                   | 否                       |
+| attempt 替换    | `retry_replaced`                 | 已进入新 attempt     | 否                       |
+| context/WS 故障 | `page_closed`、`connection_lost` | 未输出内容时立即重试 | 否                       |
+| 上游 429        | `upstream_rate_limited`          | 换账号重试           | account × model cooldown |
+| 上游临时错误    | `upstream_5xx`                   | 换账号重试           | 可配置短 cooldown        |
 
 错误分类优先使用结构化 `kind/reason`，只有旧协议没有结构化字段时才退回状态码或文本正则。
 

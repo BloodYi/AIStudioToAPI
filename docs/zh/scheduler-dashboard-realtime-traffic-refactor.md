@@ -196,26 +196,26 @@ gemini-3.8-flash：逐账号 max(0, 100 - 今日请求数) 后求和
 
 ```json
 {
-    "usage_window": {
-        "date": "2026-09-10",
-        "timezone": "America/Los_Angeles"
+  "usage_window": {
+    "date": "2026-09-10",
+    "timezone": "America/Los_Angeles"
+  },
+  "quota_by_model": [
+    {
+      "model": "gemini-3.7-flash",
+      "quota_per_account": 100,
+      "tracked_accounts": 44,
+      "daily_requests": 889,
+      "estimated_remaining_quota": 3511
     },
-    "quota_by_model": [
-        {
-            "model": "gemini-3.7-flash",
-            "quota_per_account": 100,
-            "tracked_accounts": 44,
-            "daily_requests": 889,
-            "estimated_remaining_quota": 3511
-        },
-        {
-            "model": "gemini-3.8-flash",
-            "quota_per_account": 100,
-            "tracked_accounts": 44,
-            "daily_requests": 902,
-            "estimated_remaining_quota": 3498
-        }
-    ]
+    {
+      "model": "gemini-3.8-flash",
+      "quota_per_account": 100,
+      "tracked_accounts": 44,
+      "daily_requests": 902,
+      "estimated_remaining_quota": 3498
+    }
+  ]
 }
 ```
 
@@ -353,14 +353,14 @@ Context 区域使用原生 `<details>` 或等价可访问折叠组件，默认�
 
 建议把当前大而全的 `/api/status` 拆成用途明确的接口。也可以使用 `include` 参数实现同样效果，但返回字段必须有明确上限。
 
-| 当前分页/状态 | 每 5 秒请求 | 不应传输 |
-| --- | --- | --- |
-| 首页 | `/api/dashboard/realtime` | 历史记录、日志全文、Context 行、账号 slot |
-| 首页且 Context 展开 | 额外 `/api/scheduler/contexts` | 历史记录、账号 slot |
-| 首页且账号详情展开 | 额外 `/api/scheduler/accounts?ids=...` | 未展开账号 slot |
-| 使用统计 | `/api/usage-stats/summary`，以及当前第一页增量 | 全量历史记录 |
-| 日志 | `/api/logs?after=<cursor>` | 每轮完整日志全文 |
-| 设置 | `/api/status/core` 或仅需要的配置状态 | scheduler 全量、统计历史、日志 |
+| 当前分页/状态       | 每 5 秒请求                                    | 不应传输                                  |
+| ------------------- | ---------------------------------------------- | ----------------------------------------- |
+| 首页                | `/api/dashboard/realtime`                      | 历史记录、日志全文、Context 行、账号 slot |
+| 首页且 Context 展开 | 额外 `/api/scheduler/contexts`                 | 历史记录、账号 slot                       |
+| 首页且账号详情展开  | 额外 `/api/scheduler/accounts?ids=...`         | 未展开账号 slot                           |
+| 使用统计            | `/api/usage-stats/summary`，以及当前第一页增量 | 全量历史记录                              |
+| 日志                | `/api/logs?after=<cursor>`                     | 每轮完整日志全文                          |
+| 设置                | `/api/status/core` 或仅需要的配置状态          | scheduler 全量、统计历史、日志            |
 
 `/api/dashboard/realtime` 只包含：
 
@@ -408,9 +408,9 @@ GET /api/usage-stats/records?cursor=<opaque>&limit=20&filters=...
 
 ```json
 {
-    "cursor": 1842,
-    "reset": false,
-    "lines": ["...new line 1...", "...new line 2..."]
+  "cursor": 1842,
+  "reset": false,
+  "lines": ["...new line 1...", "...new line 2..."]
 }
 ```
 
@@ -437,31 +437,31 @@ GET /api/dashboard/realtime
 
 ```json
 {
-    "generated_at": "2026-09-11T08:10:05.000Z",
-    "revision": "scheduler:9281",
-    "status": {
-        "service_connected": true,
-        "browser_connected": true
+  "generated_at": "2026-09-11T08:10:05.000Z",
+  "revision": "scheduler:9281",
+  "status": {
+    "service_connected": true,
+    "browser_connected": true
+  },
+  "scheduler": {
+    "active_workers": 0,
+    "idle_workers": 2,
+    "queued_requests": 0,
+    "contexts_summary": {
+      "ready": 8,
+      "busy": 0,
+      "initializing": 3,
+      "reconnecting": 0,
+      "unavailable": 0,
+      "max": 11
     },
-    "scheduler": {
-        "active_workers": 0,
-        "idle_workers": 2,
-        "queued_requests": 0,
-        "contexts_summary": {
-            "ready": 8,
-            "busy": 0,
-            "initializing": 3,
-            "reconnecting": 0,
-            "unavailable": 0,
-            "max": 11
-        },
-        "usage_window": {
-            "date": "2026-09-11",
-            "timezone": "America/Los_Angeles"
-        },
-        "quota_by_model": [],
-        "models": []
-    }
+    "usage_window": {
+      "date": "2026-09-11",
+      "timezone": "America/Los_Angeles"
+    },
+    "quota_by_model": [],
+    "models": []
+  }
 }
 ```
 
@@ -477,16 +477,16 @@ GET /api/scheduler/contexts
 
 ```json
 {
-    "revision": "contexts:413",
-    "contexts": [
-        {
-            "auth_index": 0,
-            "state": "READY",
-            "inflight": 0,
-            "connection_epoch": 8,
-            "last_disconnect_reason": null
-        }
-    ]
+  "revision": "contexts:413",
+  "contexts": [
+    {
+      "auth_index": 0,
+      "state": "READY",
+      "inflight": 0,
+      "connection_epoch": 8,
+      "last_disconnect_reason": null
+    }
+  ]
 }
 ```
 
@@ -500,13 +500,13 @@ slot 对外字段应使用展示语义名称，例如：
 
 ```json
 {
-    "model": "gemini-3.7-flash",
-    "status": "HEALTHY",
-    "inflight": 0,
-    "daily_requests": 4,
-    "daily_failures": 1,
-    "cooldown_until": null,
-    "last_error": null
+  "model": "gemini-3.7-flash",
+  "status": "HEALTHY",
+  "inflight": 0,
+  "daily_requests": 4,
+  "daily_failures": 1,
+  "cooldown_until": null,
+  "last_error": null
 }
 ```
 

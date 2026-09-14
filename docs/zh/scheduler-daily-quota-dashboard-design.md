@@ -69,8 +69,8 @@
 新增内部方法建议为：
 
 ```js
-getPacificDateKey(now = Date.now())
-rolloverDailyUsage(slot, now = Date.now())
+getPacificDateKey((now = Date.now()));
+rolloverDailyUsage(slot, (now = Date.now()));
 ```
 
 行为如下：
@@ -156,9 +156,9 @@ Content-Type: application/json
 
 ```json
 {
-    "success": true,
-    "reset_account_count": 12,
-    "reset_model_count": 24
+  "success": true,
+  "reset_account_count": 12,
+  "reset_model_count": 24
 }
 ```
 
@@ -211,28 +211,28 @@ slot 剩余 = max(0, 该模型日上限 - slot 今日请求数)
 
 ```json
 {
-    "usage_window": {
-        "date": "2026-09-10",
-        "timezone": "America/Los_Angeles"
-    },
-    "estimated_remaining_quota": 2333,
-    "quota_tracked_accounts": 12,
-    "quota_tracked_models": 2,
-    "models": [
-        {
-            "model": "gemini-3.7-flash",
-            "daily_requests": 34
+  "usage_window": {
+    "date": "2026-09-10",
+    "timezone": "America/Los_Angeles"
+  },
+  "estimated_remaining_quota": 2333,
+  "quota_tracked_accounts": 12,
+  "quota_tracked_models": 2,
+  "models": [
+    {
+      "model": "gemini-3.7-flash",
+      "daily_requests": 34
+    }
+  ],
+  "accounts": [
+    {
+      "models": {
+        "gemini-3.7-flash": {
+          "daily_requests": 4
         }
-    ],
-    "accounts": [
-        {
-            "models": {
-                "gemini-3.7-flash": {
-                    "daily_requests": 4
-                }
-            }
-        }
-    ]
+      }
+    }
+  ]
 }
 ```
 
