@@ -20,6 +20,7 @@ const {
 } = require("../utils/CustomErrors");
 
 const WS_INIT_TIMEOUT_MS = 120000;
+const CONTEXT_CREATION_TIMEOUT_MS = 120000;
 const FIREFOX_DOH_DISABLED_PREFS = {
     "network.trr.mode": 5,
     "network.trr.uri": "",
@@ -71,6 +72,11 @@ class BrowserManager {
         this._contextInitTasks = new Map();
         this._contextPoolRunning = false;
         this._ensureBrowserTask = null;
+        // Firefox can hang when multiple BrowserContext creation commands are
+        // issued at the same time. Serialize only that short protocol step;
+        // page navigation and WebSocket initialization remain parallel.
+        this._contextCreationQueue = Promise.resolve();
+        this.contextCreationTimeoutMs = config.scheduler?.contextCreationTimeoutMs || CONTEXT_CREATION_TIMEOUT_MS;
 
         // Background wakeup service status (instance-level, tracks this.page)
         // Prevents multiple BackgroundWakeup instances from running simultaneously
@@ -1620,6 +1626,50 @@ class BrowserManager {
         await this._ensureBrowserTask;
     }
 
+    async _createBrowserContext(options, authIndex) {
+        let releaseTurn;
+        const previousTurn = this._contextCreationQueue || Promise.resolve();
+        const currentTurn = new Promise(resolve => {
+            releaseTurn = resolve;
+        });
+        this._contextCreationQueue = previousTurn.catch(() => {}).then(() => currentTurn);
+
+        await previousTurn.catch(() => {});
+
+        let creationTimedOut = false;
+        let timeoutId;
+        try {
+            if (!this.browser) throw new Error("Browser disconnected before context creation");
+
+            const creationTask = this.browser.newContext(options);
+            // If Playwright eventually completes after the watchdog fired, close
+            // the orphan instead of letting an untracked context leak.
+            creationTask
+                .then(context => {
+                    if (creationTimedOut) context.close().catch(() => {});
+                })
+                .catch(() => {});
+
+            const timeoutMs = this.contextCreationTimeoutMs || CONTEXT_CREATION_TIMEOUT_MS;
+            const timeoutTask = new Promise((_, reject) => {
+                timeoutId = setTimeout(() => {
+                    creationTimedOut = true;
+                    reject(
+                        Object.assign(
+                            new Error(`Timed out creating browser context #${authIndex} after ${timeoutMs}ms`),
+                            { code: "CONTEXT_CREATION_TIMEOUT", reason: "context_creation_timeout" }
+                        )
+                    );
+                }, timeoutMs);
+            });
+
+            return await Promise.race([creationTask, timeoutTask]);
+        } finally {
+            if (timeoutId) clearTimeout(timeoutId);
+            releaseTurn();
+        }
+    }
+
     _startPooledContext(authIndex) {
         if (this._contextInitTasks.has(authIndex)) return this._contextInitTasks.get(authIndex);
         this.initializingContexts.add(authIndex);
@@ -2284,12 +2334,15 @@ class BrowserManager {
             // Check abort status before expensive operations
             this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
-            context = await this.browser.newContext({
-                deviceScaleFactor: 1,
-                storageState: storageStateObject,
-                viewport: { height: randomHeight, width: randomWidth },
-                ...(proxyConfig ? { proxy: proxyConfig } : {}),
-            });
+            context = await this._createBrowserContext(
+                {
+                    deviceScaleFactor: 1,
+                    storageState: storageStateObject,
+                    viewport: { height: randomHeight, width: randomWidth },
+                    ...(proxyConfig ? { proxy: proxyConfig } : {}),
+                },
+                authIndex
+            );
 
             // Check abort status after context creation
             this._throwIfContextInitAborted(authIndex, isBackgroundTask);

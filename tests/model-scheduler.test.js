@@ -627,18 +627,22 @@ test("local queue and WebSocket failures never cool account-model state", async 
 });
 
 test("new context configuration validates pool and capacity limits", () => {
+    assert.equal(loadConfig({}).contextCreationTimeoutMs, 120000);
     const config = loadConfig({
+        CONTEXT_CREATION_TIMEOUT_MS: "90000",
         CONTEXT_INIT_CONCURRENCY: "3",
         CONTEXT_MAX_CONCURRENCY: "5",
         CONTEXT_POOL_MIN_READY: "4",
         MAX_BROWSER_WORKERS: "6",
         REQUEST_DISPATCH_TIMEOUT_MS: "25000",
     });
+    assert.equal(config.contextCreationTimeoutMs, 90000);
     assert.equal(config.contextInitConcurrency, 3);
     assert.equal(config.contextMaxConcurrency, 5);
     assert.equal(config.contextPoolMinReady, 4);
     assert.equal(config.queueTimeoutMs, 25000);
     assert.throws(() => loadConfig({ CONTEXT_POOL_MIN_READY: "3", MAX_BROWSER_WORKERS: "2" }));
+    assert.throws(() => loadConfig({ CONTEXT_CREATION_TIMEOUT_MS: "0" }), /Invalid CONTEXT_CREATION_TIMEOUT_MS/);
 });
 
 test("100 requests spread across 12 ready contexts without header-style serialization", async () => {

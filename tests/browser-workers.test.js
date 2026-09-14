@@ -125,3 +125,72 @@ test("context initialization failure stays local and marks only the context unav
     assert.equal(manager.contextUnavailable.get(0).error.message, "Build initialization failed");
     assert.equal(manager.scheduler.account(0).healthy, undefined);
 });
+
+test("browser context creation is serialized while later initialization can remain parallel", async () => {
+    const manager = Object.create(BrowserManager.prototype);
+    const pending = [];
+    let activeCreations = 0;
+    let peakCreations = 0;
+    manager._contextCreationQueue = Promise.resolve();
+    manager.contextCreationTimeoutMs = 1000;
+    manager.browser = {
+        newContext() {
+            activeCreations++;
+            peakCreations = Math.max(peakCreations, activeCreations);
+            return new Promise(resolve => {
+                pending.push(() => {
+                    activeCreations--;
+                    resolve({ close: async () => {} });
+                });
+            });
+        },
+    };
+
+    const first = manager._createBrowserContext({}, 0);
+    const second = manager._createBrowserContext({}, 1);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(pending.length, 1);
+
+    pending.shift()();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(pending.length, 1);
+
+    pending.shift()();
+    await Promise.all([first, second]);
+    assert.equal(peakCreations, 1);
+});
+
+test("browser context creation timeout releases the lock and closes a late orphan", async () => {
+    const manager = Object.create(BrowserManager.prototype);
+    let resolveStalled;
+    let lateContextClosed = false;
+    let calls = 0;
+    manager._contextCreationQueue = Promise.resolve();
+    manager.contextCreationTimeoutMs = 10;
+    manager.browser = {
+        newContext() {
+            calls++;
+            if (calls === 1) {
+                return new Promise(resolve => {
+                    resolveStalled = resolve;
+                });
+            }
+            return Promise.resolve({ close: async () => {} });
+        },
+    };
+
+    await assert.rejects(manager._createBrowserContext({}, 0), error => {
+        assert.equal(error.code, "CONTEXT_CREATION_TIMEOUT");
+        return true;
+    });
+    await manager._createBrowserContext({}, 1);
+    assert.equal(calls, 2);
+
+    resolveStalled({
+        async close() {
+            lateContextClosed = true;
+        },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(lateContextClosed, true);
+});

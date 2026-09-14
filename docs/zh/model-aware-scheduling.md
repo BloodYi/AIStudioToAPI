@@ -21,6 +21,7 @@ ACCOUNT_ROTATION_STRATEGY=least_recently_used
 MAX_BROWSER_WORKERS=6
 CONTEXT_POOL_MIN_READY=6
 CONTEXT_INIT_CONCURRENCY=2
+CONTEXT_CREATION_TIMEOUT_MS=120000
 GLOBAL_MAX_CONCURRENCY=24
 CONTEXT_MAX_CONCURRENCY=0
 ACCOUNT_MAX_CONCURRENCY=0
@@ -47,6 +48,7 @@ SCHEDULER_STATE_PATH=data/scheduler-state.json
 | `GLOBAL_MAX_CONCURRENCY`           | 最大执行租约数，默认等于 context 上限，可以大于它                                                   |
 | `CONTEXT_POOL_MIN_READY`           | 后台维持的最少 ready context 数，不得超过 `MAX_BROWSER_WORKERS`                                     |
 | `CONTEXT_INIT_CONCURRENCY`         | 后台同时初始化的 context 数，默认 2                                                                 |
+| `CONTEXT_CREATION_TIMEOUT_MS`      | 串行 BrowserContext 创建阶段的超时毫秒数，默认 120000                                               |
 | `CONTEXT_MAX_CONCURRENCY`          | 单 context 并发硬上限，0 表示不限但仍执行 least-inflight                                            |
 | `ACCOUNT_MAX_CONCURRENCY`          | 单账号跨模型总并发上限，默认 0 表示不限                                                             |
 | `ACCOUNT_MODEL_MAX_CONCURRENCY`    | JSON：单账号在指定模型上的并发上限，0 不限，未配置继承账号上限；账号总上限仍独立生效                |

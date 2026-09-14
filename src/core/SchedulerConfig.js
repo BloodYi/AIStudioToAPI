@@ -61,6 +61,7 @@ function loadSchedulerConfig(env = process.env) {
         accountConcurrency,
         accountModelConcurrency,
         allocation,
+        contextCreationTimeoutMs: integer("CONTEXT_CREATION_TIMEOUT_MS", 120000),
         contextInitConcurrency: integer("CONTEXT_INIT_CONCURRENCY", 2),
         contextMaxConcurrency,
         contextPoolMinReady,
