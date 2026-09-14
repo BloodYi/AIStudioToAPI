@@ -43,6 +43,7 @@
         </div>
         <p v-if="rateLimitsReset" role="status">{{ t("schedulerResetAll429Success") }}</p>
         <p v-if="allAccountsResetMessage" role="status">{{ allAccountsResetMessage }}</p>
+        <p v-if="accountActionMessage" role="status">{{ accountActionMessage }}</p>
         <p v-if="modelVisibilityMessage" role="status">{{ modelVisibilityMessage }}</p>
         <details :open="contextsOpen" @toggle="toggleContexts">
             <summary :aria-expanded="contextsOpen">
@@ -122,10 +123,14 @@
                 @toggle="event => toggleAccount(event, account.index)"
             >
                 <summary :aria-expanded="expandedAccounts.has(account.index)">
-                    #{{ account.index }} {{ account.key }} · {{ account.healthy ? "HEALTHY" : "UNHEALTHY" }} ·
+                    #{{ account.index }} {{ account.key }} ·
+                    {{ account.disabled ? "DISABLED" : account.healthy ? "HEALTHY" : "UNHEALTHY" }} ·
                     {{ t("schedulerInflight") }}: {{ account.inflight }}
                     <button :disabled="busy || account.inflight > 0" @click.prevent="reset(account.index)">
                         {{ t("schedulerResetAccount") }}
+                    </button>
+                    <button :disabled="busy || account.disabled" @click.prevent="disableAccount(account.index)">
+                        {{ t("schedulerDisableAccount") }}
                     </button>
                 </summary>
                 <div class="scheduler-table">
@@ -180,6 +185,7 @@ const busy = ref(false),
     allAccountsResetMessage = ref(""),
     modelVisibilityMessage = ref(""),
     operatingModel = ref("");
+const accountActionMessage = ref("");
 const contextsOpen = ref(false),
     accountsOpen = ref(false),
     hiddenModelsOpen = ref(false),
@@ -333,6 +339,15 @@ async function resetAllAccounts() {
 }
 async function reset(accountId, model) {
     await sendReset("/api/scheduler/reset", { account_id: accountId, model });
+}
+async function disableAccount(accountId) {
+    if (!window.confirm(props.t("schedulerDisableAccountConfirm"))) return;
+    const result = await sendReset("/api/scheduler/disable", { account_id: accountId });
+    if (!result) return;
+    accountActionMessage.value = props.t(
+        result.changed ? "schedulerDisableAccountSuccess" : "schedulerDisableAccountNoChanges"
+    );
+    await fetchAccounts(true);
 }
 async function hideModel(model) {
     if (!window.confirm(props.t("schedulerHideModelConfirm", { model }))) return;

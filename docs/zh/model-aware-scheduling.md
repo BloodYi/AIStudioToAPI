@@ -36,6 +36,8 @@ SCHEDULER_READY_CONTEXT_ONLY=true
 STREAM_EARLY_HEADERS=true
 STREAM_KEEPALIVE_INTERVAL_MS=10000
 RATE_LIMIT_COOLDOWN=3600
+RISK_CONTROL_COOLDOWN=600
+RISK_CONTROL_MAX_COOLDOWN=10800
 TEMP_ERROR_COOLDOWN=30
 MAX_RETRIES_PER_REQUEST=2
 SCHEDULER_STATE_PATH=data/scheduler-state.json
@@ -61,6 +63,8 @@ SCHEDULER_STATE_PATH=data/scheduler-state.json
 | `STREAM_EARLY_HEADERS`             | 流式请求通过校验后立即发送 SSE headers 和 accepted 注释，默认开启                                   |
 | `STREAM_KEEPALIVE_INTERVAL_MS`     | 等待调度或上游首包期间的 SSE 注释心跳间隔，默认 10000 毫秒                                          |
 | `RATE_LIMIT_COOLDOWN`              | 429 冷却秒数，默认 3600，不猜测 Google 的日额度重置时刻                                             |
+| `RISK_CONTROL_COOLDOWN`            | HTTP 403 风控初始冷却秒数，默认 600，连续风控按 1、3、6、18 倍退避并带 ±10% 抖动                    |
+| `RISK_CONTROL_MAX_COOLDOWN`        | HTTP 403 风控最大冷却秒数，默认 10800                                                               |
 | `TEMP_ERROR_COOLDOWN`              | 临时错误初始冷却秒数，默认 30，连续失败退避到 60、120，最多 4 倍                                    |
 | `MAX_RETRIES_PER_REQUEST`          | 初次之外的最大重试次数，默认继承旧 `MAX_RETRIES - 1`，未配置时为 2                                  |
 | `SCHEDULER_STATE_PATH`             | 默认工作目录下 `data/scheduler-state.json`                                                          |

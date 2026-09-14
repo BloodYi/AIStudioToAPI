@@ -1537,8 +1537,12 @@ class BrowserManager {
             return {
                 auth_index: authIndex,
                 connection_epoch: this.connectionRegistry?.getConnectionEpoch(authIndex) || null,
+                created_at: data.createdAt || null,
+                draining: Boolean(data.draining),
+                eviction_priority: this.contextEvictionReason(authIndex),
                 inflight,
                 last_disconnect_reason: data.lastDisconnectReason || null,
+                last_request_at: data.lastRequestAt || null,
                 state,
             };
         });
@@ -1571,7 +1575,13 @@ class BrowserManager {
     }
 
     requestContext(authIndex, model = null) {
-        if (!this.scheduler || this.scheduler.closed || this.isContextReady(authIndex)) return;
+        if (
+            !this.scheduler ||
+            this.scheduler.closed ||
+            this.scheduler.isAccountManuallyDisabled?.(authIndex) === true ||
+            this.isContextReady(authIndex)
+        )
+            return;
         this.contextDemand ??= new Map();
         this.contextDemand.set(authIndex, { at: Date.now(), model });
         this._pumpContextPool();
@@ -1579,15 +1589,20 @@ class BrowserManager {
 
     _poolCandidates() {
         const rotation = this.authSource.getRotationIndices();
-        const demanded = [...(this.contextDemand?.keys() || [])].filter(index => rotation.includes(index));
+        const enabled = index => this.scheduler.isAccountManuallyDisabled?.(index) !== true;
+        for (const index of this.contextDemand?.keys() || []) if (!enabled(index)) this.contextDemand.delete(index);
+        const demanded = [...(this.contextDemand?.keys() || [])].filter(
+            index => rotation.includes(index) && enabled(index)
+        );
         const target = this.scheduler.config.contextPoolMinReady;
-        const readyCount = rotation.filter(index => this.isContextReady(index)).length;
+        const readyCount = rotation.filter(index => enabled(index) && this.isContextReady(index)).length;
         const needWarm = Math.max(0, target - readyCount - this.initializingContexts.size);
         const warm = needWarm
             ? rotation
                   .filter(index => {
                       const unavailable = this.contextUnavailable.get(index);
                       return (
+                          enabled(index) &&
                           !demanded.includes(index) &&
                           !this.isContextReady(index) &&
                           !this.initializingContexts.has(index) &&
@@ -1599,6 +1614,7 @@ class BrowserManager {
         return [...demanded, ...warm].filter(index => {
             const unavailable = this.contextUnavailable.get(index);
             return (
+                enabled(index) &&
                 !this.isContextReady(index) &&
                 !this.initializingContexts.has(index) &&
                 (!unavailable?.retryAt || unavailable.retryAt <= Date.now())
@@ -1624,6 +1640,97 @@ class BrowserManager {
             });
         }
         await this._ensureBrowserTask;
+    }
+
+    markContextRequest(authIndex, now = Date.now()) {
+        const data = this.contexts.get(authIndex);
+        if (data) data.lastRequestAt = now;
+    }
+
+    _isContextIdle(authIndex) {
+        return !this.scheduler?.account(authIndex).inflight && !this._hasActiveQueueForAuth(authIndex);
+    }
+
+    rankContextForEviction(authIndex, now = Date.now()) {
+        const data = this.contexts.get(authIndex) || {};
+        const rotation = this.authSource.getRotationIndices();
+        const account = this.scheduler?.account(authIndex);
+        const slots = Object.values(account?.models || {});
+        const unusableSlots =
+            slots.length > 0 && slots.every(slot => slot.unsupported || (slot.cooldown_until || 0) > now);
+        return [
+            account?.disabled ? 0 : 1,
+            !account?.healthy || !rotation.includes(authIndex) || this.authSource.isExpired?.(authIndex) ? 0 : 1,
+            unusableSlots ? 0 : 1,
+            this.contextDemand.has(authIndex) ? 1 : 0,
+            data.lastRequestAt || 0,
+            data.createdAt || 0,
+            authIndex,
+        ];
+    }
+
+    contextEvictionReason(authIndex, now = Date.now()) {
+        const rank = this.rankContextForEviction(authIndex, now);
+        if (rank[0] === 0) return "account_disabled";
+        if (rank[1] === 0) return "account_unhealthy";
+        if (rank[2] === 0) return "slots_unusable";
+        if (rank[3] === 0) return "no_queued_demand";
+        return "healthy_idle_lru";
+    }
+
+    _compareContextEviction(a, b, now = Date.now()) {
+        const left = this.rankContextForEviction(a, now);
+        const right = this.rankContextForEviction(b, now);
+        for (let i = 0; i < left.length; i++) if (left[i] !== right[i]) return left[i] - right[i];
+        return 0;
+    }
+
+    compareAccountsForDraining(a, b) {
+        return this._compareContextEviction(a, b);
+    }
+
+    beginAccountDrain(authIndex, reason = "context_capacity") {
+        const data = this.contexts.get(authIndex);
+        if (!data) return false;
+        data.draining = true;
+        return this._scheduleContextClosureWhenIdle(authIndex, reason);
+    }
+
+    handleAccountDisabled(authIndex) {
+        this.contextDemand.delete(authIndex);
+        if (this.initializingContexts.has(authIndex)) this.abortedContexts.add(authIndex);
+        const data = this.contexts.get(authIndex);
+        if (!data) return;
+        data.draining = true;
+        if (!this._isContextIdle(authIndex)) {
+            this._scheduleContextClosureWhenIdle(authIndex, "account_disabled");
+            return;
+        }
+        this.closeContext(authIndex, { keepBrowser: true })
+            .then(() => this._pumpContextPool())
+            .catch(error =>
+                this.logger.error(`[ContextPool] Failed to close disabled context #${authIndex}: ${error.message}`)
+            );
+    }
+
+    handleAccountEnabled(authIndex) {
+        const data = this.contexts.get(authIndex);
+        if (data) data.draining = false;
+        if (this.pendingContextClosures.get(authIndex) === "account_disabled")
+            this._cancelPendingContextClosure(authIndex, "account_enabled");
+        this._pumpContextPool();
+    }
+
+    handleAccountsEnabled() {
+        for (const authIndex of this.authSource.getRotationIndices()) this.handleAccountEnabled(authIndex);
+    }
+
+    handleAccountLeaseReleased(authIndex) {
+        const data = this.contexts.get(authIndex);
+        if ((!data?.draining && !this.pendingContextClosures.has(authIndex)) || !this._isContextIdle(authIndex)) return;
+        this._closePendingContextIfIdle(authIndex).catch(error =>
+            this.logger.error(`[ContextPool] Failed to finish draining context #${authIndex}: ${error.message}`)
+        );
     }
 
     async _createBrowserContext(options, authIndex) {
@@ -1678,6 +1785,8 @@ class BrowserManager {
             try {
                 await this._ensureBrowserForPool();
                 if (this.scheduler.closed) throw new Error("Scheduler is shutting down");
+                if (this.scheduler.isAccountManuallyDisabled?.(authIndex) === true)
+                    throw new ContextAbortedError(authIndex, "account disabled");
                 const stale = this.contexts.get(authIndex);
                 if (stale) {
                     if (this.scheduler.account(authIndex).inflight > 0) {
@@ -1692,16 +1801,23 @@ class BrowserManager {
                 }
                 const occupancy = this.contexts.size + this.initializingContexts.size - 1;
                 if (occupancy >= this.scheduler.config.maxWorkers) {
-                    const idle = [...this.contexts.keys()].find(
-                        index => index !== authIndex && !this.scheduler.account(index).inflight
-                    );
+                    const idle = [...this.contexts.keys()]
+                        .filter(index => index !== authIndex && this._isContextIdle(index))
+                        .sort((a, b) => this._compareContextEviction(a, b))[0];
                     if (idle === undefined) {
                         blockedByCapacity = true;
                         return;
                     }
+                    this.logger.info(
+                        `[ContextPool] Evicting context #${idle} for #${authIndex} (${this.contextEvictionReason(idle)})`
+                    );
                     await this.closeContext(idle, { keepBrowser: true });
                 }
                 await this._initializeContext(authIndex, true);
+                if (this.scheduler.isAccountManuallyDisabled?.(authIndex) === true) {
+                    await this.closeContext(authIndex, { keepBrowser: true });
+                    throw new ContextAbortedError(authIndex, "account disabled during initialization");
+                }
                 const data = this.contexts.get(authIndex);
                 if (!data || !this.connectionRegistry.getConnectionByAuth(authIndex, false))
                     throw Object.assign(new Error("WebSocket not ready after context initialization"), {
@@ -1860,7 +1976,7 @@ class BrowserManager {
     }
 
     async _closeContextForPoolIfPossible(authIndex, reason) {
-        if (this._hasActiveQueueForAuth(authIndex)) {
+        if (!this._isContextIdle(authIndex)) {
             return this._scheduleContextClosureWhenIdle(authIndex, reason);
         }
 
@@ -1873,7 +1989,8 @@ class BrowserManager {
         if (!this.pendingContextClosures.has(authIndex)) {
             return false;
         }
-        if (authIndex === this._currentAuthIndex) {
+        const data = this.contexts.get(authIndex);
+        if (authIndex === this._currentAuthIndex && !data?.draining) {
             this.logger.debug(
                 `[ContextPool] Skipping pending close for context #${authIndex} because it is active again as current.`
             );
@@ -1884,7 +2001,7 @@ class BrowserManager {
             return false;
         }
 
-        if (this._hasActiveQueueForAuth(authIndex)) {
+        if (!this._isContextIdle(authIndex)) {
             this.logger.debug(
                 `[ContextPool] Pending close for context #${authIndex} is still waiting on active queue(s).`
             );
@@ -1897,6 +2014,7 @@ class BrowserManager {
             `[ContextPool] Closing deferred context #${authIndex} now that all queues are drained (reason: ${pendingReason}).`
         );
         await this.closeContext(authIndex);
+        if (this.scheduler) this._pumpContextPool();
         if (this._isSystemBusy()) {
             this.logger.info("[ContextPool] Skipping rebalance after deferred close because system is busy.");
             return true;
@@ -2460,7 +2578,9 @@ class BrowserManager {
             if (!this.abortedContexts.has(authIndex) && !(isBackgroundTask && this._backgroundPreloadAbort)) {
                 this.contexts.set(authIndex, {
                     context,
+                    createdAt: Date.now(),
                     healthMonitorInterval: null,
+                    lastRequestAt: 0,
                     page,
                     state: "READY",
                 });

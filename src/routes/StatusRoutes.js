@@ -117,7 +117,15 @@ class StatusRoutes {
             if (rawIds === undefined || rawIds === "") {
                 const accounts = this.serverSystem.authSource.getRotationIndices().map(index => {
                     const account = scheduler.account(index);
-                    return { healthy: account.healthy, index, inflight: account.inflight, key: account.key };
+                    return {
+                        disabled: account.disabled,
+                        disabled_at: account.disabled_at,
+                        disabled_reason: account.disabled_reason,
+                        healthy: account.healthy,
+                        index,
+                        inflight: account.inflight,
+                        key: account.key,
+                    };
                 });
                 return this._sendJsonWithEtag(req, res, {
                     accounts,
@@ -163,6 +171,18 @@ class StatusRoutes {
             const scheduler = this.serverSystem.scheduler;
             if (!scheduler) return res.status(409).json({ error: "Scheduler is in legacy mode" });
             res.json({ reset_count: scheduler.resetAllRateLimits(), success: true });
+        });
+        app.post("/api/scheduler/disable", isAuthenticated, (req, res) => {
+            const scheduler = this.serverSystem.scheduler;
+            if (!scheduler) return res.status(409).json({ error: "Scheduler is in legacy mode" });
+            const index = req.body?.account_id;
+            if (!Number.isInteger(index) || !this.serverSystem.authSource.availableIndices.includes(index))
+                return res.status(400).json({ error: "Valid account_id is required" });
+            const result = scheduler.disable(index);
+            this.logger.info(
+                `[Scheduler] Admin disabled account #${index}${result.changed ? "" : " (already disabled)"}`
+            );
+            res.json({ success: true, ...result });
         });
         app.post("/api/scheduler/reset-all", isAuthenticated, (req, res) => {
             const scheduler = this.serverSystem.scheduler;

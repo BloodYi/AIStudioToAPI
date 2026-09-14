@@ -90,6 +90,89 @@ test("temporary failure backs off without disabling account", async () => {
     scheduler.close();
 });
 
+test("403 risk control uses independent deterministic backoff and resets only on success", async () => {
+    const scheduler = setup(
+        {
+            riskControlCooldownMs: 600000,
+            riskControlJitter: false,
+            riskControlMaxCooldownMs: 10800000,
+            tempErrorCooldownMs: 1000,
+        },
+        1
+    );
+    const expected = [600000, 1800000, 3600000, 10800000, 10800000];
+    for (let i = 0; i < expected.length; i++) {
+        const lease = await scheduler.acquire("a");
+        const before = Date.now();
+        scheduler.failure(lease, { status: 403 });
+        assert.ok(lease.slot.cooldown_until - before >= expected[i]);
+        assert.ok(lease.slot.cooldown_until - before <= expected[i] + 20);
+        assert.equal(lease.slot.risk_control_failures, i + 1);
+        assert.equal(lease.slot.consecutive_failures, 0);
+        assert.equal(lease.slot.last_error_kind, "risk_controlled");
+        assert.equal(lease.account.healthy, true);
+        assert.equal(lease.slot.unsupported, false);
+        scheduler.release(lease);
+        lease.slot.cooldown_until = 0;
+    }
+    const temporary = await scheduler.acquire("a");
+    scheduler.failure(temporary, { status: 503 });
+    assert.equal(temporary.slot.risk_control_failures, 5);
+    assert.equal(temporary.slot.consecutive_failures, 1);
+    scheduler.release(temporary);
+    temporary.slot.cooldown_until = 0;
+    const success = await scheduler.acquire("a");
+    scheduler.startAttempt(success);
+    scheduler.release(success, true);
+    assert.equal(success.slot.risk_control_failures, 0);
+    assert.equal(success.slot.last_error_kind, null);
+    scheduler.close();
+});
+
+test("manual account disable is lease-safe and only account-wide recovery clears it", async () => {
+    const scheduler = setup({ globalConcurrency: 2 }, 2);
+    const active = await scheduler.acquire("a");
+    const result = scheduler.disable(active.account.index);
+    assert.deepEqual(result, { account_id: 0, changed: true, disabled: true });
+    assert.equal(active.account.inflight, 1);
+    assert.equal(scheduler.disable(0).changed, false);
+    const replacement = await scheduler.acquire("a");
+    assert.equal(replacement.account.index, 1);
+    scheduler.release(replacement);
+    scheduler.release(active, true);
+
+    scheduler.reset(0, "a");
+    assert.equal(scheduler.account(0).disabled, true);
+    assert.equal(
+        scheduler.eligibleAccounts("a").some(account => account.index === 0),
+        false
+    );
+    scheduler.resetAllRateLimits();
+    assert.equal(scheduler.account(0).disabled, true);
+    scheduler.reset(0);
+    assert.equal(scheduler.account(0).disabled, false);
+    assert.equal(scheduler.account(0).disabled_at, null);
+    scheduler.close();
+});
+
+test("manual account disable survives version 5 persistence and bulk enable clears it", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "scheduler-disabled-"));
+    const statePath = path.join(directory, "state.json");
+    const first = setup({ statePath }, 1);
+    first.disable(0);
+    first.close();
+    const persisted = JSON.parse(fs.readFileSync(statePath));
+    assert.equal(persisted.version, 5);
+    assert.equal(persisted.accounts[0].disabled, true);
+
+    const second = setup({ statePath }, 1);
+    assert.equal(second.account(0).disabled, true);
+    assert.deepEqual(second.resetAllAccounts(), { reset_account_count: 1, reset_model_count: 0 });
+    assert.equal(second.account(0).disabled, false);
+    second.close();
+    fs.rmSync(directory, { recursive: true });
+});
+
 test("minimum allocation gets next free worker and idle capacity can be borrowed", async () => {
     const scheduler = setup({ allocation: { a: { min: 3, preferred: 5 }, b: { min: 1, preferred: 1 } } });
     const borrowed = await Promise.all(Array.from({ length: 6 }, () => scheduler.acquire("a")));
@@ -255,12 +338,12 @@ test("hidden models are filtered only from management snapshots and remain sched
     scheduler.close();
 });
 
-test("hidden models persist in version 4 state and legacy states default to visible", () => {
+test("hidden models persist in version 5 state and legacy states default to visible", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "scheduler-hidden-"));
     const statePath = path.join(directory, "state.json");
     const first = setup({ allocation: { flash: { min: 0, preferred: 1 } }, statePath }, 1);
     first.hideModel("flash");
-    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 4);
+    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 5);
     const second = setup({ allocation: { flash: { min: 0, preferred: 1 } }, statePath }, 1);
     assert.deepEqual(second.hiddenModelsSnapshot(), ["flash"]);
     first.close();
@@ -420,7 +503,7 @@ test("corrupt state is backed up and inflight reset does not persist a lock", ()
     assert.equal(scheduler.accounts.size, 0);
     assert.ok(fs.readdirSync(directory).some(name => name.includes(".corrupt-")));
     scheduler.close();
-    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 4);
+    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 5);
     fs.rmSync(directory, { recursive: true });
 });
 
@@ -627,7 +710,10 @@ test("local queue and WebSocket failures never cool account-model state", async 
 });
 
 test("new context configuration validates pool and capacity limits", () => {
-    assert.equal(loadConfig({}).contextCreationTimeoutMs, 120000);
+    const defaults = loadConfig({});
+    assert.equal(defaults.contextCreationTimeoutMs, 120000);
+    assert.equal(defaults.riskControlCooldownMs, 600000);
+    assert.equal(defaults.riskControlMaxCooldownMs, 10800000);
     const config = loadConfig({
         CONTEXT_CREATION_TIMEOUT_MS: "90000",
         CONTEXT_INIT_CONCURRENCY: "3",

@@ -191,6 +191,56 @@ test("reset-all scheduler route enforces authentication and reports legacy and c
     });
 });
 
+test("disable scheduler route authenticates, validates IDs, and is idempotent", async () => {
+    const routes = new Map();
+    const app = {};
+    for (const method of ["delete", "get", "post", "put", "use"])
+        app[method] = (route, ...handlers) => {
+            if (method === "post") routes.set(route, handlers);
+        };
+    let disabled = false;
+    const scheduler = {
+        disable(index) {
+            const changed = !disabled;
+            disabled = true;
+            return { account_id: index, changed, disabled: true };
+        },
+    };
+    const serverSystem = {
+        authSource: { availableIndices: [0] },
+        config: {},
+        distIndexPath: "",
+        logger,
+        scheduler,
+    };
+    const isAuthenticated = (req, res, next) =>
+        req.authenticated ? next() : res.status(401).json({ error: "Unauthorized" });
+    new StatusRoutes(serverSystem).setupRoutes(app, isAuthenticated);
+    const invoke = async (authenticated, body) => {
+        const handlers = routes.get("/api/scheduler/disable");
+        const response = new Response();
+        response.body = null;
+        response.json = value => {
+            response.body = value;
+            return response;
+        };
+        let index = 0;
+        const next = () => handlers[++index]({ authenticated, body }, response, next);
+        await handlers[0]({ authenticated, body }, response, next);
+        return response;
+    };
+    assert.equal((await invoke(false, { account_id: 0 })).statusCode, 401);
+    assert.equal((await invoke(true, {})).statusCode, 400);
+    assert.equal((await invoke(true, { account_id: 9 })).statusCode, 400);
+    assert.deepEqual((await invoke(true, { account_id: 0 })).body, {
+        account_id: 0,
+        changed: true,
+        disabled: true,
+        success: true,
+    });
+    assert.equal((await invoke(true, { account_id: 0 })).body.changed, false);
+});
+
 for (const stream of [false, true]) {
     test(`OpenAI ${stream ? "real stream" : "buffered"} retries quota on another account and keeps global account unchanged`, async () => {
         const fixture = setup(index =>

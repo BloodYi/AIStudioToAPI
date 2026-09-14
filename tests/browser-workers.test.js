@@ -22,6 +22,7 @@ function browserFixture(limit) {
         },
         async _startBackgroundWakeup() {},
         _startHealthMonitor() {},
+        abortedContexts: new Set(),
         authSource: { getRotationIndices: () => [0, 1, 2] },
         async closeContext(index, options) {
             this.contexts.delete(index);
@@ -33,6 +34,7 @@ function browserFixture(limit) {
         contextUnavailable: new Map(),
         initializingContexts: new Set(),
         logger,
+        pendingContextClosures: new Map(),
         scheduler: {
             account: index => ({ inflight: index === 0 ? 1 : 0 }),
             closed: false,
@@ -58,6 +60,65 @@ test("context setup is bounded parallel and never evicts leased contexts", async
     assert.equal(manager.peak, 2);
     assert.equal(manager.peakInitializations, 2);
     assert.deepEqual([...manager.contexts.keys()], [0, 2]);
+});
+
+test("disabled accounts are excluded from context demand and warm candidates", () => {
+    const manager = browserFixture(2);
+    manager.scheduler.config.contextPoolMinReady = 2;
+    manager.scheduler.isAccountManuallyDisabled = index => index === 1;
+    manager.requestContext(1, "flash");
+    assert.equal(manager.contextDemand.has(1), false);
+    manager.contextDemand.set(1, { model: "flash" });
+    manager.contextDemand.set(2, { model: "flash" });
+    assert.deepEqual(manager._poolCandidates(), [2, 0]);
+    manager.scheduler.closed = true;
+});
+
+test("context eviction ranks disabled state, demand, and true request LRU", () => {
+    const manager = browserFixture(3);
+    const accounts = new Map(
+        [0, 1, 2].map(index => [index, { disabled: false, healthy: true, inflight: 0, models: {} }])
+    );
+    manager.scheduler.account = index => accounts.get(index);
+    manager.scheduler.isAccountManuallyDisabled = index => accounts.get(index).disabled;
+    manager.contexts = new Map([
+        [0, { createdAt: 10, lastRequestAt: 300, page: { isClosed: () => false }, state: "READY" }],
+        [1, { createdAt: 20, lastRequestAt: 100, page: { isClosed: () => false }, state: "READY" }],
+        [2, { createdAt: 30, lastRequestAt: 200, page: { isClosed: () => false }, state: "READY" }],
+    ]);
+    assert.deepEqual(
+        [0, 1, 2].sort((a, b) => manager._compareContextEviction(a, b)),
+        [1, 2, 0]
+    );
+    manager.contextDemand.set(1, { model: "flash" });
+    assert.deepEqual(
+        [0, 1, 2].sort((a, b) => manager._compareContextEviction(a, b)),
+        [2, 0, 1]
+    );
+    accounts.get(0).disabled = true;
+    assert.equal([0, 1, 2].sort((a, b) => manager._compareContextEviction(a, b))[0], 0);
+    manager.markContextRequest(2, 400);
+    assert.equal(manager.contexts.get(2).lastRequestAt, 400);
+});
+
+test("disabling a busy context drains without interrupting it and closes after release", async () => {
+    const manager = browserFixture(1);
+    const account = { disabled: true, healthy: true, inflight: 1, models: {} };
+    manager.scheduler.account = () => account;
+    manager.contexts.set(0, { page: { isClosed: () => false }, state: "READY" });
+    manager.handleAccountDisabled(0);
+    assert.equal(manager.contexts.get(0).draining, true);
+    assert.equal(manager.pendingContextClosures.get(0), "account_disabled");
+    assert.equal(manager.contexts.has(0), true);
+
+    let pumps = 0;
+    manager._isSystemBusyProvider = () => true;
+    manager._pumpContextPool = () => pumps++;
+    account.inflight = 0;
+    manager.handleAccountLeaseReleased(0);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contexts.has(0), false);
+    assert.equal(pumps, 1);
 });
 test("one-worker account rotation keeps browser alive while replacing last context", async () => {
     const manager = browserFixture(1);

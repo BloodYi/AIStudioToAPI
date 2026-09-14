@@ -90,6 +90,7 @@ class ModelScheduler {
         this.workers = Array.from({ length: config.globalConcurrency }, (_, id) => ({ id, lease: null }));
         this.sequence = 0;
         this.closed = false;
+        this.random = typeof config.random === "function" ? config.random : Math.random;
         this.metrics = {
             dispatch_timeout: 0,
             local_transport: 0,
@@ -103,10 +104,21 @@ class ModelScheduler {
         // Email survives auth file re-numbering; anonymous auth sources use their index.
         const key = this.authSource.accountNameMap.get(index) || `auth-${index}`;
         if (!this.accounts.has(key))
-            this.accounts.set(key, { healthy: true, key, last_error: null, models: Object.create(null) });
+            this.accounts.set(key, {
+                disabled: false,
+                disabled_at: null,
+                disabled_reason: null,
+                healthy: true,
+                key,
+                last_error: null,
+                models: Object.create(null),
+            });
         const account = this.accounts.get(key);
         account.index = index;
         account.inflight ??= 0;
+        account.disabled ??= false;
+        account.disabled_at ??= null;
+        account.disabled_reason ??= null;
         return account;
     }
 
@@ -139,9 +151,11 @@ class ModelScheduler {
                 failure_count: 0,
                 inflight: 0,
                 last_error: null,
+                last_error_kind: null,
                 last_used_at: 0,
                 rate_limited: false,
                 request_count: 0,
+                risk_control_failures: 0,
                 success_count: 0,
                 unsupported: false,
             };
@@ -162,6 +176,7 @@ class ModelScheduler {
                 const slot = this.slot(account, model);
                 return (
                     account.healthy &&
+                    !account.disabled &&
                     !excluded.has(account.key) &&
                     !slot.unsupported &&
                     slot.cooldown_until <= Date.now()
@@ -256,7 +271,12 @@ class ModelScheduler {
         });
         if (waitingForContext && activeAccounts.length >= this.config.maxWorkers) {
             if (!activeAccounts.some(account => account.key === this.drainingAccount)) {
-                this.drainingAccount = activeAccounts.sort((a, b) => a.inflight - b.inflight)[0].key;
+                const draining = activeAccounts.sort((a, b) => {
+                    const ranked = this.browserManager?.compareAccountsForDraining?.(a.index, b.index);
+                    return ranked || a.inflight - b.inflight || a.index - b.index;
+                })[0];
+                this.drainingAccount = draining.key;
+                this.browserManager?.beginAccountDrain?.(draining.index, "context_capacity");
             }
         } else {
             this.drainingAccount = null;
@@ -352,6 +372,7 @@ class ModelScheduler {
         lease.slot.daily_request_count++;
         lease.slot.request_count++;
         lease.slot.last_used_at = now;
+        this.browserManager?.markContextRequest?.(lease.account.index, now);
         this.saveSoon();
     }
 
@@ -372,8 +393,10 @@ class ModelScheduler {
         slot.daily_failure_count++;
         slot.failure_count++;
         this.metrics.upstream_error++;
-        slot.consecutive_failures++;
+        if (kind === "risk_controlled") slot.risk_control_failures = (slot.risk_control_failures || 0) + 1;
+        else slot.consecutive_failures++;
         slot.last_error = String(error.message || "Request failed").slice(0, 2000);
+        slot.last_error_kind = kind;
         account.last_error = slot.last_error;
         if (kind === "account") account.healthy = false;
         if (kind === "unsupported") slot.unsupported = true;
@@ -381,9 +404,22 @@ class ModelScheduler {
             slot.rate_limited = true;
             slot.cooldown_until = Date.now() + this.config.rateLimitCooldownMs;
         }
-        if (kind === "temporary" || kind === "risk_controlled")
+        if (kind === "temporary")
             slot.cooldown_until =
                 Date.now() + this.config.tempErrorCooldownMs * Math.min(4, 2 ** (slot.consecutive_failures - 1));
+        if (kind === "risk_controlled") {
+            const multipliers = [1, 3, 6, 18];
+            const multiplier = multipliers[Math.min(slot.risk_control_failures - 1, multipliers.length - 1)];
+            const jitter = this.config.riskControlJitter === false ? 1 : 0.9 + this.random() * 0.2;
+            const cooldown = Math.min(
+                this.config.riskControlMaxCooldownMs,
+                Math.round(this.config.riskControlCooldownMs * multiplier * jitter)
+            );
+            slot.cooldown_until = Date.now() + cooldown;
+            this.logger.warn?.(
+                `[Scheduler] Risk control account #${account.index}, model ${lease.model}, consecutive=${slot.risk_control_failures}, cooldown_until=${slot.cooldown_until}`
+            );
+        }
         this.saveSoon();
     }
 
@@ -393,13 +429,33 @@ class ModelScheduler {
         if (success && lease.attempted && !lease.recorded) {
             lease.slot.success_count++;
             lease.slot.consecutive_failures = 0;
+            lease.slot.risk_control_failures = 0;
             lease.slot.last_error = null;
+            lease.slot.last_error_kind = null;
         }
         lease.account.inflight--;
         lease.slot.inflight--;
         lease.worker.lease = null;
         this.saveSoon();
         this.drain();
+        this.browserManager?.handleAccountLeaseReleased?.(lease.account.index);
+    }
+
+    isAccountManuallyDisabled(index) {
+        return this.account(index).disabled === true;
+    }
+
+    disable(index, reason = "manual") {
+        const account = this.account(index);
+        if (account.disabled) return { account_id: index, changed: false, disabled: true };
+        account.disabled = true;
+        account.disabled_at = Date.now();
+        account.disabled_reason = reason;
+        this.sequence++;
+        this.flush();
+        this.browserManager?.handleAccountDisabled?.(index);
+        this.drain();
+        return { account_id: index, changed: true, disabled: true };
     }
 
     resetAllRateLimits() {
@@ -424,7 +480,10 @@ class ModelScheduler {
         // Limit the override to accounts that are currently valid rotation candidates.
         for (const index of this.authSource.getRotationIndices()) {
             const account = this.account(index);
-            if (!account.healthy || account.last_error !== null) {
+            if (account.disabled || !account.healthy || account.last_error !== null) {
+                account.disabled = false;
+                account.disabled_at = null;
+                account.disabled_reason = null;
                 account.healthy = true;
                 account.last_error = null;
                 resetAccountCount++;
@@ -435,6 +494,7 @@ class ModelScheduler {
                     !slot.rate_limited &&
                     !slot.cooldown_until &&
                     !slot.consecutive_failures &&
+                    !slot.risk_control_failures &&
                     slot.last_error === null
                 )
                     continue;
@@ -442,7 +502,9 @@ class ModelScheduler {
                     consecutive_failures: 0,
                     cooldown_until: 0,
                     last_error: null,
+                    last_error_kind: null,
                     rate_limited: false,
+                    risk_control_failures: 0,
                     unsupported: false,
                 });
                 resetModelCount++;
@@ -450,6 +512,7 @@ class ModelScheduler {
         }
         this.flush();
         this.drain();
+        this.browserManager?.handleAccountsEnabled?.();
         return { reset_account_count: resetAccountCount, reset_model_count: resetModelCount };
     }
 
@@ -459,6 +522,9 @@ class ModelScheduler {
         if (!model) {
             account.healthy = true;
             account.last_error = null;
+            account.disabled = false;
+            account.disabled_at = null;
+            account.disabled_reason = null;
         }
         const slots = model ? [this.slot(account, model)] : Object.values(account.models);
         for (const slot of slots)
@@ -466,11 +532,14 @@ class ModelScheduler {
                 consecutive_failures: 0,
                 cooldown_until: 0,
                 last_error: null,
+                last_error_kind: null,
                 rate_limited: false,
+                risk_control_failures: 0,
                 unsupported: false,
             });
         this.flush();
         this.drain();
+        if (!model) this.browserManager?.handleAccountEnabled?.(index);
     }
 
     _snapshotModels() {
@@ -514,6 +583,7 @@ class ModelScheduler {
     }
 
     _slotStatus(account, slot, rotationIndices) {
+        if (account.disabled) return "ACCOUNT_DISABLED";
         if (!account.healthy || !rotationIndices.includes(account.index)) return "UNHEALTHY";
         if (slot.unsupported) return "UNSUPPORTED";
         if (slot.rate_limited) return "RATE_LIMITED";
@@ -616,7 +686,10 @@ class ModelScheduler {
         const isRateLimited = slot =>
             Boolean(slot?.rate_limited && (!slot.cooldown_until || slot.cooldown_until > now));
         const isAvailable = (account, slot) =>
-            (account?.healthy ?? true) && !slot?.unsupported && (!slot?.cooldown_until || slot.cooldown_until <= now);
+            (account?.healthy ?? true) &&
+            !account?.disabled &&
+            !slot?.unsupported &&
+            (!slot?.cooldown_until || slot.cooldown_until <= now);
 
         return {
             active: this.workers.filter(worker => worker.lease).length,
@@ -655,10 +728,14 @@ class ModelScheduler {
             contexts: contexts.map(context => ({
                 auth_index: context.auth_index,
                 connection_epoch: context.connection_epoch || null,
+                created_at: context.created_at || null,
+                draining: Boolean(context.draining),
+                eviction_priority: context.eviction_priority || null,
                 inflight: context.inflight || 0,
                 last_disconnect_reason: context.last_disconnect_reason
                     ? String(context.last_disconnect_reason).slice(0, 500)
                     : null,
+                last_request_at: context.last_request_at || null,
                 state: context.state,
             })),
             revision: `contexts:${this.sequence}:${contexts.length}`,
@@ -673,6 +750,9 @@ class ModelScheduler {
             accounts: requested.map(index => {
                 const account = this.account(index);
                 return {
+                    disabled: account.disabled,
+                    disabled_at: account.disabled_at,
+                    disabled_reason: account.disabled_reason,
                     healthy: account.healthy,
                     index: account.index,
                     inflight: account.inflight,
@@ -688,7 +768,9 @@ class ModelScheduler {
                                 daily_requests: slot.daily_request_count,
                                 inflight: slot.inflight,
                                 last_error: slot.last_error ? String(slot.last_error).slice(0, 500) : null,
+                                last_error_kind: slot.last_error_kind || null,
                                 model,
+                                risk_control_failures: slot.risk_control_failures || 0,
                                 status: this._slotStatus(account, slot, rotationIndices),
                             };
                         }),
@@ -770,9 +852,9 @@ class ModelScheduler {
         if (!this.config.statePath) return;
         try {
             const data = JSON.parse(fs.readFileSync(this.config.statePath, "utf8"));
-            if (![1, 2, 3, 4].includes(data.version) || !Array.isArray(data.accounts))
+            if (![1, 2, 3, 4, 5].includes(data.version) || !Array.isArray(data.accounts))
                 throw new Error("Unsupported scheduler state");
-            if (data.version === 4) {
+            if (data.version >= 4) {
                 if (!Array.isArray(data.hiddenModels) || data.hiddenModels.some(model => typeof model !== "string"))
                     throw new Error("Invalid hidden scheduler models");
                 this.hiddenModels = new Set(data.hiddenModels.map(normalizeModelName));
@@ -783,7 +865,12 @@ class ModelScheduler {
                     throw new Error("Invalid account state");
                 account.models = Object.assign(Object.create(null), account.models);
                 account.inflight = 0;
+                account.disabled ??= false;
+                account.disabled_at ??= null;
+                account.disabled_reason ??= null;
                 for (const slot of Object.values(account.models)) {
+                    slot.risk_control_failures ??= 0;
+                    slot.last_error_kind ??= null;
                     if (data.version === 1) {
                         slot.daily_request_count = 0;
                         slot.daily_failure_count = 0;
@@ -845,7 +932,7 @@ class ModelScheduler {
                     accounts: [...this.accounts.values()],
                     fileAffinities: [...this.fileAffinities],
                     hiddenModels: this.hiddenModelsSnapshot(),
-                    version: 4,
+                    version: 5,
                 }),
                 {
                     mode: 0o600,
