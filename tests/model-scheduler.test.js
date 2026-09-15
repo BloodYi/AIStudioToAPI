@@ -412,6 +412,30 @@ test("upstream failures use the Pacific daily window while aborts and transport 
     scheduler.close();
 });
 
+test("account details expose one model list with aggregate 403 and 429 flags", () => {
+    const scheduler = setup({}, 1);
+    const account = scheduler.account(0);
+    const riskControlled = scheduler.slot(account, "risk-model");
+    riskControlled.last_error_kind = "risk_controlled";
+    riskControlled.risk_control_failures = 1;
+    riskControlled.cooldown_until = Date.now() + 60_000;
+    const rateLimited = scheduler.slot(account, "rate-model");
+    rateLimited.rate_limited = true;
+    rateLimited.cooldown_until = Date.now() + 60_000;
+
+    const details = scheduler.accountsSnapshot([0]).accounts[0];
+    assert.equal(details.has_403, true);
+    assert.equal(details.has_429, true);
+    assert.deepEqual(
+        details.models.map(slot => [slot.model, slot.status]),
+        [
+            ["rate-model", "RATE_LIMITED"],
+            ["risk-model", "RISK_CONTROLLED"],
+        ]
+    );
+    scheduler.close();
+});
+
 test("version 1 state preserves cumulative values and initializes daily usage at zero", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "scheduler-v1-"));
     const statePath = path.join(directory, "state.json");

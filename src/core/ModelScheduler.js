@@ -594,7 +594,6 @@ class ModelScheduler {
         }
         if (slot.rate_limited) return "RATE_LIMITED";
         if (slot.cooldown_until) return "COOLDOWN";
-        if (slot.cooldown_until && slot.cooldown_until > Date.now()) return "COOLDOWN";
         return "HEALTHY";
     }
 
@@ -792,23 +791,6 @@ class ModelScheduler {
                     index: account.index,
                     inflight: account.inflight,
                     key: account.key,
-                    models: Object.keys(account.models)
-                        .filter(model => !this.hiddenModels.has(model))
-                        .sort()
-                        .map(model => {
-                            const slot = this.slot(account, model, now);
-                            return {
-                                cooldown_until: slot.cooldown_until || null,
-                                daily_failures: slot.daily_failure_count,
-                                daily_requests: slot.daily_request_count,
-                                inflight: slot.inflight,
-                                last_error: slot.last_error ? String(slot.last_error).slice(0, 500) : null,
-                                last_error_kind: slot.last_error_kind || null,
-                                model,
-                                risk_control_failures: slot.risk_control_failures || 0,
-                                status: this._slotStatus(account, slot, rotationIndices),
-                            };
-                        }),
                     models,
                 };
             }),
