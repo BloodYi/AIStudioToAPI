@@ -586,8 +586,15 @@ class ModelScheduler {
         if (account.disabled) return "ACCOUNT_DISABLED";
         if (!account.healthy || !rotationIndices.includes(account.index)) return "UNHEALTHY";
         if (slot.unsupported) return "UNSUPPORTED";
+        if (
+            slot.last_error_kind === "risk_controlled" ||
+            (slot.risk_control_failures > 0 && slot.cooldown_until && slot.cooldown_until > Date.now())
+        ) {
+            return "RISK_CONTROLLED";
+        }
         if (slot.rate_limited) return "RATE_LIMITED";
         if (slot.cooldown_until) return "COOLDOWN";
+        if (slot.cooldown_until && slot.cooldown_until > Date.now()) return "COOLDOWN";
         return "HEALTHY";
     }
 
@@ -749,10 +756,38 @@ class ModelScheduler {
         return {
             accounts: requested.map(index => {
                 const account = this.account(index);
+                const models = Object.keys(account.models)
+                    .filter(model => !this.hiddenModels.has(model))
+                    .sort()
+                    .map(model => {
+                        const slot = this.slot(account, model, now);
+                        return {
+                            cooldown_until: slot.cooldown_until || null,
+                            daily_failures: slot.daily_failure_count,
+                            daily_requests: slot.daily_request_count,
+                            inflight: slot.inflight,
+                            last_error: slot.last_error ? String(slot.last_error).slice(0, 500) : null,
+                            last_error_kind: slot.last_error_kind || null,
+                            model,
+                            risk_control_failures: slot.risk_control_failures || 0,
+                            status: this._slotStatus(account, slot, rotationIndices),
+                        };
+                    });
+                let has403 = false;
+                let has429 = false;
+                for (const slot of models) {
+                    if (slot.status === "RISK_CONTROLLED" || slot.last_error_kind === "risk_controlled") {
+                        has403 = true;
+                    } else if (slot.status === "RATE_LIMITED" || slot.status === "COOLDOWN") {
+                        has429 = true;
+                    }
+                }
                 return {
                     disabled: account.disabled,
                     disabled_at: account.disabled_at,
                     disabled_reason: account.disabled_reason,
+                    has_403: has403,
+                    has_429: has429,
                     healthy: account.healthy,
                     index: account.index,
                     inflight: account.inflight,
@@ -774,6 +809,7 @@ class ModelScheduler {
                                 status: this._slotStatus(account, slot, rotationIndices),
                             };
                         }),
+                    models,
                 };
             }),
             revision: `accounts:${this.sequence}`,

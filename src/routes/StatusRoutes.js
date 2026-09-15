@@ -115,12 +115,31 @@ class StatusRoutes {
             if (!scheduler) return res.status(409).json({ error: "Scheduler is in legacy mode" });
             const rawIds = req.query.ids;
             if (rawIds === undefined || rawIds === "") {
+                const now = Date.now();
                 const accounts = this.serverSystem.authSource.getRotationIndices().map(index => {
                     const account = scheduler.account(index);
+                    let has403 = false;
+                    let has429 = false;
+                    if (account.models) {
+                        for (const model of Object.keys(account.models)) {
+                            if (scheduler.hiddenModels?.has(model)) continue;
+                            const slot = scheduler.slot(account, model, now);
+                            if (
+                                slot.last_error_kind === "risk_controlled" ||
+                                (slot.risk_control_failures > 0 && slot.cooldown_until && slot.cooldown_until > now)
+                            ) {
+                                has403 = true;
+                            } else if (slot.rate_limited || (slot.cooldown_until && slot.cooldown_until > now)) {
+                                has429 = true;
+                            }
+                        }
+                    }
                     return {
                         disabled: account.disabled,
                         disabled_at: account.disabled_at,
                         disabled_reason: account.disabled_reason,
+                        has_403: has403,
+                        has_429: has429,
                         healthy: account.healthy,
                         index,
                         inflight: account.inflight,

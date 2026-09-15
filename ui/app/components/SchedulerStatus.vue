@@ -273,6 +273,26 @@
             <div v-if="contextsOpen" class="collapsible-body">
                 <div class="context-view-switch">
                     <span class="view-switch-tip">共 {{ contexts.length }} 个实例槽位</span>
+                    <div class="view-switch-info">
+                        <span class="view-switch-tip">共 {{ contexts.length }} 个实例槽位</span>
+                        <span v-if="coldContexts.length > 0" class="context-ratio-hint">
+                            （{{ activeContexts.length }} 活跃 / {{ coldContexts.length }} 冷备）
+                        </span>
+                        <button
+                            v-if="contextViewMode === 'matrix' && coldContexts.length > 0 && !showAllContexts"
+                            class="btn-inline-toggle"
+                            @click="showAllContexts = true"
+                        >
+                            {{ t("schedulerShowAllContexts") }} ▾
+                        </button>
+                        <button
+                            v-else-if="contextViewMode === 'matrix' && coldContexts.length > 0 && showAllContexts"
+                            class="btn-inline-toggle"
+                            @click="showAllContexts = false"
+                        >
+                            {{ t("schedulerCollapseColdContexts") }} ▴
+                        </button>
+                    </div>
                     <div class="switch-button-group">
                         <button
                             class="switch-btn"
@@ -302,6 +322,34 @@
                         <div class="node-header">
                             <span class="node-id font-mono">#{{ context.auth_index }}</span>
                             <span class="node-state-tag">{{ context.state }}</span>
+                <div v-if="contextViewMode === 'matrix'" class="context-matrix-wrapper">
+                    <div class="context-matrix-grid">
+                        <div
+                            v-for="context in displayedMatrixContexts"
+                            :key="context.auth_index"
+                            class="node-card"
+                            :class="'node-' + (context.state || 'unknown').toLowerCase()"
+                        >
+                            <div class="node-header">
+                                <span class="node-id font-mono">#{{ context.auth_index }}</span>
+                                <span class="node-state-tag">{{ context.state }}</span>
+                            </div>
+                            <div class="node-body">
+                                <span
+                                    v-if="context.last_disconnect_reason"
+                                    class="node-error-text"
+                                    :title="context.last_disconnect_reason"
+                                >
+                                    ⚠️ {{ context.last_disconnect_reason }}
+                                </span>
+                                <span v-else class="node-sub-text">
+                                    {{ context.state === "READY" ? "运行就绪" : "待命闲置" }}
+                                </span>
+                            </div>
+                            <div class="node-footer font-mono">
+                                <span>在途: {{ context.inflight }}</span>
+                                <span>Epoch: {{ context.connection_epoch || "—" }}</span>
+                            </div>
                         </div>
                         <div class="node-body">
                             <span
@@ -314,11 +362,40 @@
                             <span v-else class="node-sub-text">
                                 {{ context.state === "READY" ? "运行就绪" : "待命闲置" }}
                             </span>
+
+                        <!-- Toggle Card when collapsed -->
+                        <div
+                            v-if="!showAllContexts && coldContexts.length > 0 && activeContexts.length > 0"
+                            class="node-card node-expand-toggle"
+                            @click="showAllContexts = true"
+                        >
+                            <div class="expand-toggle-inner">
+                                <svg class="expand-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path
+                                        stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                        stroke-width="2"
+                                        d="M19 9l-7 7-7-7"
+                                    ></path>
+                                </svg>
+                                <span class="expand-title">+ 其余 {{ coldContexts.length }} 个冷备实例</span>
+                                <span class="expand-action">{{ t("schedulerShowAllContexts") }}</span>
+                            </div>
                         </div>
                         <div class="node-footer font-mono">
                             <span>在途: {{ context.inflight }}</span>
                             <span>Epoch: {{ context.connection_epoch || "—" }}</span>
                         </div>
+                    </div>
+
+                    <!-- Bottom Collapse Action when expanded -->
+                    <div
+                        v-if="showAllContexts && coldContexts.length > 0 && activeContexts.length > 0"
+                        class="matrix-collapse-bar"
+                    >
+                        <button class="btn btn-sm btn-default" @click="showAllContexts = false">
+                            {{ t("schedulerCollapseColdContexts") }} ▴
+                        </button>
                     </div>
                 </div>
 
@@ -564,6 +641,34 @@
                                 <!-- Concise Badge: strictly clear without verbose text -->
                                 <span class="acc-badge" :class="'badge-' + getAccountState(account)">
                                     {{ getAccountStateLabel(account) }}
+                                <!-- Concise Badges: clearly distinguish 429, 403, disabled, healthy -->
+                                <span v-if="account.disabled" class="acc-badge badge-disabled">
+                                    {{ t("schedulerStatusDisabled") }}
+                                </span>
+                                <span v-if="hasAccount403(account)" class="acc-badge badge-403">
+                                    🛡️ {{ t("schedulerStatusRiskControlled") }}
+                                </span>
+                                <span v-if="hasAccount429(account)" class="acc-badge badge-429">
+                                    🚨 {{ t("schedulerStatusRateLimited") }}
+                                </span>
+                                <span
+                                    v-if="!account.disabled && !hasAccount403(account) && !hasAccount429(account) && account.healthy"
+                                    v-if="
+                                        !account.disabled &&
+                                        !hasAccount403(account) &&
+                                        !hasAccount429(account) &&
+                                        account.healthy
+                                    "
+                                    class="acc-badge badge-healthy"
+                                >
+                                    ✅ {{ t("schedulerStatusHealthy") }}
+                                </span>
+                                <span
+                                    v-if="!account.disabled && !account.healthy"
+                                    class="acc-badge badge-unhealthy"
+                                >
+                                <span v-if="!account.disabled && !account.healthy" class="acc-badge badge-unhealthy">
+                                    异常
                                 </span>
                             </div>
 
@@ -594,6 +699,12 @@
                         <!-- Inside Account: Model Slots Detail -->
                         <div v-if="expandedAccounts.has(account.index)" class="account-card-body">
                             <div v-if="!account.models?.length" class="scheduler-empty py-2">正在加载模型槽位详情…</div>
+                            <div v-if="loadingAccounts.has(account.index)" class="scheduler-empty py-2">
+                                正在加载模型槽位详情…
+                            </div>
+                            <div v-else-if="!account.models?.length" class="scheduler-empty py-2">
+                                {{ t("schedulerNoVisibleModels") }}
+                            </div>
                             <div v-else class="model-slots-list">
                                 <div
                                     v-for="slot in account.models"
@@ -690,6 +801,8 @@ const contextsOpen = ref(false),
     contexts = ref([]),
     accounts = ref([]),
     expandedAccounts = ref(new Set()),
+    loadingAccounts = ref(new Set()),
+    showAllContexts = ref(false),
     hiddenModels = ref([]),
     hiddenModelsLoading = ref(false);
 
@@ -697,6 +810,43 @@ const accountFilter = ref("all");
 const searchQuery = ref("");
 const contextViewMode = ref("matrix");
 const expandedErrors = ref(new Set());
+
+const activeContexts = computed(() => {
+    return contexts.value.filter(c => {
+        const state = (c.state || "").toUpperCase();
+        return (
+            state === "READY" ||
+            state === "INITIALIZING" ||
+            state === "BUSY" ||
+            state === "RECONNECTING" ||
+            state === "UNAVAILABLE" ||
+            (c.inflight > 0)
+            c.inflight > 0
+        );
+    });
+});
+
+const coldContexts = computed(() => {
+    return contexts.value.filter(c => {
+        const state = (c.state || "").toUpperCase();
+        return !(
+            state === "READY" ||
+            state === "INITIALIZING" ||
+            state === "BUSY" ||
+            state === "RECONNECTING" ||
+            state === "UNAVAILABLE" ||
+            (c.inflight > 0)
+            c.inflight > 0
+        );
+    });
+});
+
+const displayedMatrixContexts = computed(() => {
+    if (showAllContexts.value || coldContexts.value.length === 0 || activeContexts.value.length === 0) {
+        return contexts.value;
+    }
+    return activeContexts.value;
+});
 
 const contextSummary = computed(() => props.data?.contexts_summary || {});
 const totalCapacity = computed(() => (props.data?.active_workers || 0) + (props.data?.idle_workers || 0));
@@ -762,6 +912,28 @@ function getContextRatio(count) {
 }
 
 // Account State Determination
+function hasAccount403(account) {
+    if (account.has_403) return true;
+    const models = account.models || [];
+    return models.some(
+        m =>
+            m.status === "RISK_CONTROLLED" ||
+            m.last_error_kind === "risk_controlled" ||
+            (m.last_error && m.last_error.includes("403"))
+    );
+}
+
+function hasAccount429(account) {
+    if (account.has_429) return true;
+    const models = account.models || [];
+    return models.some(
+        m =>
+            m.status === "RATE_LIMITED" ||
+            (m.last_error && m.last_error.includes("429")) ||
+            (m.cooldown_until && m.status !== "RISK_CONTROLLED")
+    );
+}
+
 function getAccountState(account) {
     if (account.disabled) return "disabled";
     const models = account.models || [];
@@ -771,6 +943,8 @@ function getAccountState(account) {
         m => m.status === "RATE_LIMITED" || (m.last_error && m.last_error.includes("429")) || m.cooldown_until
     );
     if (has429) return "429";
+    if (hasAccount403(account)) return "403";
+    if (hasAccount429(account)) return "429";
     if (!account.healthy) return "unhealthy";
     return "healthy";
 }
@@ -786,18 +960,29 @@ function getAccountStateLabel(account) {
 
 function isSlotRestricted(slot) {
     return slot.status === "RATE_LIMITED" || slot.status === "RISK_CONTROLLED" || Boolean(slot.cooldown_until);
+    return (
+        slot.status === "RATE_LIMITED" ||
+        slot.status === "RISK_CONTROLLED" ||
+        slot.status === "COOLDOWN" ||
+        Boolean(slot.cooldown_until)
+    );
 }
 
 function getSlotStatusClass(slot) {
     if (slot.status === "RATE_LIMITED") return "429";
     if (slot.status === "RISK_CONTROLLED") return "403";
+    if (slot.status === "RISK_CONTROLLED" || slot.last_error_kind === "risk_controlled") return "403";
+    if (slot.status === "RATE_LIMITED" || slot.status === "COOLDOWN") return "429";
     if (slot.status === "HEALTHY") return "healthy";
     return "default";
 }
 
 function getSlotStatusLabel(slot) {
+    if (slot.status === "RISK_CONTROLLED" || slot.last_error_kind === "risk_controlled")
+        return props.t("schedulerStatusRiskControlled");
     if (slot.status === "RATE_LIMITED") return props.t("schedulerStatusRateLimited");
     if (slot.status === "RISK_CONTROLLED") return props.t("schedulerStatusRiskControlled");
+    if (slot.status === "COOLDOWN") return props.t("schedulerCooldown");
     if (slot.status === "HEALTHY") return props.t("schedulerStatusHealthy");
     return slot.status || "—";
 }
@@ -849,6 +1034,10 @@ const summaryCounts = computed(() => {
         else if (state === "403") riskControlled++;
         else if (state === "429") rateLimited++;
         else if (state === "healthy") healthy++;
+        if (acc.disabled) disabled++;
+        if (hasAccount403(acc)) riskControlled++;
+        if (hasAccount429(acc)) rateLimited++;
+        if (!acc.disabled && !hasAccount403(acc) && !hasAccount429(acc) && acc.healthy) healthy++;
     }
 
     return { disabled, healthy, rateLimited, riskControlled };
@@ -863,6 +1052,14 @@ const filteredAccounts = computed(() => {
         if (filter !== "all") {
             const state = getAccountState(acc);
             if (state !== filter) return false;
+        if (filter === "disabled") {
+            if (!acc.disabled) return false;
+        } else if (filter === "403") {
+            if (!hasAccount403(acc)) return false;
+        } else if (filter === "429") {
+            if (!hasAccount429(acc)) return false;
+        } else if (filter === "healthy") {
+            if (acc.disabled || hasAccount403(acc) || hasAccount429(acc) || !acc.healthy) return false;
         }
 
         // Query filter
@@ -926,6 +1123,10 @@ async function fetchAccounts(force = false) {
         }
     } finally {
         if (accountsController === controller) accountsController = null;
+        if (accountsController === controller) {
+            accountsController = null;
+            for (const id of ids) loadingAccounts.value.delete(id);
+        }
     }
 }
 
@@ -969,6 +1170,7 @@ function toggleAccounts() {
         accountsController?.abort();
         accounts.value = [];
         expandedAccounts.value = new Set();
+        loadingAccounts.value.clear();
     }
 }
 
@@ -976,16 +1178,19 @@ function toggleAccountManual(index) {
     const next = new Set(expandedAccounts.value);
     if (next.has(index)) {
         next.delete(index);
+        loadingAccounts.value.delete(index);
     } else {
         if (next.size >= 20) {
             error.value = props.t("schedulerAccountExpandLimit");
             return;
         }
         next.add(index);
+        loadingAccounts.value.add(index);
     }
     expandedAccounts.value = next;
     if (next.has(index)) {
         fetchAccounts(true).catch(failure => {
+            loadingAccounts.value.delete(index);
             if (failure.name !== "AbortError") setError(failure);
         });
     }
@@ -1807,9 +2012,38 @@ async function sendReset(url, body) {
     margin-bottom: 12px;
 }
 
+.view-switch-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
 .view-switch-tip {
     font-size: 0.72rem;
     color: #64748b;
+}
+
+.context-ratio-hint {
+    font-size: 0.72rem;
+    color: #64748b;
+    font-family: monospace;
+}
+
+.btn-inline-toggle {
+    border: none;
+    background: transparent;
+    color: #2563eb;
+    font-size: 0.72rem;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: background 0.15s;
+}
+
+.btn-inline-toggle:hover {
+    background: #eff6ff;
 }
 
 .switch-button-group {
@@ -1834,6 +2068,11 @@ async function sendReset(url, body) {
     background: #ffffff;
     color: #0f172a;
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+
+.context-matrix-wrapper {
+    display: flex;
+    flex-direction: column;
 }
 
 .context-matrix-grid {
@@ -1914,6 +2153,58 @@ async function sendReset(url, body) {
     color: #94a3b8;
     border-top: 1px solid rgba(0, 0, 0, 0.04);
     padding-top: 4px;
+}
+
+.node-card.node-expand-toggle {
+    border: 2px dashed #cbd5e1;
+    background: #f8fafc;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 80px;
+    transition: all 0.2s ease;
+}
+
+.node-card.node-expand-toggle:hover {
+    border-color: #3b82f6;
+    background: #eff6ff;
+}
+
+.expand-toggle-inner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    text-align: center;
+}
+
+.expand-icon {
+    width: 16px;
+    height: 16px;
+    color: #3b82f6;
+}
+
+.expand-title {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #475569;
+}
+
+.node-card.node-expand-toggle:hover .expand-title {
+    color: #1d4ed8;
+}
+
+.expand-action {
+    font-size: 0.7rem;
+    color: #2563eb;
+    font-weight: 500;
+}
+
+.matrix-collapse-bar {
+    margin-top: 10px;
+    display: flex;
+    justify-content: center;
 }
 
 /* 5. Modern Tables */
@@ -2092,6 +2383,7 @@ async function sendReset(url, body) {
 }
 
 .account-row-card {
+    flex-shrink: 0;
     border: 1px solid #e2e8f0;
     border-radius: 10px;
     background: #ffffff;
