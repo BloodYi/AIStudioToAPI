@@ -70,6 +70,11 @@ test("permissions, account failures and manual recovery have distinct scope", as
     scheduler.release(recovered);
     assert.equal(classifyError({ message: "Forbidden", status: 403 }), "risk_controlled");
     assert.equal(classifyError({ message: "PERMISSION_DENIED", status: 403 }), "risk_controlled");
+    assert.equal(classifyError({ message: "[403] Proxy browser error" }), "risk_controlled");
+    assert.equal(
+        classifyError({ message: "Proxy browser error: Google API returned error: 403 PERMISSION_DENIED" }),
+        "risk_controlled"
+    );
     assert.equal(classifyError({ message: "model unsupported for account" }), "unsupported");
     assert.equal(classifyError({ message: "Invalid request", status: 400 }), "request");
     assert.equal(classifyError({ status: 503 }), "temporary");
@@ -155,14 +160,14 @@ test("manual account disable is lease-safe and only account-wide recovery clears
     scheduler.close();
 });
 
-test("manual account disable survives version 5 persistence and bulk enable clears it", () => {
+test("manual account disable survives version 6 persistence and bulk enable clears it", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "scheduler-disabled-"));
     const statePath = path.join(directory, "state.json");
     const first = setup({ statePath }, 1);
     first.disable(0);
     first.close();
     const persisted = JSON.parse(fs.readFileSync(statePath));
-    assert.equal(persisted.version, 5);
+    assert.equal(persisted.version, 6);
     assert.equal(persisted.accounts[0].disabled, true);
 
     const second = setup({ statePath }, 1);
@@ -338,12 +343,12 @@ test("hidden models are filtered only from management snapshots and remain sched
     scheduler.close();
 });
 
-test("hidden models persist in version 5 state and legacy states default to visible", () => {
+test("hidden models persist in version 6 state and legacy states default to visible", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "scheduler-hidden-"));
     const statePath = path.join(directory, "state.json");
     const first = setup({ allocation: { flash: { min: 0, preferred: 1 } }, statePath }, 1);
     first.hideModel("flash");
-    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 5);
+    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 6);
     const second = setup({ allocation: { flash: { min: 0, preferred: 1 } }, statePath }, 1);
     assert.deepEqual(second.hiddenModelsSnapshot(), ["flash"]);
     first.close();
@@ -426,6 +431,14 @@ test("account details expose one model list with aggregate 403 and 429 flags", (
     const details = scheduler.accountsSnapshot([0]).accounts[0];
     assert.equal(details.has_403, true);
     assert.equal(details.has_429, true);
+    assert.deepEqual(scheduler.accountsOverviewSnapshot().summary, {
+        disabled: 0,
+        healthy: 0,
+        rate_limited: 0,
+        risk_controlled: 1,
+        total: 1,
+        unhealthy: 0,
+    });
     assert.deepEqual(
         details.models.map(slot => [slot.model, slot.status]),
         [
@@ -434,6 +447,53 @@ test("account details expose one model list with aggregate 403 and 429 flags", (
         ]
     );
     scheduler.close();
+});
+
+test("version 5 state migrates structured status from strict legacy 403 errors", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "scheduler-v5-403-"));
+    const statePath = path.join(directory, "state.json");
+    fs.writeFileSync(
+        statePath,
+        JSON.stringify({
+            accounts: [
+                {
+                    healthy: true,
+                    key: "auth-0",
+                    last_error: "[403] Proxy browser error",
+                    models: {
+                        flash: {
+                            consecutive_failures: 0,
+                            cooldown_until: 0,
+                            daily_failure_count: 1,
+                            daily_request_count: 1,
+                            daily_request_date: "2026-09-15",
+                            failure_count: 1,
+                            inflight: 0,
+                            last_error: "[403] Proxy browser error: Google API returned error: 403 PERMISSION_DENIED",
+                            last_used_at: 0,
+                            rate_limited: false,
+                            request_count: 1,
+                            success_count: 0,
+                            unsupported: true,
+                        },
+                    },
+                },
+            ],
+            fileAffinities: [],
+            hiddenModels: [],
+            version: 5,
+        })
+    );
+
+    const scheduler = setup({ statePath }, 1);
+    const slot = scheduler.account(0).models.flash;
+    assert.equal(slot.last_error_kind, "risk_controlled");
+    assert.equal(slot.last_http_status, 403);
+    assert.equal(slot.risk_control_failures, 1);
+    assert.equal(slot.unsupported, false);
+    assert.equal(scheduler.accountsOverviewSnapshot().summary.risk_controlled, 1);
+    scheduler.close();
+    fs.rmSync(directory, { recursive: true });
 });
 
 test("version 1 state preserves cumulative values and initializes daily usage at zero", () => {
@@ -527,7 +587,7 @@ test("corrupt state is backed up and inflight reset does not persist a lock", ()
     assert.equal(scheduler.accounts.size, 0);
     assert.ok(fs.readdirSync(directory).some(name => name.includes(".corrupt-")));
     scheduler.close();
-    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 5);
+    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 6);
     fs.rmSync(directory, { recursive: true });
 });
 

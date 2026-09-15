@@ -55,8 +55,12 @@ function classifyError(error = {}) {
         ].includes(error.kind || error.reason)
     )
         return "transport";
-    const status = Number(error.status ?? error.code);
     const message = String(error.message || "");
+    const explicitStatus = Number(error.status ?? error.code);
+    const messageStatus = Number(
+        /^\s*\[(\d{3})\]/.exec(message)?.[1] || /Google API returned error:\s*(\d{3})/i.exec(message)?.[1]
+    );
+    const status = Number.isFinite(explicitStatus) ? explicitStatus : messageStatus;
     if (status === 403) return "risk_controlled";
     if (error.accountUnhealthy) return "account";
     if (/^unsupported$/i.test(message.trim())) return "unsupported";
@@ -152,6 +156,7 @@ class ModelScheduler {
                 inflight: 0,
                 last_error: null,
                 last_error_kind: null,
+                last_http_status: null,
                 last_used_at: 0,
                 rate_limited: false,
                 request_count: 0,
@@ -397,6 +402,14 @@ class ModelScheduler {
         else slot.consecutive_failures++;
         slot.last_error = String(error.message || "Request failed").slice(0, 2000);
         slot.last_error_kind = kind;
+        const httpStatus = Number(error.status ?? error.code);
+        slot.last_http_status = Number.isFinite(httpStatus)
+            ? httpStatus
+            : kind === "risk_controlled"
+              ? 403
+              : kind === "rate_limited"
+                ? 429
+                : null;
         account.last_error = slot.last_error;
         if (kind === "account") account.healthy = false;
         if (kind === "unsupported") slot.unsupported = true;
@@ -432,6 +445,7 @@ class ModelScheduler {
             lease.slot.risk_control_failures = 0;
             lease.slot.last_error = null;
             lease.slot.last_error_kind = null;
+            lease.slot.last_http_status = null;
         }
         lease.account.inflight--;
         lease.slot.inflight--;
@@ -503,6 +517,7 @@ class ModelScheduler {
                     cooldown_until: 0,
                     last_error: null,
                     last_error_kind: null,
+                    last_http_status: null,
                     rate_limited: false,
                     risk_control_failures: 0,
                     unsupported: false,
@@ -533,6 +548,7 @@ class ModelScheduler {
                 cooldown_until: 0,
                 last_error: null,
                 last_error_kind: null,
+                last_http_status: null,
                 rate_limited: false,
                 risk_control_failures: 0,
                 unsupported: false,
@@ -597,6 +613,51 @@ class ModelScheduler {
         return "HEALTHY";
     }
 
+    _accountFlags(account, now = Date.now(), rotationIndices = this.authSource.getRotationIndices()) {
+        let has403 = false;
+        let has429 = false;
+        for (const model of Object.keys(account.models || {})) {
+            if (this.hiddenModels.has(model)) continue;
+            const status = this._slotStatus(account, this.slot(account, model, now), rotationIndices);
+            if (status === "RISK_CONTROLLED") has403 = true;
+            else if (status === "RATE_LIMITED" || status === "COOLDOWN") has429 = true;
+        }
+        return { has403, has429 };
+    }
+
+    accountsOverviewSnapshot() {
+        const now = Date.now();
+        const rotationIndices = this.authSource.getRotationIndices();
+        const summary = { disabled: 0, healthy: 0, rate_limited: 0, risk_controlled: 0, total: 0, unhealthy: 0 };
+        const accounts = rotationIndices.map(index => {
+            const account = this.account(index);
+            const { has403, has429 } = this._accountFlags(account, now, rotationIndices);
+            const state = account.disabled
+                ? "disabled"
+                : has403
+                  ? "risk_controlled"
+                  : has429
+                    ? "rate_limited"
+                    : account.healthy
+                      ? "healthy"
+                      : "unhealthy";
+            summary[state]++;
+            summary.total++;
+            return {
+                disabled: account.disabled,
+                disabled_at: account.disabled_at,
+                disabled_reason: account.disabled_reason,
+                has_403: has403,
+                has_429: has429,
+                healthy: account.healthy,
+                index,
+                inflight: account.inflight,
+                key: account.key,
+            };
+        });
+        return { accounts, revision: `accounts:${this.sequence}`, summary };
+    }
+
     summarySnapshot() {
         const now = Date.now();
         const indices = this.authSource.getRotationIndices();
@@ -628,6 +689,7 @@ class ModelScheduler {
         const busyContexts = contextCount("BUSY");
         const readyContexts = contextCount("READY");
         return {
+            accounts_summary: this.accountsOverviewSnapshot().summary,
             active_browser_workers: busyContexts,
             active_workers: this.workers.filter(worker => worker.lease).length,
             busy_browser_workers: busyContexts,
@@ -767,20 +829,13 @@ class ModelScheduler {
                             inflight: slot.inflight,
                             last_error: slot.last_error ? String(slot.last_error).slice(0, 500) : null,
                             last_error_kind: slot.last_error_kind || null,
+                            last_http_status: slot.last_http_status || null,
                             model,
                             risk_control_failures: slot.risk_control_failures || 0,
                             status: this._slotStatus(account, slot, rotationIndices),
                         };
                     });
-                let has403 = false;
-                let has429 = false;
-                for (const slot of models) {
-                    if (slot.status === "RISK_CONTROLLED" || slot.last_error_kind === "risk_controlled") {
-                        has403 = true;
-                    } else if (slot.status === "RATE_LIMITED" || slot.status === "COOLDOWN") {
-                        has429 = true;
-                    }
-                }
+                const { has403, has429 } = this._accountFlags(account, now, rotationIndices);
                 return {
                     disabled: account.disabled,
                     disabled_at: account.disabled_at,
@@ -870,7 +925,7 @@ class ModelScheduler {
         if (!this.config.statePath) return;
         try {
             const data = JSON.parse(fs.readFileSync(this.config.statePath, "utf8"));
-            if (![1, 2, 3, 4, 5].includes(data.version) || !Array.isArray(data.accounts))
+            if (![1, 2, 3, 4, 5, 6].includes(data.version) || !Array.isArray(data.accounts))
                 throw new Error("Unsupported scheduler state");
             if (data.version >= 4) {
                 if (!Array.isArray(data.hiddenModels) || data.hiddenModels.some(model => typeof model !== "string"))
@@ -889,6 +944,17 @@ class ModelScheduler {
                 for (const slot of Object.values(account.models)) {
                     slot.risk_control_failures ??= 0;
                     slot.last_error_kind ??= null;
+                    slot.last_http_status ??= null;
+                    if (
+                        !slot.last_error_kind &&
+                        slot.last_error &&
+                        classifyError({ message: slot.last_error }) === "risk_controlled"
+                    ) {
+                        slot.last_error_kind = "risk_controlled";
+                        slot.last_http_status = 403;
+                        slot.risk_control_failures = Math.max(1, slot.risk_control_failures);
+                        slot.unsupported = false;
+                    }
                     if (data.version === 1) {
                         slot.daily_request_count = 0;
                         slot.daily_failure_count = 0;
@@ -950,7 +1016,7 @@ class ModelScheduler {
                     accounts: [...this.accounts.values()],
                     fileAffinities: [...this.fileAffinities],
                     hiddenModels: this.hiddenModelsSnapshot(),
-                    version: 5,
+                    version: 6,
                 }),
                 {
                     mode: 0o600,

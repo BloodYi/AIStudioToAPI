@@ -494,7 +494,7 @@
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
                     </svg>
                     <strong>{{ t("schedulerAccounts") }}</strong>
-                    <span class="capacity-pill font-mono">{{ accounts.length }} 个账号</span>
+                    <span class="capacity-pill font-mono">{{ summaryCounts.total }} 个账号</span>
                 </div>
 
                 <div class="header-pills">
@@ -857,12 +857,7 @@ function getContextRatio(count) {
 function hasAccount403(account) {
     if (account.has_403) return true;
     const models = account.models || [];
-    return models.some(
-        m =>
-            m.status === "RISK_CONTROLLED" ||
-            m.last_error_kind === "risk_controlled" ||
-            (m.last_error && m.last_error.includes("403"))
-    );
+    return models.some(m => m.status === "RISK_CONTROLLED" || m.last_error_kind === "risk_controlled");
 }
 
 function hasAccount429(account) {
@@ -871,7 +866,7 @@ function hasAccount429(account) {
     return models.some(
         m =>
             m.status === "RATE_LIMITED" ||
-            (m.last_error && m.last_error.includes("429")) ||
+            m.status === "COOLDOWN" ||
             (m.cooldown_until && m.status !== "RISK_CONTROLLED")
     );
 }
@@ -954,6 +949,16 @@ function isErrorJsonOpen(accIdx, model) {
 
 // Summary counts for filter tabs
 const summaryCounts = computed(() => {
+    const overview = props.data?.accounts_summary;
+    if (overview) {
+        return {
+            disabled: overview.disabled || 0,
+            healthy: overview.healthy || 0,
+            rateLimited: overview.rate_limited || 0,
+            riskControlled: overview.risk_controlled || 0,
+            total: overview.total || 0,
+        };
+    }
     let rateLimited = 0;
     let riskControlled = 0;
     let disabled = 0;
@@ -967,7 +972,7 @@ const summaryCounts = computed(() => {
         else if (state === "healthy") healthy++;
     }
 
-    return { disabled, healthy, rateLimited, riskControlled };
+    return { disabled, healthy, rateLimited, riskControlled, total: accounts.value.length };
 });
 
 const filteredAccounts = computed(() => {
