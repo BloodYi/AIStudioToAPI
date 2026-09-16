@@ -20,6 +20,8 @@ const {
 } = require("../utils/CustomErrors");
 
 const WS_INIT_TIMEOUT_MS = 120000;
+const CONSENT_RETRY_INTERVAL_MS = 2500;
+const CONSENT_TIMEOUT_GRACE_MS = 7500;
 const CONTEXT_CREATION_TIMEOUT_MS = 120000;
 const FIREFOX_DOH_DISABLED_PREFS = {
     "network.trr.mode": 5,
@@ -70,6 +72,7 @@ class BrowserManager {
         this.contextUnavailable = new Map();
         this.closingContexts = new Set();
         this._contextInitTasks = new Map();
+        this._contextInitSequence = 0;
         this._contextPoolRunning = false;
         this._ensureBrowserTask = null;
         // Firefox can hang when multiple BrowserContext creation commands are
@@ -245,29 +248,37 @@ class BrowserManager {
         }
     }
 
-    async _clickButtonByTextIfVisible(page, text, logPrefix = "[Browser]", debugName = "button") {
+    async _findAndClickButtonByText(page, text, logPrefix = "[Browser]", debugName = "button", click = true) {
         try {
-            // Use DOM operation to find and click button
-            const clicked = await page.evaluate(text => {
-                // eslint-disable-next-line no-undef
-                const buttons = document.querySelectorAll("button");
-                for (const btn of buttons) {
-                    // Check if the element occupies space (simple visibility check)
-                    const rect = btn.getBoundingClientRect();
-                    const isVisible = rect.width > 0 && rect.height > 0;
+            if (typeof page.getByRole === "function") {
+                const locator = page.getByRole("button", { exact: true, name: text }).first();
+                const found = (await locator.count()) > 0 && (await locator.isVisible());
+                if (!found) return { clicked: false, found: false };
+                if (click && (await locator.isEnabled())) {
+                    await locator.click({ timeout: 2000 });
+                    return { clicked: true, found: true };
+                }
+                return { clicked: false, found: true };
+            }
 
-                    if (isVisible) {
-                        const btnText = (btn.innerText || "").trim();
-                        if (btnText === text) {
-                            btn.click();
-                            return true;
+            // Compatibility fallback for tests and older Playwright page adapters.
+            return await page.evaluate(
+                ({ click, text }) => {
+                    // eslint-disable-next-line no-undef
+                    const buttons = document.querySelectorAll("button, [role='button']");
+                    for (const btn of buttons) {
+                        const rect = btn.getBoundingClientRect();
+                        const isVisible = rect.width > 0 && rect.height > 0;
+                        const btnText = (btn.innerText || btn.textContent || "").trim();
+                        if (isVisible && btnText === text) {
+                            if (click) btn.click();
+                            return { clicked: click, found: true };
                         }
                     }
-                }
-                return false;
-            }, text);
-
-            return clicked;
+                    return { clicked: false, found: false };
+                },
+                { click, text }
+            );
         } catch (error) {
             // Element not visible or doesn't exist is expected here,
             // but propagate clearly critical browser/page issues.
@@ -282,7 +293,23 @@ class BrowserManager {
             }
         }
 
-        return false;
+        return { clicked: false, found: false };
+    }
+
+    async _clickButtonByTextIfVisible(page, text, logPrefix = "[Browser]", debugName = "button") {
+        const result = await this._findAndClickButtonByText(page, text, logPrefix, debugName, true);
+        return result.clicked;
+    }
+
+    _hasNewOpenConnection(attempt) {
+        if (!attempt || !this.connectionRegistry) return false;
+        const connection = this.connectionRegistry.getConnectionByAuth(attempt.authIndex, false);
+        const epoch = this.connectionRegistry.getConnectionEpoch?.(attempt.authIndex) ?? null;
+        return (
+            connection?.readyState === 1 &&
+            epoch != null &&
+            (attempt.connectionEpoch == null || epoch > attempt.connectionEpoch)
+        );
     }
 
     async _clickLaunchButtonIfVisible(page, logPrefix = "[Browser]") {
@@ -345,7 +372,7 @@ class BrowserManager {
      * @param {object} page - Playwright page object
      * @param {string} logPrefix - Log prefix for messages
      * @param {number} timeout - Timeout in milliseconds (default 120000)
-     * @param {number} authIndex - Auth index for this context (default -1)
+     * @param {object} attempt - Initialization attempt whose state is being observed
      * @param {boolean} isBackgroundTask - Whether this is a background preload task (default false)
      * @returns {Promise<boolean>} true if initialization succeeded, false if failed or aborted
      */
@@ -353,7 +380,7 @@ class BrowserManager {
         page,
         logPrefix = "[Browser]",
         timeout = WS_INIT_TIMEOUT_MS,
-        authIndex = -1,
+        attempt = null,
         isBackgroundTask = false
     ) {
         this.logger.info(
@@ -362,39 +389,58 @@ class BrowserManager {
 
         const startTime = Date.now();
         const checkInterval = 1000; // Check every 1 second
-        let continueClicked = false;
+        const consentRetryIntervalMs = this.consentRetryIntervalMs ?? CONSENT_RETRY_INTERVAL_MS;
+        const consentTimeoutGraceMs = this.consentTimeoutGraceMs ?? CONSENT_TIMEOUT_GRACE_MS;
+        const authIndex = attempt?.authIndex ?? -1;
+        const wsState = attempt?.ws || { failed: false, success: false };
+        let consentFound = false;
+        let consentClosed = false;
+        let lastConsentClickAt = 0;
         let skipClicked = false;
+        let graceDeadline = null;
         let iteration = 0;
 
         try {
-            while (Date.now() - startTime < timeout) {
+            while (Date.now() - startTime < timeout || (graceDeadline !== null && Date.now() < graceDeadline)) {
                 this._throwIfContextInitAborted(authIndex, isBackgroundTask, logPrefix, "WebSocket wait");
 
-                // Read state fresh each iteration
-                const state = this._wsInitState.get(authIndex);
-
-                // Check if initialization succeeded
-                if (state && state.success) {
+                if (wsState.success) {
+                    this.logger.info(`${logPrefix} ws_connected attempt=${attempt?.id || "reconnect"} source=console`);
                     return true;
                 }
 
-                // Check if initialization failed
-                if (state && state.failed) {
+                if (this._hasNewOpenConnection(attempt)) {
+                    wsState.success = true;
+                    this.logger.info(`${logPrefix} ws_connected attempt=${attempt.id} source=registry`);
+                    return true;
+                }
+
+                if (wsState.failed) {
                     this.logger.warn(`${logPrefix} Initialization failed`);
+                    attempt.failureReason = "ws_connection_timeout";
                     return false;
                 }
 
-                if (!continueClicked) {
-                    const continueText = "Continue to the app";
-                    continueClicked = await this._clickButtonByTextIfVisible(
-                        page,
-                        continueText,
-                        logPrefix,
-                        `popup "${continueText}"`
-                    );
-                    if (continueClicked) {
-                        this.logger.info(`${logPrefix} Found "${continueText}" button, clicking...`);
+                const now = Date.now();
+                const continueText = "Continue to the app";
+                const shouldClickConsent = now - lastConsentClickAt >= consentRetryIntervalMs;
+                const consent = await this._findAndClickButtonByText(
+                    page,
+                    continueText,
+                    logPrefix,
+                    `popup "${continueText}"`,
+                    shouldClickConsent
+                );
+                if (consent.found) {
+                    if (!consentFound) this.logger.info(`${logPrefix} button_found name="${continueText}"`);
+                    consentFound = true;
+                    if (consent.clicked) {
+                        lastConsentClickAt = now;
+                        this.logger.info(`${logPrefix} click_dispatched name="${continueText}"`);
                     }
+                } else if (consentFound && !consentClosed) {
+                    consentClosed = true;
+                    this.logger.info(`${logPrefix} dialog_closed name="${continueText}"`);
                 }
 
                 if (!skipClicked) {
@@ -406,7 +452,7 @@ class BrowserManager {
                         `popup "${skipText}"`
                     );
                     if (skipClicked) {
-                        this.logger.info(`${logPrefix} Found "${skipText}" button, clicking...`);
+                        this.logger.info(`${logPrefix} click_dispatched name="${skipText}"`);
                     }
                 }
 
@@ -434,10 +480,64 @@ class BrowserManager {
                 // Wait before next check
                 iteration++;
                 await page.waitForTimeout(checkInterval);
+
+                // A consent control first observed/clicked at the boundary gets one bounded grace period.
+                if (
+                    graceDeadline === null &&
+                    Date.now() - startTime >= timeout &&
+                    consent.found &&
+                    now >= startTime + timeout - checkInterval
+                ) {
+                    graceDeadline = Date.now() + consentTimeoutGraceMs;
+                    this.logger.info(`${logPrefix} consent_grace_started duration_ms=${consentTimeoutGraceMs}`);
+                }
             }
 
-            // Timeout reached
-            this.logger.error(`${logPrefix} ⏱️ WebSocket initialization timeout after ${timeout / 1000}s`);
+            // Event-loop stalls can cross the boundary; perform authoritative final checks before cleanup.
+            if (wsState.success || this._hasNewOpenConnection(attempt)) {
+                wsState.success = true;
+                this.logger.info(`${logPrefix} ws_connected attempt=${attempt?.id || "reconnect"} source=final_check`);
+                return true;
+            }
+            const finalConsent = await this._findAndClickButtonByText(
+                page,
+                "Continue to the app",
+                logPrefix,
+                'popup "Continue to the app"',
+                true
+            );
+            if (finalConsent.found && graceDeadline === null) {
+                this.logger.info(`${logPrefix} button_found name="Continue to the app" boundary=true`);
+                if (finalConsent.clicked) {
+                    this.logger.info(`${logPrefix} click_dispatched name="Continue to the app" boundary=true`);
+                }
+                const boundaryGraceDeadline = Date.now() + consentTimeoutGraceMs;
+                this.logger.info(`${logPrefix} consent_grace_started duration_ms=${consentTimeoutGraceMs}`);
+                while (Date.now() < boundaryGraceDeadline) {
+                    if (wsState.success || this._hasNewOpenConnection(attempt)) {
+                        wsState.success = true;
+                        this.logger.info(
+                            `${logPrefix} ws_connected attempt=${attempt?.id || "reconnect"} source=consent_grace`
+                        );
+                        return true;
+                    }
+                    await page.waitForTimeout(checkInterval);
+                    await this._findAndClickButtonByText(
+                        page,
+                        "Continue to the app",
+                        logPrefix,
+                        'popup "Continue to the app"',
+                        true
+                    );
+                }
+            }
+            attempt.failureReason =
+                finalConsent.found || (consentFound && !consentClosed)
+                    ? "consent_dialog_timeout"
+                    : "ws_connection_timeout";
+            this.logger.error(
+                `${logPrefix} initialization_timeout reason=${attempt.failureReason} after ${timeout / 1000}s`
+            );
             return false;
         } catch (error) {
             // Re-throw aborts and critical page/browser errors so callers keep the original failure reason.
@@ -1419,7 +1519,7 @@ class BrowserManager {
             }
 
             // If being initialized by another task, wait for it to finish and verify success
-            if (this.initializingContexts.has(authIndex)) {
+            if (this._contextInitTasks.has(authIndex)) {
                 this.logger.info(`[ContextPool] Context #${authIndex} being initialized, waiting...`);
                 await this._waitForContextInit(authIndex);
                 if (this.contexts.has(authIndex)) {
@@ -1431,17 +1531,14 @@ class BrowserManager {
                 continue;
             }
 
-            this.initializingContexts.add(authIndex);
             try {
                 this.logger.info(`[ContextPool] Initializing context #${authIndex}...`);
-                await this._initializeContext(authIndex);
+                await this._getOrStartContextInit(authIndex);
                 firstReady = authIndex;
                 this.logger.info(`✅ [ContextPool] First context #${authIndex} ready.`);
                 break;
             } catch (error) {
                 this.logger.error(`❌ [ContextPool] Context #${authIndex} failed: ${error.message}`);
-            } finally {
-                // Note: _initializeContext already removes from initializingContexts in its finally block
             }
         }
 
@@ -1779,77 +1876,76 @@ class BrowserManager {
 
     _startPooledContext(authIndex) {
         if (this._contextInitTasks.has(authIndex)) return this._contextInitTasks.get(authIndex);
-        this.initializingContexts.add(authIndex);
         let blockedByCapacity = false;
-        const task = (async () => {
-            try {
-                await this._ensureBrowserForPool();
-                if (this.scheduler.closed) throw new Error("Scheduler is shutting down");
-                if (this.scheduler.isAccountManuallyDisabled?.(authIndex) === true)
-                    throw new ContextAbortedError(authIndex, "account disabled");
-                const stale = this.contexts.get(authIndex);
-                if (stale) {
-                    if (this.scheduler.account(authIndex).inflight > 0) {
-                        blockedByCapacity = true;
-                        return;
+        return this._getOrStartContextInit(authIndex, {
+            isBackgroundTask: true,
+            runner: async attempt => {
+                try {
+                    await this._ensureBrowserForPool();
+                    if (this.scheduler.closed) throw new Error("Scheduler is shutting down");
+                    if (this.scheduler.isAccountManuallyDisabled?.(authIndex) === true)
+                        throw new ContextAbortedError(authIndex, "account disabled");
+                    const stale = this.contexts.get(authIndex);
+                    if (stale) {
+                        if (this.scheduler.account(authIndex).inflight > 0) {
+                            blockedByCapacity = true;
+                            return;
+                        }
+                        await this.closeContext(authIndex, { keepBrowser: true, skipInitWait: true });
                     }
-                    // closeContext waits for initialization markers, so temporarily
-                    // clear this task's marker while replacing a dead idle context.
-                    this.initializingContexts.delete(authIndex);
-                    await this.closeContext(authIndex, { keepBrowser: true });
-                    this.initializingContexts.add(authIndex);
-                }
-                const occupancy = this.contexts.size + this.initializingContexts.size - 1;
-                if (occupancy >= this.scheduler.config.maxWorkers) {
-                    const idle = [...this.contexts.keys()]
-                        .filter(index => index !== authIndex && this._isContextIdle(index))
-                        .sort((a, b) => this._compareContextEviction(a, b))[0];
-                    if (idle === undefined) {
-                        blockedByCapacity = true;
-                        return;
+                    const occupancy = this.contexts.size + this.initializingContexts.size - 1;
+                    if (occupancy >= this.scheduler.config.maxWorkers) {
+                        const idle = [...this.contexts.keys()]
+                            .filter(index => index !== authIndex && this._isContextIdle(index))
+                            .sort((a, b) => this._compareContextEviction(a, b))[0];
+                        if (idle === undefined) {
+                            blockedByCapacity = true;
+                            return;
+                        }
+                        this.logger.info(
+                            `[ContextPool] Evicting context #${idle} for #${authIndex} (${this.contextEvictionReason(idle)})`
+                        );
+                        await this.closeContext(idle, { keepBrowser: true });
                     }
-                    this.logger.info(
-                        `[ContextPool] Evicting context #${idle} for #${authIndex} (${this.contextEvictionReason(idle)})`
-                    );
-                    await this.closeContext(idle, { keepBrowser: true });
-                }
-                await this._initializeContext(authIndex, true);
-                if (this.scheduler.isAccountManuallyDisabled?.(authIndex) === true) {
-                    await this.closeContext(authIndex, { keepBrowser: true });
-                    throw new ContextAbortedError(authIndex, "account disabled during initialization");
-                }
-                const data = this.contexts.get(authIndex);
-                if (!data || !this.connectionRegistry.getConnectionByAuth(authIndex, false))
-                    throw Object.assign(new Error("WebSocket not ready after context initialization"), {
-                        reason: "connection_lost",
-                    });
-                Object.assign(data, { lastDisconnectReason: null, noButtonCount: 0, state: "READY" });
-                this.contextDemand.delete(authIndex);
-                this.contextUnavailable.delete(authIndex);
-                this._startHealthMonitor(authIndex);
-                this._startBackgroundWakeup(data).catch(error => {
-                    this.logger.warn(`[Worker#${authIndex}] Wakeup stopped: ${error.message}`);
-                });
-            } catch (error) {
-                if (!isContextAbortedError(error)) {
-                    const retryAt = Date.now() + 5000;
-                    this.contextUnavailable.set(authIndex, { at: Date.now(), error, reason: error.reason, retryAt });
+                    await this._initializeContext(authIndex, true, attempt);
+                    if (this.scheduler.isAccountManuallyDisabled?.(authIndex) === true) {
+                        await this.closeContext(authIndex, { keepBrowser: true, skipInitWait: true });
+                        throw new ContextAbortedError(authIndex, "account disabled during initialization");
+                    }
+                    const data = this.contexts.get(authIndex);
+                    if (!data || !this.connectionRegistry.getConnectionByAuth(authIndex, false))
+                        throw Object.assign(new Error("WebSocket not ready after context initialization"), {
+                            reason: "connection_lost",
+                        });
+                    Object.assign(data, { lastDisconnectReason: null, noButtonCount: 0, state: "READY" });
                     this.contextDemand.delete(authIndex);
-                    this.logger.error(`[ContextPool] Context #${authIndex} unavailable: ${error.message}`);
-                    const retryTimer = setTimeout(() => this._pumpContextPool(), 5000);
-                    retryTimer.unref?.();
+                    this.contextUnavailable.delete(authIndex);
+                    this._startHealthMonitor(authIndex);
+                    this._startBackgroundWakeup(data).catch(error => {
+                        this.logger.warn(`[Worker#${authIndex}] Wakeup stopped: ${error.message}`);
+                    });
+                } catch (error) {
+                    if (!isContextAbortedError(error)) {
+                        const retryAt = Date.now() + 5000;
+                        this.contextUnavailable.set(authIndex, {
+                            at: Date.now(),
+                            error,
+                            reason: error.reason,
+                            retryAt,
+                        });
+                        this.contextDemand.delete(authIndex);
+                        this.logger.error(`[ContextPool] Context #${authIndex} unavailable: ${error.message}`);
+                        const retryTimer = setTimeout(() => this._pumpContextPool(), 5000);
+                        retryTimer.unref?.();
+                    }
+                } finally {
+                    if (!blockedByCapacity) {
+                        this.scheduler?.drain();
+                        this._pumpContextPool();
+                    }
                 }
-            } finally {
-                this.initializingContexts.delete(authIndex);
-                this._contextInitTasks.delete(authIndex);
-                if (!blockedByCapacity) {
-                    this.scheduler?.drain();
-                    this._pumpContextPool();
-                }
-            }
-        })();
-        this._contextInitTasks.set(authIndex, task);
-        return task;
+            },
+        });
     }
 
     async _ensureBrowser() {
@@ -2097,10 +2193,9 @@ class BrowserManager {
                 continue;
             }
 
-            this.initializingContexts.add(authIndex);
             try {
                 this.logger.info(`[ContextPool] Background preload init context #${authIndex}...`);
-                await this._initializeContext(authIndex, true); // Mark as background task
+                await this._getOrStartContextInit(authIndex, { isBackgroundTask: true });
                 this.logger.info(`✅ [ContextPool] Background context #${authIndex} ready.`);
             } catch (error) {
                 // Check if this is an abort error (user deleted the account during initialization or background preload was aborted)
@@ -2113,7 +2208,6 @@ class BrowserManager {
                     this.logger.error(`❌ [ContextPool] Background context #${authIndex} failed: ${error.message}`);
                 }
             }
-            // Note: initializingContexts and abortedContexts cleanup is handled in _initializeContext's finally block
         }
 
         if (!aborted) {
@@ -2404,6 +2498,14 @@ class BrowserManager {
      * @param {number} timeoutMs - Timeout in milliseconds
      */
     async _waitForContextInit(authIndex, timeoutMs = 120000) {
+        const task = this._contextInitTasks.get(authIndex);
+        if (task) {
+            try {
+                return await task;
+            } catch (_) {
+                return undefined;
+            }
+        }
         const start = Date.now();
         while (this.initializingContexts.has(authIndex)) {
             if (Date.now() - start > timeoutMs) {
@@ -2414,24 +2516,67 @@ class BrowserManager {
     }
 
     /**
+     * Return the sole in-flight initialization for an account, or synchronously
+     * claim ownership and create it. The owner that publishes the Promise is
+     * also the only code allowed to release the tracking markers.
+     */
+    _getOrStartContextInit(authIndex, options = {}) {
+        const existing = this._contextInitTasks.get(authIndex);
+        if (existing) return existing;
+
+        this._contextInitSequence = (this._contextInitSequence || 0) + 1;
+        const attempt = {
+            authIndex,
+            connectionEpoch: this.connectionRegistry?.getConnectionEpoch?.(authIndex) ?? null,
+            id: `${authIndex}:${this._contextInitSequence}`,
+            startedAt: Date.now(),
+            ws: { failed: false, success: false },
+        };
+        const isBackgroundTask = options.isBackgroundTask === true;
+        const runner =
+            options.runner || (currentAttempt => this._initializeContext(authIndex, isBackgroundTask, currentAttempt));
+
+        this.initializingContexts.add(authIndex);
+        this._wsInitState ||= new Map();
+        this._wsInitState.set(authIndex, attempt.ws); // Observability only; never read for correctness.
+        const task = Promise.resolve()
+            .then(() => {
+                this.logger.info(`[Context#${authIndex}] init_started attempt=${attempt.id}`);
+                return runner(attempt);
+            })
+            .finally(() => {
+                if (this._contextInitTasks.get(authIndex) === task) {
+                    this._contextInitTasks.delete(authIndex);
+                    this.initializingContexts.delete(authIndex);
+                    this.abortedContexts.delete(authIndex);
+                }
+                this.logger.info(`[Context#${authIndex}] init_finished attempt=${attempt.id}`);
+            });
+        this._contextInitTasks.set(authIndex, task);
+        return task;
+    }
+
+    /**
      * Initialize a single context for the given auth index
      * This is a helper method used by both preloadContextPool and launchOrSwitchContext
      * @param {number} authIndex - The auth index to initialize
      * @param {boolean} isBackgroundTask - Whether this is a background preload task (can be aborted by _backgroundPreloadAbort)
      * @returns {Promise<{context, page}>}
      */
-    async _initializeContext(authIndex, isBackgroundTask = false) {
+    async _initializeContext(authIndex, isBackgroundTask = false, attempt = null) {
         let context = null;
         let page = null;
+
+        if (!attempt) {
+            throw Object.assign(new Error("Context initialization must be started through single-flight ownership"), {
+                reason: "state_tracking_invariant_violation",
+            });
+        }
+        const logPrefix = `[Context#${authIndex} attempt=${attempt.id}]`;
 
         try {
             // Check if this context has been marked for abort before starting
             this._throwIfContextInitAborted(authIndex, isBackgroundTask);
-
-            // Initialize per-context WebSocket state to ensure clean state for this context
-            // Each context gets its own state object, preventing cross-contamination
-            // between concurrent init/reconnect operations on different accounts
-            this._wsInitState.set(authIndex, { failed: false, success: false });
 
             const stickyProxy = this.stickyProxyManager.getProxyForAuth(authIndex);
             const proxyConfig = stickyProxy ? stickyProxy.proxy : parseProxyFromEnv();
@@ -2505,7 +2650,7 @@ class BrowserManager {
                 }
 
                 if (msgText.includes("[ProxyClient]")) {
-                    const forwardedMessage = `[Context#${authIndex}] ${msgText.replace("[ProxyClient] ", "")}`;
+                    const forwardedMessage = `${logPrefix} ${msgText.replace("[ProxyClient] ", "")}`;
                     const browserLogType = msg.type();
 
                     if (browserLogType === "debug") {
@@ -2518,55 +2663,57 @@ class BrowserManager {
                         this.logger.info(forwardedMessage);
                     }
                 } else if (msg.type() === "error") {
-                    this.logger.error(`[Context#${authIndex} Page Error] ${msgText}`);
+                    this.logger.error(`${logPrefix} [Page Error] ${msgText}`);
                 }
 
                 // Check for WebSocket initialization status
                 if (msgText.includes("Connection successful")) {
-                    this.logger.debug(
-                        `[Context#${authIndex}] ✅ Detected successful WebSocket connection from browser`
-                    );
-                    const s = this._wsInitState.get(authIndex);
-                    if (s) s.success = true;
+                    this.logger.debug(`${logPrefix} ✅ Detected successful WebSocket connection from browser`);
+                    attempt.ws.success = true;
                 } else if (msgText.includes("WebSocket initialization failed")) {
-                    this.logger.warn(
-                        `[Context#${authIndex}] ❌ Detected WebSocket initialization failure from browser`
-                    );
-                    const s = this._wsInitState.get(authIndex);
-                    if (s) s.failed = true;
+                    this.logger.warn(`${logPrefix} ❌ Detected WebSocket initialization failure from browser`);
+                    attempt.ws.failed = true;
                 }
             });
 
             // Check abort status before navigation (most time-consuming part)
             this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
-            await this._navigateAndWakeUpPage(page, `[Context#${authIndex}]`);
+            try {
+                await this._navigateAndWakeUpPage(page, logPrefix);
+            } catch (error) {
+                if (!error.reason) error.reason = "navigation_timeout";
+                throw error;
+            }
 
             // Check abort status after navigation
             this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
-            await this._checkPageStatusAndErrors(page, `[Context#${authIndex}]`, authIndex);
+            await this._checkPageStatusAndErrors(page, logPrefix, authIndex);
 
             this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
             // Wait for WebSocket initialization (no retry)
             // Check if initialization already succeeded (console listener may have detected it)
-            const wsState = this._wsInitState.get(authIndex);
-            if (wsState && wsState.success) {
-                this.logger.info(`[Context#${authIndex}] ✅ WebSocket already initialized, skipping wait`);
+            if (attempt.ws.success || this._hasNewOpenConnection(attempt)) {
+                attempt.ws.success = true;
+                this.logger.info(`${logPrefix} ✅ WebSocket already initialized, skipping wait`);
             } else {
                 // Wait for WebSocket initialization (120 second timeout)
                 // This will throw an abort error if the context is aborted during wait
                 const initSuccess = await this._waitForWebSocketInit(
                     page,
-                    `[Context#${authIndex}]`,
+                    logPrefix,
                     WS_INIT_TIMEOUT_MS,
-                    authIndex,
+                    attempt,
                     isBackgroundTask
                 );
 
                 if (!initSuccess) {
-                    throw new Error("WebSocket initialization failed. Please check browser logs and page errors.");
+                    throw Object.assign(
+                        new Error(`Context initialization failed: ${attempt.failureReason || "ws_connection_timeout"}`),
+                        { reason: attempt.failureReason || "ws_connection_timeout" }
+                    );
                 }
             }
 
@@ -2577,6 +2724,7 @@ class BrowserManager {
             // between the check above and actually adding to the map
             if (!this.abortedContexts.has(authIndex) && !(isBackgroundTask && this._backgroundPreloadAbort)) {
                 this.contexts.set(authIndex, {
+                    attemptId: attempt.id,
                     context,
                     createdAt: Date.now(),
                     healthMonitorInterval: null,
@@ -2615,7 +2763,8 @@ class BrowserManager {
             }
 
             // Remove from contexts map if it was added
-            if (this.contexts.has(authIndex)) {
+            const current = this.contexts.get(authIndex);
+            if (current?.attemptId === attempt.id) {
                 this.contexts.delete(authIndex);
                 this.logger.info(`[Browser] Removed failed context #${authIndex} from contexts map`);
             }
@@ -2634,10 +2783,6 @@ class BrowserManager {
                 }
             }
             throw error;
-        } finally {
-            // Ensure cleanup of tracking sets even if error is thrown
-            this.initializingContexts.delete(authIndex);
-            this.abortedContexts.delete(authIndex);
         }
     }
 
@@ -2769,8 +2914,6 @@ class BrowserManager {
             return await this.launchOrSwitchContext(authIndex);
         }
 
-        this.initializingContexts.add(authIndex);
-
         try {
             // Stop background tasks for old context
             if (this._currentAuthIndex >= 0 && this.contexts.has(this._currentAuthIndex)) {
@@ -2782,7 +2925,7 @@ class BrowserManager {
             }
 
             // Initialize new context (isBackgroundTask=false for foreground initialization)
-            const { context, page } = await this._initializeContext(authIndex, false);
+            const { context, page } = await this._getOrStartContextInit(authIndex);
 
             this._activateContext(context, page, authIndex);
             await this._flushPendingContextClosures();
@@ -2889,9 +3032,23 @@ class BrowserManager {
             }
         }
 
+        const reconnectAttempt = {
+            authIndex: targetAuthIndex,
+            connectionEpoch: this.connectionRegistry?.getConnectionEpoch?.(targetAuthIndex) ?? null,
+            id: `reconnect:${targetAuthIndex}:${Date.now()}`,
+            startedAt: Date.now(),
+            ws: { failed: false, success: false },
+        };
+        const reconnectConsoleListener = msg => {
+            const text = msg.text();
+            if (text.includes("Connection successful")) reconnectAttempt.ws.success = true;
+            if (text.includes("WebSocket initialization failed")) reconnectAttempt.ws.failed = true;
+        };
+        page.on("console", reconnectConsoleListener);
+
         try {
-            // Reset per-context WebSocket state to ensure clean state for reconnection
-            this._wsInitState.set(targetAuthIndex, { failed: false, success: false });
+            // Keep this map for diagnostics; the waiter reads reconnectAttempt directly.
+            this._wsInitState.set(targetAuthIndex, reconnectAttempt.ws);
             this.logger.info("[Reconnect] Reset WebSocket initialization state");
 
             // Navigate to target page and wake it up
@@ -2902,8 +3059,7 @@ class BrowserManager {
 
             // Wait for WebSocket initialization (no retry)
             // Check if initialization already succeeded (console listener may have detected it)
-            const wsState = this._wsInitState.get(targetAuthIndex);
-            if (wsState && wsState.success) {
+            if (reconnectAttempt.ws.success || this._hasNewOpenConnection(reconnectAttempt)) {
                 this.logger.info(`[Reconnect] ✅ WebSocket already initialized, skipping wait`);
             } else {
                 // Wait for WebSocket initialization (120 second timeout)
@@ -2911,7 +3067,7 @@ class BrowserManager {
                     page,
                     "[Reconnect]",
                     WS_INIT_TIMEOUT_MS,
-                    targetAuthIndex,
+                    reconnectAttempt,
                     false
                 );
 
@@ -2969,6 +3125,8 @@ class BrowserManager {
             await this._saveDebugArtifacts("reconnect_failed", targetAuthIndex, page);
             // Keep context for non-expired failures - next request will try to refresh the page
             return false;
+        } finally {
+            page.off?.("console", reconnectConsoleListener);
         }
     }
 
@@ -2986,11 +3144,11 @@ class BrowserManager {
      *
      * @param {number} authIndex - The auth index to close
      */
-    async closeContext(authIndex, { keepBrowser = false } = {}) {
+    async closeContext(authIndex, { keepBrowser = false, skipInitWait = false } = {}) {
         this.pendingContextClosures.delete(authIndex);
 
         // If context is being initialized in background, signal abort and wait
-        if (this.initializingContexts.has(authIndex)) {
+        if (!skipInitWait && this.initializingContexts.has(authIndex)) {
             this.logger.info(`[Browser] Context #${authIndex} is being initialized, marking for abort and waiting...`);
             this.abortedContexts.add(authIndex);
             await this._waitForContextInit(authIndex);

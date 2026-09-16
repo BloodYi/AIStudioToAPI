@@ -17,7 +17,6 @@ function browserFixture(limit) {
             await new Promise(resolve => setImmediate(resolve));
             this.contexts.set(index, { page: { isClosed: () => false }, state: "READY" });
             this.activeInitializations--;
-            this.initializingContexts.delete(index);
             this.peak = Math.max(this.peak || 0, this.contexts.size);
         },
         async _startBackgroundWakeup() {},
@@ -171,7 +170,7 @@ test("same account concurrent initialization creates only one context", async ()
         launches++;
         await initialize(index);
     };
-    await Promise.all(Array.from({ length: 12 }, () => manager.ensureWorkerContext(0)));
+    await Promise.all(Array.from({ length: 20 }, () => manager.ensureWorkerContext(0)));
     assert.equal(launches, 1);
     assert.equal(manager.contexts.size, 1);
 });
@@ -254,4 +253,224 @@ test("browser context creation timeout releases the lock and closes a late orpha
     });
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(lateContextClosed, true);
+});
+
+function singleFlightFixture() {
+    const manager = Object.create(BrowserManager.prototype);
+    Object.assign(manager, {
+        _contextInitSequence: 0,
+        _contextInitTasks: new Map(),
+        _wsInitState: new Map(),
+        abortedContexts: new Set(),
+        initializingContexts: new Set(),
+        logger,
+    });
+    return manager;
+}
+
+function websocketWaitFixture(registry = null) {
+    const manager = Object.create(BrowserManager.prototype);
+    Object.assign(manager, {
+        _backgroundPreloadAbort: false,
+        _checkPageErrors: async () => ({}),
+        _clickButtonByTextIfVisible: async () => false,
+        _findAndClickButtonByText: async () => ({ clicked: false, found: false }),
+        _simulateHumanMovement: async () => {},
+        abortedContexts: new Set(),
+        connectionRegistry: registry,
+        consentRetryIntervalMs: 0,
+        consentTimeoutGraceMs: 5,
+        logger,
+    });
+    return manager;
+}
+
+function waitPage() {
+    return {
+        viewportSize: () => ({ height: 10, width: 10 }),
+        async waitForTimeout() {
+            await new Promise(resolve => setTimeout(resolve, 2));
+        },
+    };
+}
+
+test("single-flight publishes one exact Promise and result to 20 same-account callers", async () => {
+    const manager = singleFlightFixture();
+    let creations = 0;
+    const result = { context: {}, page: {} };
+    manager._initializeContext = async () => {
+        creations++;
+        await new Promise(resolve => setImmediate(resolve));
+        return result;
+    };
+
+    const tasks = Array.from({ length: 20 }, () => manager._getOrStartContextInit(7));
+    assert.ok(tasks.every(task => task === tasks[0]));
+    assert.ok((await Promise.all(tasks)).every(value => value === result));
+    assert.equal(creations, 1);
+    assert.equal(manager.initializingContexts.size, 0);
+});
+
+test("pool warmup and foreground switch join the same account initialization", async () => {
+    const manager = browserFixture(2);
+    manager.connectionRegistry.getConnectionEpoch = () => null;
+    manager.authSource.isExpired = () => false;
+    manager.authSource.markAsExpired = async () => {};
+    manager.authSource.unmarkAsExpired = async () => {};
+    manager._cancelPendingContextClosure = () => {};
+    manager._flushPendingContextClosures = async () => {};
+    manager._updateAuthFile = async () => {};
+    manager._activateContext = () => {};
+    let creations = 0;
+    manager._initializeContext = async index => {
+        creations++;
+        await new Promise(resolve => setImmediate(resolve));
+        const context = {};
+        const page = {
+            isClosed: () => false,
+            title: async () => "AI Studio",
+            url: () => "https://ai.studio/apps/test",
+        };
+        manager.contexts.set(index, { context, page, state: "READY" });
+        return { context, page };
+    };
+
+    const warmup = manager._startPooledContext(0);
+    const foreground = manager.launchOrSwitchContext(0);
+    await Promise.all([warmup, foreground]);
+    assert.equal(creations, 1);
+});
+
+test("an account-level observability overwrite cannot replace an attempt's success state", async () => {
+    const manager = websocketWaitFixture();
+    const attempt = { authIndex: 3, id: "3:1", ws: { failed: false, success: true } };
+    manager._wsInitState = new Map([[3, { failed: false, success: false }]]);
+    assert.equal(await manager._waitForWebSocketInit(waitPage(), "[Test]", 5, attempt, false), true);
+});
+
+test("a failed old attempt closes only its local context and preserves a newer map entry", async () => {
+    const manager = singleFlightFixture();
+    let localClosed = false;
+    const localContext = {
+        addInitScript: async () => {},
+        close: async () => {
+            localClosed = true;
+        },
+        newPage: async () => ({
+            bringToFront: async () => {},
+            evaluate: async () => {},
+            isClosed: () => true,
+            on: () => {},
+            viewportSize: () => ({ height: 10, width: 10 }),
+        }),
+    };
+    Object.assign(manager, {
+        _backgroundPreloadAbort: false,
+        _createBrowserContext: async () => localContext,
+        _getPrivacyProtectionScript: () => "",
+        _navigateAndWakeUpPage: async () => {
+            throw new Error("navigation failed");
+        },
+        _saveDebugArtifacts: async () => {},
+        _simulateHumanMovement: async () => {},
+        authSource: { getAuth: () => ({}) },
+        contexts: new Map([[0, { attemptId: "0:2", context: {}, page: {} }]]),
+        stickyProxyManager: { getProxyForAuth: () => null },
+    });
+    await assert.rejects(
+        manager._initializeContext(0, true, {
+            authIndex: 0,
+            connectionEpoch: null,
+            id: "0:1",
+            ws: { failed: false, success: false },
+        }),
+        error => error.reason === "navigation_timeout"
+    );
+    assert.equal(manager.contexts.get(0).attemptId, "0:2");
+    assert.equal(localClosed, true);
+});
+
+test("a newer OPEN registry epoch succeeds even when the console event is missing", async () => {
+    const registry = {
+        getConnectionByAuth: () => ({ readyState: 1 }),
+        getConnectionEpoch: () => 2,
+    };
+    const manager = websocketWaitFixture(registry);
+    const attempt = { authIndex: 0, connectionEpoch: 1, id: "0:1", ws: { failed: false, success: false } };
+    assert.equal(await manager._waitForWebSocketInit(waitPage(), "[Test]", 5, attempt, false), true);
+});
+
+test("an old registry epoch is not accepted as initialization success", async () => {
+    const registry = {
+        getConnectionByAuth: () => ({ readyState: 1 }),
+        getConnectionEpoch: () => 4,
+    };
+    const manager = websocketWaitFixture(registry);
+    const attempt = { authIndex: 0, connectionEpoch: 4, id: "0:1", ws: { failed: false, success: false } };
+    assert.equal(await manager._waitForWebSocketInit(waitPage(), "[Test]", 5, attempt, false), false);
+    assert.equal(attempt.failureReason, "ws_connection_timeout");
+});
+
+test("consent is retried after an ineffective click and succeeds on the second click", async () => {
+    const manager = websocketWaitFixture();
+    const attempt = { authIndex: 0, connectionEpoch: null, id: "0:1", ws: { failed: false, success: false } };
+    let clicks = 0;
+    manager._findAndClickButtonByText = async (_page, text, _prefix, _name, click) => {
+        if (text !== "Continue to the app") return { clicked: false, found: false };
+        if (click) clicks++;
+        if (clicks === 2) attempt.ws.success = true;
+        return { clicked: click, found: true };
+    };
+    assert.equal(await manager._waitForWebSocketInit(waitPage(), "[Test]", 20, attempt, false), true);
+    assert.equal(clicks, 2);
+});
+
+test("consent appearing at the timeout boundary can connect during the bounded grace period", async () => {
+    const manager = websocketWaitFixture();
+    const attempt = { authIndex: 0, connectionEpoch: null, id: "0:1", ws: { failed: false, success: false } };
+    let checks = 0;
+    manager._findAndClickButtonByText = async (_page, text, _prefix, _name, click) => {
+        if (text !== "Continue to the app") return { clicked: false, found: false };
+        checks++;
+        const found = checks >= 2;
+        if (found && click && checks >= 3) attempt.ws.success = true;
+        return { clicked: found && click, found };
+    };
+    assert.equal(await manager._waitForWebSocketInit(waitPage(), "[Test]", 3, attempt, false), true);
+});
+
+test("a consent dialog that never closes reports consent_dialog_timeout", async () => {
+    const manager = websocketWaitFixture();
+    const attempt = { authIndex: 0, connectionEpoch: null, id: "0:1", ws: { failed: false, success: false } };
+    manager._findAndClickButtonByText = async (_page, text, _prefix, _name, click) => ({
+        clicked: text === "Continue to the app" && click,
+        found: text === "Continue to the app",
+    });
+    assert.equal(await manager._waitForWebSocketInit(waitPage(), "[Test]", 3, attempt, false), false);
+    assert.equal(attempt.failureReason, "consent_dialog_timeout");
+});
+
+test("100 cold accounts with 16-worker capacity and two launchers never overlap attempts per account", async () => {
+    const manager = singleFlightFixture();
+    manager.scheduler = { config: { contextInitConcurrency: 2, maxWorkers: 16 } };
+    const active = new Map();
+    const peak = new Map();
+    manager._initializeContext = async index => {
+        active.set(index, (active.get(index) || 0) + 1);
+        peak.set(index, Math.max(peak.get(index) || 0, active.get(index)));
+        await new Promise(resolve => setImmediate(resolve));
+        active.set(index, active.get(index) - 1);
+        return index;
+    };
+    const accounts = Array.from({ length: 100 }, (_, index) => index);
+    let cursor = 0;
+    const launcher = async () => {
+        while (cursor < accounts.length) {
+            const index = accounts[cursor++];
+            await Promise.all([manager._getOrStartContextInit(index), manager._getOrStartContextInit(index)]);
+        }
+    };
+    await Promise.all([launcher(), launcher()]);
+    assert.ok([...peak.values()].every(value => value === 1));
+    assert.equal(peak.size, 100);
 });
