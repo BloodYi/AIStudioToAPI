@@ -1879,6 +1879,11 @@ class BrowserManager {
         let blockedByCapacity = false;
         return this._getOrStartContextInit(authIndex, {
             isBackgroundTask: true,
+            onSettledAfterRelease: () => {
+                if (blockedByCapacity) return;
+                this.scheduler?.drain();
+                this._pumpContextPool();
+            },
             runner: async attempt => {
                 try {
                     await this._ensureBrowserForPool();
@@ -1937,11 +1942,6 @@ class BrowserManager {
                         this.logger.error(`[ContextPool] Context #${authIndex} unavailable: ${error.message}`);
                         const retryTimer = setTimeout(() => this._pumpContextPool(), 5000);
                         retryTimer.unref?.();
-                    }
-                } finally {
-                    if (!blockedByCapacity) {
-                        this.scheduler?.drain();
-                        this._pumpContextPool();
                     }
                 }
             },
@@ -2545,12 +2545,15 @@ class BrowserManager {
                 return runner(attempt);
             })
             .finally(() => {
+                let released = false;
                 if (this._contextInitTasks.get(authIndex) === task) {
                     this._contextInitTasks.delete(authIndex);
                     this.initializingContexts.delete(authIndex);
                     this.abortedContexts.delete(authIndex);
+                    released = true;
                 }
                 this.logger.info(`[Context#${authIndex}] init_finished attempt=${attempt.id}`);
+                if (released) options.onSettledAfterRelease?.();
             });
         this._contextInitTasks.set(authIndex, task);
         return task;

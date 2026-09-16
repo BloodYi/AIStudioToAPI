@@ -48,6 +48,14 @@ function browserFixture(limit) {
     });
     return manager;
 }
+
+async function waitForPool(manager, expectedReady, timeoutMs = 2000) {
+    const deadline = Date.now() + timeoutMs;
+    while ((manager.contexts.size !== expectedReady || manager._contextInitTasks.size !== 0) && Date.now() < deadline) {
+        await new Promise(resolve => setImmediate(resolve));
+    }
+}
+
 test("context setup is bounded parallel and never evicts leased contexts", async () => {
     const manager = browserFixture(2);
     manager.requestContext(0);
@@ -59,6 +67,119 @@ test("context setup is bounded parallel and never evicts leased contexts", async
     assert.equal(manager.peak, 2);
     assert.equal(manager.peakInitializations, 2);
     assert.deepEqual([...manager.contexts.keys()], [0, 2]);
+});
+
+test("warm pool reaches all 16 workers after init markers are released", async () => {
+    const manager = browserFixture(16);
+    manager.authSource.getRotationIndices = () => Array.from({ length: 100 }, (_, index) => index);
+    manager.scheduler.config.contextPoolMinReady = 16;
+    manager.scheduler.config.contextInitConcurrency = 2;
+    manager.scheduler.account = () => ({ healthy: true, inflight: 0, models: {} });
+
+    manager.startContextPool();
+    await waitForPool(manager, 16);
+
+    assert.equal(manager.contexts.size, 16);
+    assert.equal(manager.initializingContexts.size, 0);
+    assert.equal(manager._contextInitTasks.size, 0);
+    assert.ok(manager.peakInitializations <= 2);
+    assert.ok(manager.peak <= 16);
+});
+
+test("warm pool reaches exact targets across concurrency and enabled-account limits", async t => {
+    const cases = [
+        { concurrency: 1, enabled: 100, expected: 1, target: 1 },
+        { concurrency: 2, enabled: 100, expected: 2, target: 2 },
+        { concurrency: 2, enabled: 100, expected: 15, target: 15 },
+        { concurrency: 2, enabled: 100, expected: 16, target: 16 },
+        { concurrency: 1, enabled: 100, expected: 16, target: 16 },
+        { concurrency: 4, enabled: 100, expected: 16, target: 16 },
+        { concurrency: 2, enabled: 10, expected: 10, target: 16 },
+    ];
+
+    for (const entry of cases) {
+        await t.test(JSON.stringify(entry), async () => {
+            const manager = browserFixture(16);
+            manager.authSource.getRotationIndices = () => Array.from({ length: 100 }, (_, index) => index);
+            manager.scheduler.config.contextPoolMinReady = entry.target;
+            manager.scheduler.config.contextInitConcurrency = entry.concurrency;
+            manager.scheduler.account = () => ({ healthy: true, inflight: 0, models: {} });
+            manager.scheduler.isAccountManuallyDisabled = index => index >= entry.enabled;
+            let peakTasks = 0;
+            const startPooledContext = manager._startPooledContext.bind(manager);
+            manager._startPooledContext = index => {
+                const task = startPooledContext(index);
+                peakTasks = Math.max(peakTasks, manager._contextInitTasks.size);
+                return task;
+            };
+
+            manager.startContextPool();
+            await waitForPool(manager, entry.expected);
+
+            assert.equal(manager.contexts.size, entry.expected);
+            assert.equal(manager.initializingContexts.size, 0);
+            assert.equal(manager._contextInitTasks.size, 0);
+            assert.ok(peakTasks <= entry.concurrency);
+            assert.ok(manager.contexts.size <= manager.scheduler.config.maxWorkers);
+            assert.ok([...manager.contexts.keys()].every(index => index < entry.enabled));
+        });
+    }
+});
+
+test("warm pool continues with another account after one initialization fails", async () => {
+    const manager = browserFixture(2);
+    manager.authSource.getRotationIndices = () => [0, 1, 2];
+    manager.scheduler.config.contextPoolMinReady = 2;
+    manager.scheduler.config.contextInitConcurrency = 1;
+    manager.scheduler.account = () => ({ healthy: true, inflight: 0, models: {} });
+    const initialize = manager._initializeContext.bind(manager);
+    manager._initializeContext = async (index, ...args) => {
+        if (index === 0) throw new Error("expected init failure");
+        return initialize(index, ...args);
+    };
+
+    manager.startContextPool();
+    await waitForPool(manager, 2);
+
+    assert.deepEqual([...manager.contexts.keys()], [1, 2]);
+    assert.equal(manager._contextInitTasks.size, 0);
+    assert.equal(manager.initializingContexts.size, 0);
+});
+
+test("capacity blocking does not synchronously repump the context pool", async () => {
+    const manager = browserFixture(1);
+    manager.contexts.set(0, { page: { isClosed: () => false }, state: "READY" });
+    manager.scheduler.account = index => ({ healthy: true, inflight: index === 0 ? 1 : 0, models: {} });
+    let pumps = 0;
+    manager._pumpContextPool = () => pumps++;
+
+    await manager._startPooledContext(1);
+
+    assert.equal(pumps, 0);
+    assert.equal(manager._contextInitTasks.size, 0);
+    assert.equal(manager.initializingContexts.size, 0);
+    assert.deepEqual([...manager.contexts.keys()], [0]);
+});
+
+test("release callback cannot restart the pool after scheduler shutdown", async () => {
+    const manager = browserFixture(2);
+    manager.authSource.getRotationIndices = () => [0, 1];
+    manager.scheduler.config.contextPoolMinReady = 2;
+    manager.scheduler.config.contextInitConcurrency = 1;
+    manager.scheduler.account = () => ({ healthy: true, inflight: 0, models: {} });
+    const initialize = manager._initializeContext.bind(manager);
+    manager._initializeContext = async (index, ...args) => {
+        const result = await initialize(index, ...args);
+        manager.scheduler.closed = true;
+        return result;
+    };
+
+    manager.startContextPool();
+    await waitForPool(manager, 1);
+
+    assert.equal(manager.contexts.size, 1);
+    assert.equal(manager._contextInitTasks.size, 0);
+    assert.equal(manager.initializingContexts.size, 0);
 });
 
 test("disabled accounts are excluded from context demand and warm candidates", () => {
@@ -309,6 +430,23 @@ test("single-flight publishes one exact Promise and result to 20 same-account ca
     assert.ok((await Promise.all(tasks)).every(value => value === result));
     assert.equal(creations, 1);
     assert.equal(manager.initializingContexts.size, 0);
+});
+
+test("single-flight settled callback runs only after ownership markers are released", async () => {
+    const manager = singleFlightFixture();
+    let releasedState = null;
+
+    await manager._getOrStartContextInit(4, {
+        onSettledAfterRelease: () => {
+            releasedState = {
+                initializing: manager.initializingContexts.has(4),
+                task: manager._contextInitTasks.has(4),
+            };
+        },
+        runner: async () => "ready",
+    });
+
+    assert.deepEqual(releasedState, { initializing: false, task: false });
 });
 
 test("pool warmup and foreground switch join the same account initialization", async () => {
