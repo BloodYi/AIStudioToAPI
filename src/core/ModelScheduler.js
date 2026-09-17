@@ -12,6 +12,62 @@ const PACIFIC_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 });
 const DAILY_QUOTAS = Object.freeze({ flash: 100, pro: 10 });
 const MAX_MODEL_NAME_LENGTH = 200;
+const PERSISTENT_403_THRESHOLD_MS = 48 * 60 * 60 * 1000;
+const PACIFIC_DATE_TIME_FORMATTER = new Intl.DateTimeFormat("en-US", {
+    day: "2-digit",
+    hour: "2-digit",
+    hourCycle: "h23",
+    minute: "2-digit",
+    month: "2-digit",
+    second: "2-digit",
+    timeZone: PACIFIC_TIMEZONE,
+    year: "numeric",
+});
+
+function pacificDateTimeParts(timestamp) {
+    const parts = Object.fromEntries(
+        PACIFIC_DATE_TIME_FORMATTER.formatToParts(new Date(timestamp))
+            .filter(part => part.type !== "literal")
+            .map(part => [part.type, Number(part.value)])
+    );
+    return parts;
+}
+
+function nextDateKey(dateKey) {
+    const [year, month, day] = dateKey.split("-").map(Number);
+    const next = new Date(Date.UTC(year, month - 1, day + 1));
+    return `${next.getUTCFullYear()}-${String(next.getUTCMonth() + 1).padStart(2, "0")}-${String(
+        next.getUTCDate()
+    ).padStart(2, "0")}`;
+}
+
+function calculateNextPacificResetAt(now, configuredTime, skipDate = null) {
+    const [targetHour, targetMinute] = configuredTime.split(":").map(Number);
+    const current = pacificDateTimeParts(now);
+    const currentDate = `${current.year}-${String(current.month).padStart(2, "0")}-${String(current.day).padStart(
+        2,
+        "0"
+    )}`;
+    const currentMinute = current.hour * 60 + current.minute;
+    const targetMinutes = targetHour * 60 + targetMinute;
+    let targetDate =
+        currentMinute <= targetMinutes && skipDate !== currentDate ? currentDate : nextDateKey(currentDate);
+    if (skipDate === targetDate) targetDate = nextDateKey(targetDate);
+
+    // Searching real instants avoids depending on the host timezone and naturally handles DST:
+    // the first valid minute after a missing wall time wins, and a repeated wall time is seen once.
+    let candidate =
+        currentMinute === targetMinutes && targetDate === currentDate ? now : Math.ceil(now / 60000) * 60000;
+    for (let count = 0; count < 3 * 24 * 60; count++, candidate += 60000) {
+        const parts = pacificDateTimeParts(candidate);
+        const date = `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
+        if (date === targetDate && parts.hour * 60 + parts.minute >= targetMinutes) return candidate;
+        if (date > targetDate) {
+            targetDate = nextDateKey(targetDate);
+        }
+    }
+    throw new Error(`Cannot calculate next ${PACIFIC_TIMEZONE} reset time`);
+}
 
 function normalizeModelName(model) {
     if (typeof model !== "string") throw schedulerError("Model must be a non-empty string", 400);
@@ -82,6 +138,18 @@ function classifyError(error = {}) {
     return "request";
 }
 
+function observedHttpStatus(error = {}, kind) {
+    const message = String(error.message || "");
+    const explicitStatus = Number(error.status ?? error.code);
+    const messageStatus = Number(
+        /^\s*\[(\d{3})\]/.exec(message)?.[1] || /Google API returned error:\s*(\d{3})/i.exec(message)?.[1]
+    );
+    if (Number.isInteger(explicitStatus) && explicitStatus >= 100 && explicitStatus <= 599) return explicitStatus;
+    if (Number.isInteger(messageStatus) && messageStatus >= 100 && messageStatus <= 599) return messageStatus;
+    if (kind === "rate_limited" && /RESOURCE_EXHAUSTED/.test(message)) return 429;
+    return null;
+}
+
 class ModelScheduler {
     constructor(config, authSource, logger) {
         this.config = config;
@@ -95,6 +163,11 @@ class ModelScheduler {
         this.sequence = 0;
         this.closed = false;
         this.random = typeof config.random === "function" ? config.random : Math.random;
+        this.now = typeof config.now === "function" ? config.now : Date.now;
+        this.setTimer = typeof config.setTimer === "function" ? config.setTimer : setTimeout;
+        this.clearTimer = typeof config.clearTimer === "function" ? config.clearTimer : clearTimeout;
+        this.dailyResetTimer = null;
+        this.lastDailyResetPacificDate = null;
         this.metrics = {
             dispatch_timeout: 0,
             local_transport: 0,
@@ -102,6 +175,7 @@ class ModelScheduler {
             upstream_error: 0,
         };
         this.load();
+        if (this.config.dailyResetEnabled !== false) this._scheduleDailyReset();
     }
 
     account(index) {
@@ -109,6 +183,7 @@ class ModelScheduler {
         const key = this.authSource.accountNameMap.get(index) || `auth-${index}`;
         if (!this.accounts.has(key))
             this.accounts.set(key, {
+                continuous_403_since: null,
                 disabled: false,
                 disabled_at: null,
                 disabled_reason: null,
@@ -123,6 +198,7 @@ class ModelScheduler {
         account.disabled ??= false;
         account.disabled_at ??= null;
         account.disabled_reason ??= null;
+        account.continuous_403_since ??= null;
         return account;
     }
 
@@ -394,6 +470,7 @@ class ModelScheduler {
         }
         lease.recorded = true;
         const { account, slot } = lease;
+        this._recordAccountObservedResult(account, observedHttpStatus(error, kind));
         this.rolloverDailyUsage(slot);
         slot.daily_failure_count++;
         slot.failure_count++;
@@ -440,6 +517,7 @@ class ModelScheduler {
         if (!lease || lease.released) return;
         lease.released = true;
         if (success && lease.attempted && !lease.recorded) {
+            this._recordAccountObservedResult(lease.account, 200);
             lease.slot.success_count++;
             lease.slot.consecutive_failures = 0;
             lease.slot.risk_control_failures = 0;
@@ -453,6 +531,32 @@ class ModelScheduler {
         this.saveSoon();
         this.drain();
         this.browserManager?.handleAccountLeaseReleased?.(lease.account.index);
+    }
+
+    _recordAccountObservedResult(account, status) {
+        if (status === 403) {
+            if (account.continuous_403_since == null) {
+                account.continuous_403_since = this.now();
+                this.sequence++;
+                this.saveSoon();
+            }
+            return;
+        }
+        if (status !== null && status !== undefined && account.continuous_403_since != null) {
+            account.continuous_403_since = null;
+            this.sequence++;
+            this.saveSoon();
+        }
+    }
+
+    _persistent403Snapshot(account, now = this.now()) {
+        const since = account.continuous_403_since ?? null;
+        const duration = since === null ? 0 : Math.max(0, now - since);
+        return {
+            continuous_403_duration_ms: duration,
+            continuous_403_since: since,
+            persistent_403: since !== null && duration >= PERSISTENT_403_THRESHOLD_MS,
+        };
     }
 
     isAccountManuallyDisabled(index) {
@@ -529,6 +633,69 @@ class ModelScheduler {
         this.drain();
         this.browserManager?.handleAccountsEnabled?.();
         return { reset_account_count: resetAccountCount, reset_model_count: resetModelCount };
+    }
+
+    resetDailyCooldowns() {
+        let affectedAccountCount = 0;
+        let affectedSlotCount = 0;
+        for (const index of this.authSource.getRotationIndices()) {
+            const account = this.account(index);
+            let accountChanged = false;
+            for (const slot of Object.values(account.models)) {
+                const changed = Boolean(
+                    slot.cooldown_until ||
+                    slot.rate_limited ||
+                    slot.risk_control_failures ||
+                    slot.consecutive_failures ||
+                    slot.last_error !== null ||
+                    slot.last_error_kind !== null ||
+                    slot.last_http_status !== null
+                );
+                if (!changed) continue;
+                Object.assign(slot, {
+                    consecutive_failures: 0,
+                    cooldown_until: 0,
+                    last_error: null,
+                    last_error_kind: null,
+                    last_http_status: null,
+                    rate_limited: false,
+                    risk_control_failures: 0,
+                });
+                affectedSlotCount++;
+                accountChanged = true;
+            }
+            if (accountChanged) affectedAccountCount++;
+        }
+        if (affectedSlotCount) this.sequence++;
+        this.flush();
+        this.drain();
+        return { affected_account_count: affectedAccountCount, affected_slot_count: affectedSlotCount };
+    }
+
+    _scheduleDailyReset() {
+        if (this.closed || this.config.dailyResetEnabled === false) return;
+        const now = this.now();
+        const executeAt = calculateNextPacificResetAt(now, this.config.dailyResetTime, this.lastDailyResetPacificDate);
+        const delay = Math.max(0, executeAt - now);
+        this.dailyResetTimer = this.setTimer(() => {
+            this.dailyResetTimer = null;
+            if (this.closed) return;
+            const firedAt = this.now();
+            const pacificDate = this.getPacificDateKey(firedAt);
+            if (this.lastDailyResetPacificDate !== pacificDate) {
+                this.lastDailyResetPacificDate = pacificDate;
+                const result = this.resetDailyCooldowns();
+                this.logger.info?.(
+                    `[Scheduler] Daily cooldown reset ${JSON.stringify({
+                        configured_time: this.config.dailyResetTime,
+                        pacific_date: pacificDate,
+                        ...result,
+                    })}`
+                );
+            }
+            this._scheduleDailyReset();
+        }, delay);
+        this.dailyResetTimer?.unref?.();
     }
 
     reset(index, model) {
@@ -626,9 +793,17 @@ class ModelScheduler {
     }
 
     accountsOverviewSnapshot() {
-        const now = Date.now();
+        const now = this.now();
         const rotationIndices = this.authSource.getRotationIndices();
-        const summary = { disabled: 0, healthy: 0, rate_limited: 0, risk_controlled: 0, total: 0, unhealthy: 0 };
+        const summary = {
+            disabled: 0,
+            healthy: 0,
+            persistent_403: 0,
+            rate_limited: 0,
+            risk_controlled: 0,
+            total: 0,
+            unhealthy: 0,
+        };
         const accounts = rotationIndices.map(index => {
             const account = this.account(index);
             const { has403, has429 } = this._accountFlags(account, now, rotationIndices);
@@ -643,7 +818,10 @@ class ModelScheduler {
                       : "unhealthy";
             summary[state]++;
             summary.total++;
+            const persistent403 = this._persistent403Snapshot(account, now);
+            if (persistent403.persistent_403) summary.persistent_403++;
             return {
+                ...persistent403,
                 disabled: account.disabled,
                 disabled_at: account.disabled_at,
                 disabled_reason: account.disabled_reason,
@@ -813,7 +991,7 @@ class ModelScheduler {
     accountsSnapshot(indices) {
         const rotationIndices = this.authSource.getRotationIndices();
         const requested = indices === undefined ? rotationIndices : indices;
-        const now = Date.now();
+        const now = this.now();
         return {
             accounts: requested.map(index => {
                 const account = this.account(index);
@@ -837,6 +1015,7 @@ class ModelScheduler {
                     });
                 const { has403, has429 } = this._accountFlags(account, now, rotationIndices);
                 return {
+                    ...this._persistent403Snapshot(account, now),
                     disabled: account.disabled,
                     disabled_at: account.disabled_at,
                     disabled_reason: account.disabled_reason,
@@ -925,7 +1104,7 @@ class ModelScheduler {
         if (!this.config.statePath) return;
         try {
             const data = JSON.parse(fs.readFileSync(this.config.statePath, "utf8"));
-            if (![1, 2, 3, 4, 5, 6].includes(data.version) || !Array.isArray(data.accounts))
+            if (![1, 2, 3, 4, 5, 6, 7].includes(data.version) || !Array.isArray(data.accounts))
                 throw new Error("Unsupported scheduler state");
             if (data.version >= 4) {
                 if (!Array.isArray(data.hiddenModels) || data.hiddenModels.some(model => typeof model !== "string"))
@@ -941,6 +1120,14 @@ class ModelScheduler {
                 account.disabled ??= false;
                 account.disabled_at ??= null;
                 account.disabled_reason ??= null;
+                if (data.version < 7) account.continuous_403_since = null;
+                else if (
+                    account.continuous_403_since !== null &&
+                    (!Number.isSafeInteger(account.continuous_403_since) || account.continuous_403_since < 0)
+                ) {
+                    throw new Error("Invalid continuous 403 scheduler state");
+                }
+                account.continuous_403_since ??= null;
                 for (const slot of Object.values(account.models)) {
                     slot.risk_control_failures ??= 0;
                     slot.last_error_kind ??= null;
@@ -1016,7 +1203,7 @@ class ModelScheduler {
                     accounts: [...this.accounts.values()],
                     fileAffinities: [...this.fileAffinities],
                     hiddenModels: this.hiddenModelsSnapshot(),
-                    version: 6,
+                    version: 7,
                 }),
                 {
                     mode: 0o600,
@@ -1030,6 +1217,8 @@ class ModelScheduler {
 
     close() {
         this.closed = true;
+        this.clearTimer(this.dailyResetTimer);
+        this.dailyResetTimer = null;
         for (const item of [...this.pending]) {
             this.remove(item);
             item.reject(schedulerError("Scheduler is shutting down"));
@@ -1037,4 +1226,10 @@ class ModelScheduler {
         this.flush();
     }
 }
-module.exports = { classifyError, getModelDailyQuota, ModelScheduler, normalizeModelName };
+module.exports = {
+    calculateNextPacificResetAt,
+    classifyError,
+    getModelDailyQuota,
+    ModelScheduler,
+    normalizeModelName,
+};

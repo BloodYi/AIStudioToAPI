@@ -3,7 +3,12 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { ModelScheduler, classifyError, getModelDailyQuota } = require("../src/core/ModelScheduler");
+const {
+    calculateNextPacificResetAt,
+    ModelScheduler,
+    classifyError,
+    getModelDailyQuota,
+} = require("../src/core/ModelScheduler");
 const loadConfig = require("../src/core/SchedulerConfig");
 const logger = { error() {}, warn() {} };
 function setup(overrides = {}, count = 8) {
@@ -134,6 +139,116 @@ test("403 risk control uses independent deterministic backoff and resets only on
     scheduler.close();
 });
 
+test("continuous 403 is account-wide, threshold-derived, and cleared only by observed non-403 results", async () => {
+    let now = 1_800_000_000_000;
+    const scheduler = setup({ now: () => now, riskControlJitter: false }, 1);
+    const first = await scheduler.acquire("a");
+    scheduler.startAttempt(first);
+    scheduler.failure(first, { status: 403 });
+    scheduler.release(first);
+    assert.equal(first.account.continuous_403_since, now);
+    assert.equal(scheduler.accountsOverviewSnapshot().accounts[0].persistent_403, false);
+
+    first.slot.cooldown_until = 0;
+    now += 24 * 60 * 60 * 1000;
+    const second = await scheduler.acquire("b");
+    scheduler.failure(second, { message: "[403] denied" });
+    scheduler.release(second);
+    assert.equal(second.account.continuous_403_since, 1_800_000_000_000);
+
+    now += 24 * 60 * 60 * 1000;
+    const overview = scheduler.accountsOverviewSnapshot();
+    assert.equal(overview.accounts[0].persistent_403, true);
+    assert.equal(overview.accounts[0].continuous_403_duration_ms, 48 * 60 * 60 * 1000);
+    assert.equal(overview.summary.persistent_403, 1);
+    const eligibleBefore = scheduler.eligibleAccounts("probe").length;
+    assert.equal(eligibleBefore, 1);
+
+    scheduler.reset(0);
+    scheduler.resetAllAccounts();
+    scheduler.resetAllRateLimits();
+    scheduler.resetDailyCooldowns();
+    assert.equal(second.account.continuous_403_since, 1_800_000_000_000);
+
+    const transport = await scheduler.acquire("transport");
+    scheduler.failure(transport, { kind: "transport" });
+    scheduler.release(transport);
+    assert.equal(transport.account.continuous_403_since, 1_800_000_000_000);
+
+    const non403 = await scheduler.acquire("non403");
+    scheduler.failure(non403, { status: 500 });
+    scheduler.release(non403);
+    assert.equal(non403.account.continuous_403_since, null);
+
+    non403.slot.cooldown_until = 0;
+    const again = await scheduler.acquire("success");
+    scheduler.startAttempt(again);
+    scheduler.failure(again, { status: 403 });
+    scheduler.release(again);
+    again.slot.cooldown_until = 0;
+    const success = await scheduler.acquire("success");
+    scheduler.startAttempt(success);
+    scheduler.release(success, true);
+    assert.equal(success.account.continuous_403_since, null);
+    scheduler.close();
+});
+
+test("daily cooldown reset preserves administrative, health, unsupported, usage, lease and 403 history", async () => {
+    const scheduler = setup({ globalConcurrency: 2 }, 1);
+    const active = await scheduler.acquire("a");
+    scheduler.startAttempt(active);
+    Object.assign(active.account, {
+        continuous_403_since: Date.now() - 3 * 86400000,
+        disabled: true,
+        disabled_at: 123,
+        disabled_reason: "manual",
+        healthy: false,
+        last_error: "login required",
+    });
+    Object.assign(active.slot, {
+        consecutive_failures: 3,
+        cooldown_until: Date.now() + 60000,
+        failure_count: 9,
+        last_error: "temporary",
+        last_error_kind: "temporary",
+        last_http_status: 503,
+        rate_limited: true,
+        risk_control_failures: 2,
+        success_count: 4,
+        unsupported: true,
+    });
+    const counts = {
+        daily: active.slot.daily_request_count,
+        failures: active.slot.failure_count,
+        requests: active.slot.request_count,
+        success: active.slot.success_count,
+    };
+    assert.deepEqual(scheduler.resetDailyCooldowns(), { affected_account_count: 1, affected_slot_count: 1 });
+    assert.equal(active.account.disabled, true);
+    assert.equal(active.account.healthy, false);
+    assert.equal(active.account.last_error, "login required");
+    assert.ok(active.account.continuous_403_since);
+    assert.equal(active.slot.unsupported, true);
+    assert.equal(active.slot.inflight, 1);
+    assert.equal(active.worker.lease, active);
+    assert.deepEqual(
+        {
+            daily: active.slot.daily_request_count,
+            failures: active.slot.failure_count,
+            requests: active.slot.request_count,
+            success: active.slot.success_count,
+        },
+        counts
+    );
+    assert.equal(active.slot.cooldown_until, 0);
+    assert.equal(active.slot.last_error, null);
+    scheduler.failure(active, { status: 429 });
+    assert.equal(active.slot.rate_limited, true);
+    assert.ok(active.slot.cooldown_until > Date.now());
+    scheduler.release(active);
+    scheduler.close();
+});
+
 test("manual account disable is lease-safe and only account-wide recovery clears it", async () => {
     const scheduler = setup({ globalConcurrency: 2 }, 2);
     const active = await scheduler.acquire("a");
@@ -160,14 +275,14 @@ test("manual account disable is lease-safe and only account-wide recovery clears
     scheduler.close();
 });
 
-test("manual account disable survives version 6 persistence and bulk enable clears it", () => {
+test("manual account disable survives version 7 persistence and bulk enable clears it", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "scheduler-disabled-"));
     const statePath = path.join(directory, "state.json");
     const first = setup({ statePath }, 1);
     first.disable(0);
     first.close();
     const persisted = JSON.parse(fs.readFileSync(statePath));
-    assert.equal(persisted.version, 6);
+    assert.equal(persisted.version, 7);
     assert.equal(persisted.accounts[0].disabled, true);
 
     const second = setup({ statePath }, 1);
@@ -343,12 +458,12 @@ test("hidden models are filtered only from management snapshots and remain sched
     scheduler.close();
 });
 
-test("hidden models persist in version 6 state and legacy states default to visible", () => {
+test("hidden models persist in version 7 state and legacy states default to visible", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "scheduler-hidden-"));
     const statePath = path.join(directory, "state.json");
     const first = setup({ allocation: { flash: { min: 0, preferred: 1 } }, statePath }, 1);
     first.hideModel("flash");
-    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 6);
+    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 7);
     const second = setup({ allocation: { flash: { min: 0, preferred: 1 } }, statePath }, 1);
     assert.deepEqual(second.hiddenModelsSnapshot(), ["flash"]);
     first.close();
@@ -374,6 +489,62 @@ test("Pacific date keys honor PST, PDT and daylight-saving transitions", () => {
     assert.equal(scheduler.getPacificDateKey(Date.parse("2026-03-08T08:00:00Z")), "2026-03-08");
     assert.equal(scheduler.getPacificDateKey(Date.parse("2026-11-01T09:30:00Z")), "2026-11-01");
     scheduler.close();
+});
+
+test("next Pacific reset honors standard time, daylight time, missing and repeated wall times", () => {
+    assert.equal(
+        calculateNextPacificResetAt(Date.parse("2026-01-15T07:00:00Z"), "00:00"),
+        Date.parse("2026-01-15T08:00:00Z")
+    );
+    assert.equal(
+        calculateNextPacificResetAt(Date.parse("2026-07-15T06:00:00Z"), "00:00"),
+        Date.parse("2026-07-15T07:00:00Z")
+    );
+    assert.equal(
+        calculateNextPacificResetAt(Date.parse("2026-03-08T08:01:00Z"), "02:30"),
+        Date.parse("2026-03-08T10:00:00Z")
+    );
+    assert.equal(
+        calculateNextPacificResetAt(Date.parse("2026-11-01T07:00:00Z"), "01:30"),
+        Date.parse("2026-11-01T08:30:00Z")
+    );
+});
+
+test("daily reset timer fires once per Pacific date, replans, and is cleared on close", () => {
+    let now = Date.parse("2026-01-15T07:59:00Z");
+    const timers = [];
+    const cleared = [];
+    const scheduler = setup(
+        {
+            clearTimer: timer => cleared.push(timer),
+            dailyResetTime: "00:00",
+            now: () => now,
+            setTimer(callback, delay) {
+                const timer = {
+                    callback,
+                    delay,
+                    unref() {
+                        this.unrefCalled = true;
+                    },
+                    unrefCalled: false,
+                };
+                timers.push(timer);
+                return timer;
+            },
+        },
+        1
+    );
+    assert.equal(timers[0].delay, 60000);
+    assert.equal(timers[0].unrefCalled, true);
+    const slot = scheduler.slot(scheduler.account(0), "a");
+    Object.assign(slot, { cooldown_until: now + 600000, last_error: "quota", rate_limited: true });
+    now += 60000;
+    timers[0].callback();
+    assert.equal(slot.cooldown_until, 0);
+    assert.equal(timers.length, 2);
+    assert.equal(timers[1].delay, 24 * 60 * 60 * 1000);
+    scheduler.close();
+    assert.equal(cleared.at(-1), timers[1]);
 });
 
 test("daily attempts count once per lease and roll over without changing cumulative usage", async () => {
@@ -434,6 +605,7 @@ test("account details expose one model list with aggregate 403 and 429 flags", (
     assert.deepEqual(scheduler.accountsOverviewSnapshot().summary, {
         disabled: 0,
         healthy: 0,
+        persistent_403: 0,
         rate_limited: 0,
         risk_controlled: 1,
         total: 1,
@@ -573,10 +745,51 @@ test("quota estimates use valid accounts, hyphen segments and clamp each slot at
 
 test("configuration validates capacity and honors legacy mode", () => {
     assert.equal(loadConfig({ ACCOUNT_ROTATION_STRATEGY: "legacy" }).enabled, false);
+    assert.equal(loadConfig({}).dailyResetEnabled, true);
+    assert.equal(loadConfig({}).dailyResetTime, "00:00");
+    assert.equal(loadConfig({ SCHEDULER_DAILY_RESET_ENABLED: "false" }).dailyResetEnabled, false);
+    assert.equal(loadConfig({ SCHEDULER_DAILY_RESET_ENABLED: "FALSE" }).dailyResetEnabled, true);
+    assert.equal(loadConfig({ SCHEDULER_DAILY_RESET_TIME: "23:59" }).dailyResetTime, "23:59");
+    assert.throws(() => loadConfig({ SCHEDULER_DAILY_RESET_TIME: "24:00" }), /SCHEDULER_DAILY_RESET_TIME/);
+    assert.throws(() => loadConfig({ SCHEDULER_DAILY_RESET_TIME: "1:00" }), /SCHEDULER_DAILY_RESET_TIME/);
+    assert.throws(() => loadConfig({ SCHEDULER_DAILY_RESET_TIME: "" }), /SCHEDULER_DAILY_RESET_TIME/);
     assert.throws(() => loadConfig({ MAX_BROWSER_WORKERS: "0" }));
     assert.throws(() => loadConfig({ MODEL_WORKER_ALLOCATION: '{"a":2}' }));
     assert.throws(() => loadConfig({ MODEL_MAX_CONCURRENCY: '{"a":0}' }));
     assert.equal(loadConfig({ MAX_RETRIES_PER_REQUEST: "0" }).maxRetries, 0);
+});
+
+test("version 6 starts continuous 403 tracking empty while version 7 preserves and validates it", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "scheduler-v7-403-"));
+    const statePath = path.join(directory, "state.json");
+    const first = setup({ statePath }, 1);
+    const lease = await first.acquire("a");
+    first.failure(lease, { status: 403 });
+    const since = lease.account.continuous_403_since;
+    first.release(lease);
+    first.close();
+    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 7);
+
+    const second = setup({ statePath }, 1);
+    assert.equal(second.account(0).continuous_403_since, since);
+    second.close();
+
+    const legacy = JSON.parse(fs.readFileSync(statePath));
+    legacy.version = 6;
+    legacy.accounts[0].continuous_403_since = since;
+    fs.writeFileSync(statePath, JSON.stringify(legacy));
+    const upgraded = setup({ statePath }, 1);
+    assert.equal(upgraded.account(0).continuous_403_since, null);
+    upgraded.close();
+
+    const invalid = JSON.parse(fs.readFileSync(statePath));
+    invalid.accounts[0].continuous_403_since = -1;
+    fs.writeFileSync(statePath, JSON.stringify(invalid));
+    const rejected = setup({ statePath }, 1);
+    assert.equal(rejected.accounts.size, 0);
+    assert.ok(fs.readdirSync(directory).some(name => name.includes(".corrupt-")));
+    rejected.close();
+    fs.rmSync(directory, { recursive: true });
 });
 
 test("corrupt state is backed up and inflight reset does not persist a lock", () => {
@@ -587,7 +800,7 @@ test("corrupt state is backed up and inflight reset does not persist a lock", ()
     assert.equal(scheduler.accounts.size, 0);
     assert.ok(fs.readdirSync(directory).some(name => name.includes(".corrupt-")));
     scheduler.close();
-    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 6);
+    assert.equal(JSON.parse(fs.readFileSync(statePath)).version, 7);
     fs.rmSync(directory, { recursive: true });
 });
 

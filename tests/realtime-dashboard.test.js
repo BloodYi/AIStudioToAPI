@@ -73,15 +73,50 @@ test("dashboard and scheduler detail routes keep heavy fields out of realtime re
     const scheduler = {
         account: index => ({ healthy: true, index, inflight: 0, key: `auth-${index}` }),
         accountsOverviewSnapshot: () => ({
-            accounts: [{ healthy: true, index: 0, inflight: 0, key: "auth-0" }],
+            accounts: [
+                {
+                    continuous_403_duration_ms: 172800000,
+                    continuous_403_since: 1,
+                    healthy: true,
+                    index: 0,
+                    inflight: 0,
+                    key: "auth-0",
+                    persistent_403: true,
+                },
+            ],
             revision: "accounts:1",
-            summary: { disabled: 0, healthy: 1, rate_limited: 0, risk_controlled: 0, total: 1, unhealthy: 0 },
+            summary: {
+                disabled: 0,
+                healthy: 1,
+                persistent_403: 1,
+                rate_limited: 0,
+                risk_controlled: 0,
+                total: 1,
+                unhealthy: 0,
+            },
         }),
-        accountsSnapshot: ids => ({ accounts: ids.map(index => ({ index, models: [] })), revision: "accounts:1" }),
+        accountsSnapshot: ids => ({
+            accounts: ids.map(index => ({
+                continuous_403_duration_ms: 172800000,
+                continuous_403_since: 1,
+                index,
+                models: [],
+                persistent_403: true,
+            })),
+            revision: "accounts:1",
+        }),
         contextsSnapshot: () => ({ contexts: [], revision: "contexts:1" }),
         sequence: 1,
         summarySnapshot: () => ({
-            accounts_summary: { disabled: 0, healthy: 1, rate_limited: 0, risk_controlled: 0, total: 1, unhealthy: 0 },
+            accounts_summary: {
+                disabled: 0,
+                healthy: 1,
+                persistent_403: 1,
+                rate_limited: 0,
+                risk_controlled: 0,
+                total: 1,
+                unhealthy: 0,
+            },
             active_workers: 0,
             contexts_summary: { busy: 0, initializing: 0, max: 1, ready: 0, reconnecting: 0, unavailable: 0 },
             idle_workers: 1,
@@ -161,10 +196,15 @@ test("dashboard and scheduler detail routes keep heavy fields out of realtime re
     for (const field of ["accounts", "contexts", "logs", "records", "workers"])
         assert.equal(Object.hasOwn(dashboard.body.scheduler, field), false);
     assert.equal(dashboard.body.scheduler.accounts_summary.total, 1);
+    assert.equal(dashboard.body.scheduler.accounts_summary.persistent_403, 1);
     const cached = invoke("/api/dashboard/realtime", {}, { "if-none-match": dashboard.headers.ETag });
     assert.equal(cached.statusCode, 304);
-    assert.deepEqual(invoke("/api/scheduler/accounts", { ids: "0" }).body.accounts[0].models, []);
-    assert.equal(invoke("/api/scheduler/accounts").body.summary.total, 1);
+    const detail = invoke("/api/scheduler/accounts", { ids: "0" }).body.accounts[0];
+    assert.deepEqual(detail.models, []);
+    assert.equal(detail.persistent_403, true);
+    const overview = invoke("/api/scheduler/accounts").body;
+    assert.equal(overview.summary.total, 1);
+    assert.equal(overview.accounts[0].continuous_403_since, 1);
     assert.equal(invoke("/api/scheduler/accounts", { ids: "bad" }).statusCode, 400);
 });
 

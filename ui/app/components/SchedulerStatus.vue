@@ -504,6 +504,9 @@
                     <span v-if="summaryCounts.riskControlled > 0" class="status-pill pill-purple">
                         {{ summaryCounts.riskControlled }} 个 403
                     </span>
+                    <span v-if="summaryCounts.persistent403 > 0" class="status-pill pill-persistent-403">
+                        {{ t("schedulerPersistent403Summary", { count: summaryCounts.persistent403 }) }}
+                    </span>
                     <span v-if="summaryCounts.disabled > 0" class="status-pill pill-slate">
                         {{ summaryCounts.disabled }} 个禁用
                     </span>
@@ -538,6 +541,13 @@
                             @click="accountFilter = '403'"
                         >
                             🛡️ {{ t("schedulerFilter403") }} ({{ summaryCounts.riskControlled }})
+                        </button>
+                        <button
+                            class="filter-tab tab-persistent-403"
+                            :class="{ active: accountFilter === 'persistent-403' }"
+                            @click="accountFilter = 'persistent-403'"
+                        >
+                            ⚠️ {{ t("schedulerFilterPersistent403") }} ({{ summaryCounts.persistent403 }})
                         </button>
                         <button
                             class="filter-tab tab-disabled"
@@ -614,6 +624,18 @@
                                 <!-- Concise Badge: strictly clear without verbose text -->
                                 <span class="acc-badge" :class="'badge-' + getAccountState(account)">
                                     {{ getAccountStateLabel(account) }}
+                                </span>
+                                <span
+                                    v-if="account.persistent_403"
+                                    class="acc-badge badge-persistent-403"
+                                    :title="t('schedulerPersistent403Tooltip')"
+                                >
+                                    ⚠
+                                    {{
+                                        t("schedulerPersistent403Badge", {
+                                            duration: formatPersistent403Duration(account),
+                                        })
+                                    }}
                                 </span>
                             </div>
 
@@ -824,6 +846,13 @@ function formatDateTime(val) {
     return `${d.toLocaleDateString()} ${d.toLocaleTimeString()}`;
 }
 
+function formatPersistent403Duration(account) {
+    const duration = Math.max(0, Number(account.continuous_403_duration_ms) || 0);
+    const days = Math.floor(duration / 86400000);
+    const hours = Math.floor((duration % 86400000) / 3600000);
+    return props.t("schedulerPersistent403Duration", { days, hours });
+}
+
 function getQuotaPercent(quota) {
     const total = (quota.tracked_accounts || 0) * (quota.quota_per_account || 0);
     if (!total) return 0;
@@ -954,6 +983,7 @@ const summaryCounts = computed(() => {
         return {
             disabled: overview.disabled || 0,
             healthy: overview.healthy || 0,
+            persistent403: overview.persistent_403 || 0,
             rateLimited: overview.rate_limited || 0,
             riskControlled: overview.risk_controlled || 0,
             total: overview.total || 0,
@@ -963,8 +993,10 @@ const summaryCounts = computed(() => {
     let riskControlled = 0;
     let disabled = 0;
     let healthy = 0;
+    let persistent403 = 0;
 
     for (const acc of accounts.value) {
+        if (acc.persistent_403) persistent403++;
         const state = getAccountState(acc);
         if (state === "disabled") disabled++;
         else if (state === "403") riskControlled++;
@@ -972,7 +1004,7 @@ const summaryCounts = computed(() => {
         else if (state === "healthy") healthy++;
     }
 
-    return { disabled, healthy, rateLimited, riskControlled, total: accounts.value.length };
+    return { disabled, healthy, persistent403, rateLimited, riskControlled, total: accounts.value.length };
 });
 
 const filteredAccounts = computed(() => {
@@ -982,8 +1014,12 @@ const filteredAccounts = computed(() => {
     return accounts.value.filter(acc => {
         // Tab filter
         if (filter !== "all") {
-            const state = getAccountState(acc);
-            if (state !== filter) return false;
+            if (filter === "persistent-403") {
+                if (!acc.persistent_403) return false;
+            } else {
+                const state = getAccountState(acc);
+                if (state !== filter) return false;
+            }
         }
 
         // Query filter
@@ -1035,16 +1071,20 @@ async function fetchAccounts(force = false) {
     accountsController = controller;
     const ids = [...expandedAccounts.value];
     try {
-        const result = await getJson(
-            `/api/scheduler/accounts${ids.length ? `?ids=${ids.join(",")}` : ""}`,
-            controller.signal
-        );
-        if (!result || !accountsOpen.value) return;
-        if (!ids.length) accounts.value = result.accounts || [];
-        else {
-            const details = new Map((result.accounts || []).map(account => [account.index, account]));
-            accounts.value = accounts.value.map(account => details.get(account.index) || account);
-        }
+        const [overview, detailResult] = await Promise.all([
+            getJson("/api/scheduler/accounts", controller.signal),
+            ids.length
+                ? getJson(`/api/scheduler/accounts?ids=${ids.join(",")}`, controller.signal)
+                : Promise.resolve(null),
+        ]);
+        if (!overview || !accountsOpen.value) return;
+        const previous = new Map(accounts.value.map(account => [account.index, account]));
+        const details = new Map((detailResult?.accounts || []).map(account => [account.index, account]));
+        accounts.value = (overview.accounts || []).map(account => {
+            if (details.has(account.index)) return details.get(account.index);
+            const old = previous.get(account.index);
+            return old?.models ? { ...account, models: old.models } : account;
+        });
     } finally {
         if (accountsController === controller) {
             accountsController = null;
@@ -2253,6 +2293,12 @@ async function sendReset(url, body) {
     border-color: #c4b5fd;
 }
 
+.filter-tab.tab-persistent-403.active {
+    background: #fff7ed;
+    color: #c2410c;
+    border-color: #fb923c;
+}
+
 .filter-tab.tab-disabled.active {
     background: #f1f5f9;
     color: #334155;
@@ -2422,6 +2468,13 @@ async function sendReset(url, body) {
     background: #f5f3ff;
     color: #6d28d9;
     border: 1px solid #ddd6fe;
+}
+
+.badge-persistent-403,
+.pill-persistent-403 {
+    background: #fff7ed;
+    color: #9a3412;
+    border: 1px solid #fb923c;
 }
 
 .badge-disabled {

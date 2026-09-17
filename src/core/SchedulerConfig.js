@@ -16,6 +16,10 @@ function loadSchedulerConfig(env = process.env) {
     if (!["least_recently_used", "least_used", "legacy"].includes(strategy)) {
         throw new Error("Invalid ACCOUNT_ROTATION_STRATEGY");
     }
+    const dailyResetTime = env.SCHEDULER_DAILY_RESET_TIME === undefined ? "00:00" : env.SCHEDULER_DAILY_RESET_TIME;
+    if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(dailyResetTime)) {
+        throw new Error("Invalid SCHEDULER_DAILY_RESET_TIME");
+    }
     const legacyContexts = Number.parseInt(env.MAX_CONTEXTS, 10);
     const maxWorkers = integer(
         "MAX_BROWSER_WORKERS",
@@ -65,6 +69,8 @@ function loadSchedulerConfig(env = process.env) {
         contextInitConcurrency: integer("CONTEXT_INIT_CONCURRENCY", 2),
         contextMaxConcurrency,
         contextPoolMinReady,
+        dailyResetEnabled: env.SCHEDULER_DAILY_RESET_ENABLED !== "false",
+        dailyResetTime,
         dynamic: env.ENABLE_DYNAMIC_WORKER_ALLOCATION !== "false",
         enabled: strategy !== "legacy",
         globalConcurrency,

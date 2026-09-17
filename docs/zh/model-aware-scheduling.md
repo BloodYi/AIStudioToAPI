@@ -38,6 +38,8 @@ STREAM_KEEPALIVE_INTERVAL_MS=10000
 RATE_LIMIT_COOLDOWN=3600
 RISK_CONTROL_COOLDOWN=600
 RISK_CONTROL_MAX_COOLDOWN=10800
+SCHEDULER_DAILY_RESET_ENABLED=true
+SCHEDULER_DAILY_RESET_TIME=00:00
 TEMP_ERROR_COOLDOWN=30
 MAX_RETRIES_PER_REQUEST=2
 SCHEDULER_STATE_PATH=data/scheduler-state.json
@@ -65,6 +67,8 @@ SCHEDULER_STATE_PATH=data/scheduler-state.json
 | `RATE_LIMIT_COOLDOWN`              | 429 冷却秒数，默认 3600，不猜测 Google 的日额度重置时刻                                             |
 | `RISK_CONTROL_COOLDOWN`            | HTTP 403 风控初始冷却秒数，默认 600，连续风控按 1、3、6、18 倍退避并带 ±10% 抖动                    |
 | `RISK_CONTROL_MAX_COOLDOWN`        | HTTP 403 风控最大冷却秒数，默认 10800                                                               |
+| `SCHEDULER_DAILY_RESET_ENABLED`    | 是否在每天太平洋时间自动清理可恢复冷却，默认 `true`；仅 `false` 关闭                                |
+| `SCHEDULER_DAILY_RESET_TIME`       | 每日重置时间，固定使用 `America/Los_Angeles` 时区及严格 `HH:mm` 格式，默认 `00:00`                  |
 | `TEMP_ERROR_COOLDOWN`              | 临时错误初始冷却秒数，默认 30，连续失败退避到 60、120，最多 4 倍                                    |
 | `MAX_RETRIES_PER_REQUEST`          | 初次之外的最大重试次数，默认继承旧 `MAX_RETRIES - 1`，未配置时为 2                                  |
 | `SCHEDULER_STATE_PATH`             | 默认工作目录下 `data/scheduler-state.json`                                                          |
@@ -83,6 +87,10 @@ SCHEDULER_STATE_PATH=data/scheduler-state.json
 - page/context/MessageQueue/WebSocket 等本地传输故障：不修改账号×模型 cooldown；尚未输出模型内容时迁移到其他 ready context。
 - 明确登录、cookie 失效或账号暂停：整个账号 unhealthy。context 初始化排队、取消和本地初始化故障不污染模型额度状态；原有 auth 文件过期标记仍然有效。
 - 参数错误不自动切换账号。客户端取消不作为账号故障。
+
+账号从第一次真实上游 403 起开始记录连续观察窗口。若 48 小时内始终没有观察到成功或明确的非 403 上游响应，管理页会显示“长期 403”警示，提示认证信息可能需要删除后重新登录。该警示不参与调度、健康判断或冷却；手动恢复、429 重置、每日重置和服务重启都不会清除它，只有真实成功或明确的非 403 上游结果会清除。
+
+模型感知调度默认每天在太平洋时间 00:00 清除 403、429 和临时错误的当前冷却，以便在 Build 配额日界线后重新探测。自动重置保留人工禁用、账号 unhealthy、模型 unsupported、用量统计、活动租约及长期 403 计时。它使用一次性定时器逐日换算，因此会跟随太平洋夏令时；服务停机期间错过的任务不会补跑。`ACCOUNT_ROTATION_STRATEGY=legacy` 时不创建该任务。
 
 重试发生在真实响应内容输出之前，整个请求不重试同一账号，即使该账号的 auth 文件编号变化。模型池没有任何符合条件的账号时立即返回 503；上游失败之后无法找到下一个账号时保留最后一次上游错误（例如 429）。全局、模型、显式账号并发或 context 容量不足时排队；账号已有在途请求本身不触发排队。队列满返回 429，排队超时返回 504。已经输出流内容后发生错误，只记录状态并沿用原协议错误输出，不重放内容。
 
