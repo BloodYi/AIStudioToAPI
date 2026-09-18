@@ -187,8 +187,8 @@ class StatusRoutes {
                 return res.status(400).json({ error: "Valid account_id and optional model are required" });
             }
             try {
-                scheduler.reset(index, model);
-                res.json({ success: true });
+                const result = scheduler.reset(index, model);
+                res.json({ success: true, ...result });
             } catch (error) {
                 res.status(error.status || 500).json({ error: error.message });
             }

@@ -587,6 +587,7 @@ class ModelScheduler {
                 resetCount++;
             }
         }
+        if (resetCount) this.sequence++;
         this.flush();
         this.drain();
         return resetCount;
@@ -598,7 +599,13 @@ class ModelScheduler {
         // Limit the override to accounts that are currently valid rotation candidates.
         for (const index of this.authSource.getRotationIndices()) {
             const account = this.account(index);
-            if (account.disabled || !account.healthy || account.last_error !== null) {
+            if (
+                account.disabled ||
+                !account.healthy ||
+                account.last_error !== null ||
+                account.disabled_at !== null ||
+                account.disabled_reason !== null
+            ) {
                 account.disabled = false;
                 account.disabled_at = null;
                 account.disabled_reason = null;
@@ -629,6 +636,7 @@ class ModelScheduler {
                 resetModelCount++;
             }
         }
+        if (resetAccountCount || resetModelCount) this.sequence++;
         this.flush();
         this.drain();
         this.browserManager?.handleAccountsEnabled?.();
@@ -701,7 +709,15 @@ class ModelScheduler {
     reset(index, model) {
         const account = this.account(index);
         if (account.inflight) throw schedulerError("Account has active requests", 409);
+        let changed = false;
         if (!model) {
+            changed = Boolean(
+                !account.healthy ||
+                account.last_error !== null ||
+                account.disabled ||
+                account.disabled_at !== null ||
+                account.disabled_reason !== null
+            );
             account.healthy = true;
             account.last_error = null;
             account.disabled = false;
@@ -709,7 +725,17 @@ class ModelScheduler {
             account.disabled_reason = null;
         }
         const slots = model ? [this.slot(account, model)] : Object.values(account.models);
-        for (const slot of slots)
+        for (const slot of slots) {
+            changed ||= Boolean(
+                slot.consecutive_failures ||
+                slot.cooldown_until ||
+                slot.last_error !== null ||
+                slot.last_error_kind !== null ||
+                slot.last_http_status !== null ||
+                slot.rate_limited ||
+                slot.risk_control_failures ||
+                slot.unsupported
+            );
             Object.assign(slot, {
                 consecutive_failures: 0,
                 cooldown_until: 0,
@@ -720,9 +746,12 @@ class ModelScheduler {
                 risk_control_failures: 0,
                 unsupported: false,
             });
+        }
+        if (changed) this.sequence++;
         this.flush();
         this.drain();
         if (!model) this.browserManager?.handleAccountEnabled?.(index);
+        return { account_id: index, changed, scope: model ? "model" : "account", ...(model ? { model } : {}) };
     }
 
     _snapshotModels() {

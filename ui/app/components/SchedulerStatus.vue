@@ -227,20 +227,30 @@
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
                     </svg>
                     <strong>Context 浏览器池详情</strong>
-                    <span class="capacity-pill font-mono"
-                        >{{ contextSummary.ready || 0 }} / {{ contextSummary.max || 0 }} 容量</span
-                    >
+                    <span class="capacity-pill font-mono">
+                        {{ contextSummary.busy || 0 }} / {{ contextSummary.max || 0 }}
+                        {{ t("contextCapacityInUse") }}
+                    </span>
                 </div>
 
                 <div class="header-pills">
+                    <span class="status-pill pill-busy">
+                        <span class="dot dot-busy"></span> {{ t("contextBusy") }} {{ contextSummary.busy || 0 }}
+                    </span>
                     <span class="status-pill pill-ready">
-                        <span class="dot dot-ready"></span> READY {{ contextSummary.ready || 0 }}
+                        <span class="dot dot-ready"></span> {{ t("contextReady") }} {{ contextSummary.ready || 0 }}
                     </span>
                     <span v-if="(contextSummary.initializing || 0) > 0" class="status-pill pill-init">
-                        <span class="dot dot-init"></span> INIT {{ contextSummary.initializing }}
+                        <span class="dot dot-init"></span> {{ t("contextInitializing") }}
+                        {{ contextSummary.initializing }}
+                    </span>
+                    <span v-if="(contextSummary.reconnecting || 0) > 0" class="status-pill pill-reconnecting">
+                        <span class="dot dot-reconnecting"></span> {{ t("contextReconnecting") }}
+                        {{ contextSummary.reconnecting }}
                     </span>
                     <span v-if="(contextSummary.unavailable || 0) > 0" class="status-pill pill-error">
-                        <span class="dot dot-error"></span> {{ contextSummary.unavailable }} 异常故障
+                        <span class="dot dot-error"></span> {{ t("contextUnavailable") }}
+                        {{ contextSummary.unavailable }}
                     </span>
                     <span class="toggle-text">
                         {{ contextsOpen ? t("schedulerCollapseInstanceMatrix") : t("schedulerExpandInstanceMatrix") }}
@@ -252,19 +262,24 @@
             <div class="context-slot-bar-wrap">
                 <div class="context-slot-bar">
                     <div
-                        class="slot-fill slot-unavailable"
-                        :style="{ width: getContextRatio(contextSummary.unavailable) + '%' }"
-                        title="UNAVAILABLE"
-                    ></div>
-                    <div
-                        class="slot-fill slot-ready"
-                        :style="{ width: getContextRatio(contextSummary.ready) + '%' }"
-                        title="READY"
+                        class="slot-fill slot-busy"
+                        :style="{ width: getContextRatio(contextSummary.busy) + '%' }"
+                        :title="`${t('contextBusy')} ${contextSummary.busy || 0}`"
                     ></div>
                     <div
                         class="slot-fill slot-init"
                         :style="{ width: getContextRatio(contextSummary.initializing) + '%' }"
-                        title="INITIALIZING"
+                        :title="`${t('contextInitializing')} ${contextSummary.initializing || 0}`"
+                    ></div>
+                    <div
+                        class="slot-fill slot-reconnecting"
+                        :style="{ width: getContextRatio(contextSummary.reconnecting) + '%' }"
+                        :title="`${t('contextReconnecting')} ${contextSummary.reconnecting || 0}`"
+                    ></div>
+                    <div
+                        class="slot-fill slot-unavailable"
+                        :style="{ width: getContextRatio(contextSummary.unavailable) + '%' }"
+                        :title="`${t('contextUnavailable')} ${contextSummary.unavailable || 0}`"
                     ></div>
                 </div>
             </div>
@@ -877,9 +892,10 @@ function getModelTagClass(modelName) {
 }
 
 function getContextRatio(count) {
-    const max = contextSummary.value.max || 16;
-    if (!max) return 0;
-    return Math.min(100, Math.round(((count || 0) / max) * 100));
+    const max = Number(contextSummary.value.max) || 0;
+    const value = Number(count) || 0;
+    if (max <= 0) return 0;
+    return Math.min(100, Math.max(0, (value / max) * 100));
 }
 
 // Account State Determination
@@ -1198,7 +1214,9 @@ async function resetAllAccounts() {
 }
 
 async function reset(accountId, model) {
-    await sendReset("/api/scheduler/reset", { account_id: accountId, model });
+    const result = await sendReset("/api/scheduler/reset", { account_id: accountId, model });
+    if (!result) return;
+    await fetchAccounts(true);
 }
 
 async function disableAccount(accountId) {
@@ -1878,15 +1896,27 @@ async function sendReset(url, body) {
 }
 
 .pill-ready {
+    background: #f1f5f9;
+    color: #475569;
+    border: 1px solid #cbd5e1;
+}
+
+.pill-busy {
     background: #ecfdf5;
     color: #047857;
     border: 1px solid #a7f3d0;
 }
 
 .pill-init {
-    background: #eff6ff;
-    color: #1d4ed8;
-    border: 1px solid #bfdbfe;
+    background: #fffbeb;
+    color: #b45309;
+    border: 1px solid #fde68a;
+}
+
+.pill-reconnecting {
+    background: #fff7ed;
+    color: #c2410c;
+    border: 1px solid #fed7aa;
 }
 
 .pill-error {
@@ -1914,11 +1944,19 @@ async function sendReset(url, body) {
 }
 
 .dot-ready {
+    background: #94a3b8;
+}
+
+.dot-busy {
     background: #10b981;
 }
 
 .dot-init {
-    background: #3b82f6;
+    background: #f59e0b;
+}
+
+.dot-reconnecting {
+    background: #f97316;
 }
 
 .dot-error {
@@ -1956,12 +1994,16 @@ async function sendReset(url, body) {
     height: 100%;
 }
 
-.slot-ready {
+.slot-busy {
     background: #10b981;
 }
 
 .slot-init {
-    background: #3b82f6;
+    background: #f59e0b;
+}
+
+.slot-reconnecting {
+    background: #f97316;
 }
 
 .slot-unavailable {

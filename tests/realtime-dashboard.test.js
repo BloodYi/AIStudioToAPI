@@ -208,6 +208,92 @@ test("dashboard and scheduler detail routes keep heavy fields out of realtime re
     assert.equal(invoke("/api/scheduler/accounts", { ids: "bad" }).statusCode, 400);
 });
 
+test("account recovery invalidates the scheduler accounts ETag", async () => {
+    const routes = new Map();
+    const app = {};
+    for (const method of ["delete", "get", "post", "put", "use"])
+        app[method] = (route, ...handlers) => routes.set(`${method}:${route}`, handlers);
+
+    let disabled = true;
+    const scheduler = {
+        accountsOverviewSnapshot: () => ({
+            accounts: [{ disabled, healthy: !disabled, index: 0, inflight: 0, key: "auth-0" }],
+            revision: `accounts:${scheduler.sequence}`,
+            summary: {
+                disabled: disabled ? 1 : 0,
+                healthy: disabled ? 0 : 1,
+                persistent_403: 0,
+                rate_limited: 0,
+                risk_controlled: 0,
+                total: 1,
+                unhealthy: 0,
+            },
+        }),
+        reset(index, model) {
+            assert.equal(index, 0);
+            assert.equal(model, undefined);
+            disabled = false;
+            this.sequence++;
+            return { account_id: index, changed: true, scope: "account" };
+        },
+        sequence: 1,
+        workers: [],
+    };
+    const serverSystem = {
+        authSource: { availableIndices: [0] },
+        config: {},
+        distIndexPath: "",
+        logger,
+        requestHandler: {},
+        scheduler,
+    };
+    new StatusRoutes(serverSystem).setupRoutes(app, (req, res, next) => next());
+
+    const invoke = async (method, route, { body, headers = {}, query = {} } = {}) => {
+        const response = {
+            end() {
+                return this;
+            },
+            headers: {},
+            json(value) {
+                this.body = value;
+                return this;
+            },
+            setHeader(name, value) {
+                this.headers[name] = value;
+            },
+            status(code) {
+                this.statusCode = code;
+                return this;
+            },
+            statusCode: 200,
+        };
+        const handlers = routes.get(`${method}:${route}`);
+        const request = { body, headers, query };
+        let index = 0;
+        const next = () => handlers[++index](request, response, next);
+        await handlers[0](request, response, next);
+        return response;
+    };
+
+    const initial = await invoke("get", "/api/scheduler/accounts");
+    assert.equal(initial.statusCode, 200);
+    assert.equal(initial.body.accounts[0].disabled, true);
+    const unchanged = await invoke("get", "/api/scheduler/accounts", {
+        headers: { "if-none-match": initial.headers.ETag },
+    });
+    assert.equal(unchanged.statusCode, 304);
+
+    const recovered = await invoke("post", "/api/scheduler/reset", { body: { account_id: 0 } });
+    assert.deepEqual(recovered.body, { account_id: 0, changed: true, scope: "account", success: true });
+    const refreshed = await invoke("get", "/api/scheduler/accounts", {
+        headers: { "if-none-match": initial.headers.ETag },
+    });
+    assert.equal(refreshed.statusCode, 200);
+    assert.equal(refreshed.body.accounts[0].disabled, false);
+    assert.notEqual(refreshed.headers.ETag, initial.headers.ETag);
+});
+
 test("scheduler model visibility routes authenticate and return stable results", async () => {
     const routes = new Map();
     const app = {};

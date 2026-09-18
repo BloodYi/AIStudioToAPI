@@ -677,8 +677,8 @@
                             <div class="batch-actions">
                                 <el-checkbox
                                     :model-value="isAllSelected"
-                                    :indeterminate="hasSelection && !isAllSelected"
-                                    :disabled="state.accountDetails.length === 0"
+                                    :indeterminate="hasVisibleSelection && !isAllSelected"
+                                    :disabled="filteredAccountDetails.length === 0"
                                     @change="toggleSelectAll"
                                 >
                                     {{ t("selectAll") }}
@@ -735,6 +735,17 @@
                                         <path d="m9 13 3 3 3-3" />
                                     </svg>
                                 </button>
+                            </div>
+                            <div class="account-filters">
+                                <input
+                                    v-model="accountSearchQuery"
+                                    class="account-search-input"
+                                    type="search"
+                                    :placeholder="t('accountSearchPlaceholder')"
+                                />
+                                <el-checkbox v-model="showExpiredOnly">
+                                    {{ t("showExpiredOnly") }}
+                                </el-checkbox>
                             </div>
                             <!-- Right: Add, upload, and deduplicate -->
                             <div class="icon-buttons">
@@ -798,7 +809,7 @@
                         <!-- Account list -->
                         <div class="account-list">
                             <div
-                                v-for="item in state.accountDetails"
+                                v-for="item in filteredAccountDetails"
                                 :key="item.index"
                                 class="account-list-item"
                                 style="cursor: pointer"
@@ -927,6 +938,12 @@
                             </div>
                             <div v-if="state.accountDetails.length === 0" class="account-list-empty">
                                 {{ t("noActiveAccount") }}
+                            </div>
+                            <div v-else-if="filteredAccountDetails.length === 0" class="account-list-empty">
+                                <span>{{ t("noMatchingAccounts") }}</span>
+                                <button class="clear-account-filters" type="button" @click="clearAccountFilters">
+                                    {{ t("clearAccountFilters") }}
+                                </button>
                             </div>
                         </div>
                     </div>
@@ -2801,6 +2818,8 @@ const activeTab = ref("home");
 const isDownloadingUsageStats = ref(false);
 const isImportingUsageStats = ref(false);
 const isUsageStatsTransferBusy = computed(() => isDownloadingUsageStats.value || isImportingUsageStats.value);
+const accountSearchQuery = ref("");
+const showExpiredOnly = ref(false);
 
 // Create reactive version counter
 const langVersion = ref(0);
@@ -3828,9 +3847,24 @@ const formattedLogs = computed(() => {
 // Computed properties for batch selection
 const selectedCount = computed(() => state.selectedAccounts.size);
 const hasSelection = computed(() => state.selectedAccounts.size > 0);
+const filteredAccountDetails = computed(() => {
+    const query = accountSearchQuery.value.trim().toLowerCase();
+    const indexQuery = query.startsWith("#") ? query.slice(1) : query;
+    return state.accountDetails.filter(account => {
+        if (showExpiredOnly.value && account.isExpired !== true) return false;
+        if (!query) return true;
+        return (
+            getAccountDisplayName(account).toLowerCase().includes(query) ||
+            (indexQuery !== "" && String(account.index).includes(indexQuery))
+        );
+    });
+});
+const hasVisibleSelection = computed(() =>
+    filteredAccountDetails.value.some(account => state.selectedAccounts.has(account.index))
+);
 const isAllSelected = computed(() => {
-    if (state.accountDetails.length === 0) return false;
-    return state.accountDetails.every(acc => state.selectedAccounts.has(acc.index));
+    if (filteredAccountDetails.value.length === 0) return false;
+    return filteredAccountDetails.value.every(account => state.selectedAccounts.has(account.index));
 });
 const isAccountSelected = index => state.selectedAccounts.has(index);
 
@@ -3846,12 +3880,17 @@ const toggleSelectAccount = index => {
 // Toggle selection for all accounts
 const toggleSelectAll = () => {
     if (isAllSelected.value) {
-        state.selectedAccounts.clear();
+        filteredAccountDetails.value.forEach(account => state.selectedAccounts.delete(account.index));
     } else {
-        state.accountDetails.forEach(acc => {
-            state.selectedAccounts.add(acc.index);
+        filteredAccountDetails.value.forEach(account => {
+            state.selectedAccounts.add(account.index);
         });
     }
+};
+
+const clearAccountFilters = () => {
+    accountSearchQuery.value = "";
+    showExpiredOnly.value = false;
 };
 
 // Clear selection
@@ -4078,7 +4117,7 @@ const latestVersionFormatted = computed(() => {
 });
 
 // Get display name for account with i18n support
-const getAccountDisplayName = account => {
+function getAccountDisplayName(account) {
     if (account.isInvalid) {
         return t("jsonFormatError");
     }
@@ -4087,7 +4126,7 @@ const getAccountDisplayName = account => {
         return `${name} (${t("duplicateAuthHint", { index: account.canonicalIndex })})`;
     }
     return name;
-};
+}
 
 const addUser = () => {
     router.push("/auth");
@@ -5436,6 +5475,37 @@ watchEffect(() => {
     justify-content: space-between;
 }
 
+.account-filters {
+    display: flex;
+    flex: 1 1 320px;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    min-width: 240px;
+
+    .el-checkbox {
+        margin-right: 0;
+        white-space: nowrap;
+    }
+}
+
+.account-search-input {
+    width: min(100%, 280px);
+    height: 36px;
+    padding: 0 12px;
+    border: 1px solid @border-color;
+    border-radius: 8px;
+    background: @background-white;
+    color: @text-primary;
+    font: inherit;
+    outline: none;
+
+    &:focus {
+        border-color: @primary-color;
+        box-shadow: 0 0 0 2px rgba(var(--color-primary-rgb), 0.12);
+    }
+}
+
 .batch-actions {
     display: flex;
     align-items: center;
@@ -5672,6 +5742,20 @@ watchEffect(() => {
     text-align: center;
     color: @text-secondary;
     font-size: 0.9rem;
+}
+
+.clear-account-filters {
+    margin-left: 8px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: @primary-color;
+    font: inherit;
+    cursor: pointer;
+
+    &:hover {
+        text-decoration: underline;
+    }
 }
 
 .settings-switches {

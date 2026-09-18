@@ -269,9 +269,47 @@ test("manual account disable is lease-safe and only account-wide recovery clears
     );
     scheduler.resetAllRateLimits();
     assert.equal(scheduler.account(0).disabled, true);
-    scheduler.reset(0);
+    const revisionBeforeReset = scheduler.accountsOverviewSnapshot().revision;
+    const sequenceBeforeReset = scheduler.sequence;
+    assert.deepEqual(scheduler.reset(0), { account_id: 0, changed: true, scope: "account" });
     assert.equal(scheduler.account(0).disabled, false);
     assert.equal(scheduler.account(0).disabled_at, null);
+    assert.equal(scheduler.account(0).healthy, true);
+    assert.equal(scheduler.sequence, sequenceBeforeReset + 1);
+    assert.notEqual(scheduler.accountsOverviewSnapshot().revision, revisionBeforeReset);
+    assert.deepEqual(scheduler.reset(0), { account_id: 0, changed: false, scope: "account" });
+    assert.equal(scheduler.sequence, sequenceBeforeReset + 1);
+    scheduler.close();
+});
+
+test("model recovery invalidates account details only when observable state changes", () => {
+    const scheduler = setup({}, 1);
+    const slot = scheduler.slot(scheduler.account(0), "flash");
+    Object.assign(slot, {
+        consecutive_failures: 2,
+        cooldown_until: Date.now() + 60000,
+        last_error: "limited",
+        last_error_kind: "rate_limited",
+        last_http_status: 429,
+        rate_limited: true,
+    });
+    const revision = scheduler.accountsOverviewSnapshot().revision;
+    const sequence = scheduler.sequence;
+    assert.deepEqual(scheduler.reset(0, "flash"), {
+        account_id: 0,
+        changed: true,
+        model: "flash",
+        scope: "model",
+    });
+    assert.equal(scheduler.sequence, sequence + 1);
+    assert.notEqual(scheduler.accountsOverviewSnapshot().revision, revision);
+    assert.deepEqual(scheduler.reset(0, "flash"), {
+        account_id: 0,
+        changed: false,
+        model: "flash",
+        scope: "model",
+    });
+    assert.equal(scheduler.sequence, sequence + 1);
     scheduler.close();
 });
 
@@ -820,7 +858,9 @@ test("bulk 429 reset preserves other failures, statistics and active leases", as
     Object.assign(other, { cooldown_until: Date.now() + 30000, unsupported: true });
     scheduler.account(1).healthy = false;
     const before = { ...other };
+    const sequenceBeforeReset = scheduler.sequence;
     assert.equal(scheduler.resetAllRateLimits(), 2);
+    assert.equal(scheduler.sequence, sequenceBeforeReset + 1);
     for (const index of [0, 1]) {
         const slot = scheduler.account(index).models.limited;
         assert.equal(slot.rate_limited, false);
@@ -832,6 +872,7 @@ test("bulk 429 reset preserves other failures, statistics and active leases", as
     assert.equal(scheduler.account(1).healthy, false);
     assert.equal(active.account.inflight, 1);
     assert.equal(scheduler.resetAllRateLimits(), 0);
+    assert.equal(scheduler.sequence, sequenceBeforeReset + 1);
     scheduler.startAttempt(active);
     scheduler.failure(active, { status: 429 });
     assert.equal(active.slot.rate_limited, true);
@@ -864,7 +905,9 @@ test("enabling all rotation accounts clears scheduler blocks but preserves usage
         success: active.slot.success_count,
     };
 
+    const sequenceBeforeReset = scheduler.sequence;
     assert.deepEqual(scheduler.resetAllAccounts(), { reset_account_count: 1, reset_model_count: 2 });
+    assert.equal(scheduler.sequence, sequenceBeforeReset + 1);
     assert.equal(active.account.healthy, true);
     assert.equal(active.account.last_error, null);
     assert.equal(active.account.inflight, 1);
@@ -885,6 +928,7 @@ test("enabling all rotation accounts clears scheduler blocks but preserves usage
         usageBefore
     );
     assert.deepEqual(scheduler.resetAllAccounts(), { reset_account_count: 0, reset_model_count: 0 });
+    assert.equal(scheduler.sequence, sequenceBeforeReset + 1);
 
     scheduler.failure(active, { status: 403 });
     assert.ok(active.slot.cooldown_until > Date.now());
