@@ -1,15 +1,18 @@
 /**
  * File: src/core/UsageStatsService.js
- * Description: In-memory usage statistics and request history service
+ * Description: SQLite-backed usage statistics and bounded active/recent request state
  *
  * Author: OpenAI Codex
  */
 
 const fs = require("fs");
 const path = require("path");
+const UsageStatsStorage = require("./UsageStatsStorage");
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 class UsageStatsService {
-    constructor(authSource, logger, dataDir, enabled = true) {
+    constructor(authSource, logger, dataDir, enabled = true, storageOptions = {}) {
         this.authSource = authSource;
         this.logger = logger;
         this.dataDir = dataDir || path.join(process.cwd(), "data");
@@ -18,6 +21,19 @@ class UsageStatsService {
         this.appendPromise = Promise.resolve();
         this.isImportingStats = false;
         this.datasetRevision = 1;
+        this.retentionDays = storageOptions.retentionDays ?? 30;
+        this.cleanupIntervalMinutes = storageOptions.cleanupIntervalMinutes ?? 60;
+        this.cleanupBatchSize = storageOptions.cleanupBatchSize ?? 1000;
+        this.dbPath = storageOptions.dbPath || path.join(this.dataDir, "usage-stats.sqlite");
+        this.cleanupState = {
+            error: null,
+            lastAttemptAt: null,
+            lastDeletedRecords: 0,
+            lastSuccessAt: null,
+            nextCleanupAt: null,
+            status: this.enabled && this.retentionDays > 0 ? "idle" : "disabled",
+        };
+        this.storageStatus = "healthy";
 
         if (this.enabled) {
             // Ensure data directory exists
@@ -25,8 +41,15 @@ class UsageStatsService {
                 fs.mkdirSync(this.dataDir, { recursive: true });
             }
 
-            // Load persisted state
-            this._loadFromFile();
+            this.storage = new UsageStatsStorage({
+                cleanupBatchSize: this.cleanupBatchSize,
+                dbPath: this.dbPath,
+                legacyPath: this.statsFilePath,
+                retentionDays: this.retentionDays,
+            });
+            this.ready = this._initializeStorage();
+        } else {
+            this.ready = Promise.resolve();
         }
 
         if (!this.startedAt) {
@@ -66,6 +89,59 @@ class UsageStatsService {
         if (this.sequence === undefined) {
             this.sequence = 0;
         }
+    }
+
+    async _initializeStorage() {
+        try {
+            await this.storage.ready;
+            await this._refreshPersistedSummary();
+            if (this.retentionDays > 0) {
+                await this.runCleanup();
+                this._scheduleCleanup();
+            }
+        } catch (error) {
+            this.storageStatus = "error";
+            this.cleanupState.error = error.message;
+            if (this.logger) this.logger.error(`[UsageStats] SQLite initialization failed: ${error.message}`);
+            throw error;
+        }
+    }
+
+    async _refreshPersistedSummary() {
+        const snapshot = await this.storage.call("summary");
+        this.datasetRevision = snapshot.dataset_revision;
+        this.startedAt = snapshot.startedAt;
+        this.startedAtMs = Date.parse(snapshot.startedAt) || Date.now();
+        this.summary = { ...snapshot.summary };
+        delete this.summary.avgDurationMs;
+        delete this.summary.successRate;
+        delete this.summary.formatBreakdown;
+        delete this.summary.requestCategoryBreakdown;
+        delete this.summary.streamModeBreakdown;
+        delete this.summary.uniqueAccountPairs;
+        this.accountStats = new Map(
+            snapshot.accounts.map(item => [
+                item.accountKey,
+                {
+                    ...item,
+                    modelCounts: Object.fromEntries((item.modelCounts || []).map(model => [model.key, model.count])),
+                },
+            ])
+        );
+        this.modelStats = new Map(
+            snapshot.models.map(item => [
+                item.modelKey,
+                {
+                    ...item,
+                    accountCounts: Object.fromEntries(
+                        (item.accountCounts || []).map(account => [account.key, account])
+                    ),
+                },
+            ])
+        );
+        this.formatStats = new Map(snapshot.summary.formatBreakdown.map(item => [item.key, item]));
+        this.categoryStats = new Map(snapshot.summary.requestCategoryBreakdown.map(item => [item.key, item]));
+        this.streamModeStats = new Map(snapshot.summary.streamModeBreakdown.map(item => [item.key, item]));
     }
 
     startRequest(requestId, meta = {}) {
@@ -188,6 +264,7 @@ class UsageStatsService {
         };
 
         this.records.push(record);
+        if (this.records.length > 1000) this.records.shift();
         this._updateSummary(record);
         this._updateBreakdown(this.formatStats, record.apiFormat);
         this._updateBreakdown(this.categoryStats, record.requestCategory);
@@ -195,14 +272,64 @@ class UsageStatsService {
         this._updateAccountStats(record);
         this._updateModelStats(record);
 
-        // Append record to file (one line per record)
-        this._appendRecord(record);
+        this.appendPromise = this.appendPromise
+            .catch(() => {})
+            .then(() => this._persistRecord(record))
+            .then(result => {
+                if (result.inserted && Number.isSafeInteger(result.id)) {
+                    record.sequence = result.id;
+                    this.sequence = Math.max(this.sequence, result.id);
+                }
+                if (!result.inserted && this.logger)
+                    this.logger.warn(`[UsageStats] Duplicate request ID ignored: ${record.requestId}`);
+            })
+            .catch(error => {
+                this.storageStatus = "error";
+                if (this.logger) this.logger.error(`[UsageStats] Failed to persist request: ${error.message}`);
+            });
 
         return record;
     }
 
+    async _persistRecord(record) {
+        let lastError;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                const result = await this.storage.call("insert", record);
+                this.storageStatus = "healthy";
+                return result;
+            } catch (error) {
+                lastError = error;
+                if (attempt < 3) await new Promise(resolve => setTimeout(resolve, attempt * 50));
+            }
+        }
+        throw lastError;
+    }
+
     getSnapshot() {
         return { ...this.getSummarySnapshot(), records: this.enabled ? this.records.slice().reverse() : [] };
+    }
+
+    async getSummarySnapshotAsync() {
+        if (!this.enabled) return UsageStatsService.createEmptySummarySnapshot();
+        await this.ready;
+        await this.appendPromise.catch(() => {});
+        await this._refreshPersistedSummary();
+        return this.getSummarySnapshot();
+    }
+
+    async queryRecordsAsync(options = {}) {
+        if (!this.enabled)
+            return {
+                dataset_revision: this.datasetRevision,
+                has_more: false,
+                next_cursor: null,
+                records: [],
+                reset: false,
+            };
+        await this.ready;
+        await this.appendPromise.catch(() => {});
+        return this.storage.call("query", options);
     }
 
     getSummarySnapshot() {
@@ -441,7 +568,12 @@ class UsageStatsService {
 
         const importPromise = this.appendPromise
             .catch(() => {})
-            .then(() => this._importJsonlContent(content))
+            .then(() => this.storage.call("import", { content }))
+            .then(async result => {
+                await this._refreshPersistedSummary();
+                this.records = [];
+                return result;
+            })
             .finally(() => {
                 this.isImportingStats = false;
             });
@@ -450,249 +582,92 @@ class UsageStatsService {
         return importPromise;
     }
 
-    /**
-     * Load persisted JSONL records during startup and rebuild derived in-memory
-     * aggregates from the records that can be parsed.
-     */
-    _loadFromFile() {
+    async exportBatch(afterId = 0, limit = 500) {
+        if (!this.enabled) return [];
+        await this.ready;
+        await this.appendPromise.catch(() => {});
+        return this.storage.call("export", { afterId, limit });
+    }
+
+    _scheduleCleanup() {
+        if (!this.enabled || !this.retentionDays || this.cleanupTimer) return;
+        const delay = this.cleanupIntervalMinutes * 60 * 1000;
+        this.cleanupState.nextCleanupAt = new Date(Date.now() + delay).toISOString();
+        this.cleanupTimer = setTimeout(async () => {
+            this.cleanupTimer = null;
+            await this.runCleanup().catch(() => {});
+            this._scheduleCleanup();
+        }, delay);
+        this.cleanupTimer.unref?.();
+    }
+
+    async runCleanup() {
+        if (!this.enabled || !this.retentionDays || this.cleanupState.status === "running") return null;
+        this.cleanupState.status = "running";
+        this.cleanupState.nextCleanupAt = null;
+        this.cleanupState.lastAttemptAt = new Date().toISOString();
+        const started = Date.now();
         try {
-            const { records } = this._readRecordsFromFile();
-            if (records.length === 0 && !fs.existsSync(this.statsFilePath)) return;
-
-            // Recalculate aggregates from all loaded records
-            this._replaceRecords(records);
-            this._recalculateFromRecords();
-
-            if (this.logger) {
-                this.logger.info(`[UsageStats] Loaded ${this.records.length} records from ${this.statsFilePath}`);
+            const result = await this.storage.call("cleanup", { now: started });
+            this.cleanupState.lastDeletedRecords = result.deleted;
+            this.cleanupState.lastSuccessAt = new Date().toISOString();
+            this.cleanupState.error = null;
+            this.cleanupState.status = "idle";
+            if (result.deleted) {
+                this.datasetRevision += 1;
+                this.records = this.records.filter(
+                    record => Date.parse(record.finishedAt) > started - this.retentionDays * DAY_MS
+                );
             }
-        } catch (err) {
-            if (this.logger) {
-                this.logger.warn(`[UsageStats] Failed to load stats file: ${err.message}`);
-            }
+            return result;
+        } catch (error) {
+            this.cleanupState.status = "error";
+            this.cleanupState.error = error.message;
+            if (this.logger) this.logger.error(`[UsageStats] Cleanup failed: ${error.message}`);
+            throw error;
         }
     }
 
-    _appendRecord(record) {
-        if (!this.enabled) return;
-        const line = JSON.stringify(record) + "\n";
-        this.appendPromise = this.appendPromise
-            .catch(() => {})
-            .then(() => fs.promises.appendFile(this.statsFilePath, line, "utf-8"))
-            .catch(err => {
-                if (this.logger) {
-                    this.logger.warn(`[UsageStats] Failed to append record: ${err.message}`);
-                }
-            });
-    }
-
-    /**
-     * Import JSONL content, deduplicate by requestId, merge with current records,
-     * rewrite the file in finishedAt order, and rebuild memory state.
-     */
-    async _importJsonlContent(content) {
-        if (!fs.existsSync(this.dataDir)) {
-            fs.mkdirSync(this.dataDir, { recursive: true });
-        }
-
-        const { records: existingRecords } = await this._readRecordsFromFileAsync();
-        const uniqueExistingRecords = [];
-        const seenRequestIds = new Set();
-        let duplicateCount = 0;
-        let missingRequestIdCount = 0;
-
-        for (const record of existingRecords) {
-            const requestId = this._normalizeRequestId(record.requestId);
-            if (!requestId) {
-                missingRequestIdCount += 1;
-                continue;
-            }
-
-            record.requestId = requestId;
-            if (seenRequestIds.has(requestId)) {
-                duplicateCount += 1;
-                continue;
-            }
-
-            seenRequestIds.add(requestId);
-            uniqueExistingRecords.push(record);
-        }
-
-        const importedRecords = [];
-        let invalidLineCount = 0;
-        const lines = content.split(/\r?\n/);
-
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-
-            let record;
-            try {
-                record = this._normalizeLoadedRecord(JSON.parse(trimmed));
-            } catch {
-                invalidLineCount += 1;
-                continue;
-            }
-
-            const requestId = this._normalizeRequestId(record.requestId);
-            if (!requestId) {
-                missingRequestIdCount += 1;
-                continue;
-            }
-            record.requestId = requestId;
-
-            if (seenRequestIds.has(requestId)) {
-                duplicateCount += 1;
-                continue;
-            }
-
-            seenRequestIds.add(requestId);
-            importedRecords.push(record);
-        }
-
-        const mergedRecords = this._normalizeImportedRecords(uniqueExistingRecords.concat(importedRecords));
-        const fileContent = mergedRecords.map(record => JSON.stringify(record)).join("\n");
-        await fs.promises.writeFile(this.statsFilePath, fileContent ? `${fileContent}\n` : "", "utf-8");
-        this._replaceRecords(mergedRecords);
-        this._recalculateFromRecords({ resetStartedAt: false });
-
-        if (this.logger) {
-            this.logger.info(
-                `[UsageStats] Imported ${importedRecords.length} records from JSONL. ` +
-                    `Skipped ${duplicateCount} duplicates, ${invalidLineCount} invalid lines, ` +
-                    `${missingRequestIdCount} without requestId.`
-            );
-        }
-
+    async getStorageSnapshot() {
+        const serverTime = Date.now();
+        if (!this.enabled)
+            return {
+                backend: "sqlite",
+                cleanup_status: "disabled",
+                enabled: false,
+                server_time: new Date(serverTime).toISOString(),
+                storage_status: "disabled",
+            };
+        await this.ready;
+        const state = await this.storage.call("storage");
         return {
-            duplicateCount,
-            importedCount: importedRecords.length,
-            invalidLineCount,
-            missingRequestIdCount,
-            totalRecords: mergedRecords.length,
+            backend: "sqlite",
+            cleanup_error: this.cleanupState.error,
+            cleanup_interval_minutes: this.cleanupIntervalMinutes,
+            cleanup_status: this.retentionDays ? this.cleanupState.status : "disabled",
+            database_bytes: state.databaseBytes,
+            enabled: true,
+            expiration_cutoff: this.retentionDays
+                ? new Date(serverTime - this.retentionDays * DAY_MS).toISOString()
+                : null,
+            last_cleanup_attempt_at: this.cleanupState.lastAttemptAt,
+            last_cleanup_success_at: this.cleanupState.lastSuccessAt,
+            last_deleted_records: this.cleanupState.lastDeletedRecords,
+            next_cleanup_at: this.retentionDays ? this.cleanupState.nextCleanupAt : null,
+            next_record_expires_at: state.nextRecordExpiresAt,
+            retained_records: state.retainedRecords,
+            retention_days: this.retentionDays,
+            retention_mode: this.retentionDays ? "days" : "forever",
+            server_time: new Date(serverTime).toISOString(),
+            storage_status: this.storageStatus,
+            wal_bytes: state.walBytes,
         };
     }
 
-    /**
-     * Read valid records from the persisted usage-stats JSONL file. Malformed
-     * lines are ignored so one bad line does not prevent loading the rest.
-     */
-    async _readRecordsFromFileAsync() {
-        try {
-            const content = await fs.promises.readFile(this.statsFilePath, "utf-8");
-            return { records: this._parseRecordsContent(content) };
-        } catch (error) {
-            if (error?.code === "ENOENT") {
-                return { records: [] };
-            }
-
-            throw error;
-        }
-    }
-
-    _readRecordsFromFile() {
-        try {
-            const content = fs.readFileSync(this.statsFilePath, "utf-8");
-            return { records: this._parseRecordsContent(content) };
-        } catch (error) {
-            if (error?.code === "ENOENT") {
-                return { records: [] };
-            }
-
-            throw error;
-        }
-    }
-
-    _parseRecordsContent(content) {
-        const records = [];
-        const lines = content.split(/\r?\n/).filter(Boolean);
-        for (const line of lines) {
-            try {
-                records.push(this._normalizeLoadedRecord(JSON.parse(line)));
-            } catch {
-                // Skip malformed lines
-            }
-        }
-
-        return records;
-    }
-
-    /**
-     * Normalize imported data by finished time and assign continuous sequence
-     * numbers from 1..N after records from multiple files have been merged.
-     */
-    _normalizeImportedRecords(records) {
-        return records
-            .map((record, originalIndex) => ({ originalIndex, record }))
-            .sort((a, b) => {
-                const aTime = this._getRecordSortTime(a.record);
-                const bTime = this._getRecordSortTime(b.record);
-                if (aTime !== bTime) return aTime - bTime;
-                return a.originalIndex - b.originalIndex;
-            })
-            .map((item, index) => ({
-                ...item.record,
-                sequence: index + 1,
-            }));
-    }
-
-    /**
-     * Return the timestamp used for import ordering: finishedAt first, then
-     * startedAt, then the previous sequence as a final fallback.
-     */
-    _getRecordSortTime(record) {
-        const finishedAtMs = Date.parse(record?.finishedAt);
-        if (Number.isFinite(finishedAtMs)) return finishedAtMs;
-
-        const startedAtMs = Date.parse(record?.startedAt);
-        if (Number.isFinite(startedAtMs)) return startedAtMs;
-
-        const sequence = Number(record?.sequence);
-        return Number.isFinite(sequence) ? sequence : Number.MAX_SAFE_INTEGER;
-    }
-
-    /**
-     * Replace the in-memory record list and reset sequence to the highest record
-     * sequence so new records continue after the current data set.
-     */
-    _replaceRecords(records) {
-        this.records = records;
-        this.datasetRevision = (this.datasetRevision || 0) + 1;
-        this.sequence = 0;
-        for (const record of records) {
-            if (record.sequence > this.sequence) {
-                this.sequence = record.sequence;
-            }
-        }
-    }
-
-    _recalculateFromRecords(options = {}) {
-        const { resetStartedAt = true } = options;
-        if (resetStartedAt) {
-            this.startedAtMs = Date.now();
-            this.startedAt = new Date(this.startedAtMs).toISOString();
-        }
-        this.summary = {
-            abortedCount: 0,
-            errorCount: 0,
-            successCount: 0,
-            totalDurationMs: 0,
-            totalRequests: 0,
-        };
-        this.accountStats = new Map();
-        this.formatStats = new Map();
-        this.categoryStats = new Map();
-        this.streamModeStats = new Map();
-        this.modelStats = new Map();
-
-        for (const record of this.records) {
-            this._updateSummary(record);
-            this._updateBreakdown(this.formatStats, record.apiFormat);
-            this._updateBreakdown(this.categoryStats, record.requestCategory);
-            this._updateBreakdown(this.streamModeStats, record.streamMode);
-            this._updateAccountStats(record);
-            this._updateModelStats(record);
-        }
+    async close() {
+        if (this.cleanupTimer) clearTimeout(this.cleanupTimer);
+        await this.appendPromise.catch(() => {});
+        await this.storage?.close();
     }
 
     _pushAttempt(tracker, authIndex, accountName) {
@@ -818,24 +793,6 @@ class UsageStatsService {
     _normalizeDurationMs(value) {
         const durationMs = Number(value);
         return Number.isFinite(durationMs) && durationMs >= 0 ? durationMs : 0;
-    }
-
-    _normalizeLoadedRecord(record) {
-        return {
-            ...record,
-            durationMs: this._normalizeDurationMs(record?.durationMs),
-            outcome: this._normalizeOutcome(record?.outcome),
-            statusCode: Number.isFinite(Number(record?.statusCode)) ? Number(record.statusCode) : null,
-        };
-    }
-
-    /**
-     * Normalize requestId for import deduplication. Non-string IDs are treated
-     * as missing so they cannot be used as merge keys.
-     */
-    _normalizeRequestId(value) {
-        if (typeof value !== "string") return "";
-        return value.trim();
     }
 
     _normalizeAuthIndex(value) {

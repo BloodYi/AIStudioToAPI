@@ -3,6 +3,9 @@
     "version": "1.3.7",
     "author": "Ellinav, iBenzene, bbbugg",
     "description": "Encapsulate Gemini models on AI Studio as API services.",
+    "engines": {
+        "node": ">=22.13.0"
+    },
     "main": "main.js",
     "scripts": {
         "dev": "concurrently --kill-others --handle-input \"npm run dev:server\" \"npm run dev:ui\"",
@@ -28,7 +31,7 @@
         "lint:css:fix": "stylelint \"{ui,ui-public}/**/*.{css,less}\" --fix",
         "format": "prettier --write .",
         "format:check": "prettier --check .",
-        "test": "node tests/model-scheduler.test.js && node tests/scheduled-request.test.js && node tests/browser-workers.test.js && node tests/realtime-dashboard.test.js && node tests/public-dashboard.test.js"
+        "test": "node tests/model-scheduler.test.js && node tests/scheduled-request.test.js && node tests/browser-workers.test.js && node tests/realtime-dashboard.test.js && node tests/public-dashboard.test.js && node tests/sqlite-storage.test.js"
     },
     "dependencies": {
         "archiver": "^7.0.1",

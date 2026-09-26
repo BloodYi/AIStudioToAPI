@@ -43,7 +43,8 @@ class ProxyServerSystem extends EventEmitter {
             this.authSource,
             this.logger,
             path.join(process.cwd(), "data"),
-            this.config.enableUsageStats
+            this.config.enableUsageStats,
+            this.config.usageStorage
         );
 
         // Create ConnectionRegistry with lightweight reconnect callback
@@ -124,6 +125,7 @@ class ProxyServerSystem extends EventEmitter {
 
     async start(initialAuthIndex = null) {
         this.logger.info("[System] Starting flexible startup process...");
+        await this.usageStatsService.ready;
         await this._startHttpServer();
         try {
             await this._startWebSocketServer();
@@ -667,6 +669,8 @@ class ProxyServerSystem extends EventEmitter {
         if (this.browserManager) {
             await this.browserManager.closeBrowser();
         }
+
+        await this.usageStatsService?.close();
 
         await this._closeNetworkServers();
         this.logger.info("[System] Shutdown complete");

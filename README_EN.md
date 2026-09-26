@@ -58,7 +58,7 @@ A tool that wraps the Google AI Studio Build App web interface to provide OpenAI
    The API server will be available at `http://localhost:7860`
 
    After the service starts, you can access `http://localhost:7860` in your browser to open the web console homepage, where you can view account status and service status.
-   Request usage statistics are persisted locally at `/data/usage-stats.jsonl`.
+   Request usage statistics are persisted locally at `/data/usage-stats.sqlite`; legacy JSONL is migrated on first startup and retained as a backup.
 
 5. Update to the latest version (for existing local deployments):
 
@@ -96,7 +96,7 @@ Parameters:
 
 - `-p 7860:7860`: API server port (if using a reverse proxy, strongly consider `127.0.0.1:7860`)
 - `-v /path/to/auth:/app/configs/auth`: Mount directory containing auth files
-- `-v /path/to/data:/app/data`: Mount persistent data directory for usage statistics (`/app/data/usage-stats.jsonl`)
+- `-v /path/to/data:/app/data`: Mount the persistent statistics directory (`/app/data/usage-stats.sqlite` and its WAL files)
 - `-e API_KEYS`: Comma-separated list of API keys for authentication
 - `-e TZ=America/New_York`: Timezone for logs (optional, defaults to system timezone)
 
@@ -281,16 +281,20 @@ Usage:
 
 #### 🗒️ Other Configuration
 
-| Variable                    | Description                                                                                                                                                                           | Default       |
-| :-------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :------------ |
-| `STREAMING_MODE`            | Streaming mode. `real` for real streaming, `fake` for fake streaming.                                                                                                                 | `real`        |
-| `ENABLE_USAGE_STATS`        | Whether to enable request usage statistics. Defaults to enabled. Set to `false` to skip loading local stats, skip writing stats, and make `/api/usage-stats` return an empty payload. | `true`        |
-| `SAFETY_SETTINGS_THRESHOLD` | Safety settings level. Official docs: [Safety settings](https://ai.google.dev/gemini-api/docs/safety-settings)                                                                        | `OFF`         |
-| `FORCE_THINKING`            | Force enable thinking mode for all requests.                                                                                                                                          | `false`       |
-| `FORCE_WEB_SEARCH`          | Force enable web search for all requests.                                                                                                                                             | `false`       |
-| `FORCE_CODE_EXECUTION`      | Force enable code execution for all requests.                                                                                                                                         | `false`       |
-| `FORCE_URL_CONTEXT`         | Force enable URL context for all requests.                                                                                                                                            | `false`       |
-| `CAMOUFOX_EXECUTABLE_PATH`  | Path to the Camoufox browser executable (supports both absolute and relative paths). Only required if manually downloaded.                                                            | Auto-detected |
+| Variable                             | Description                                                                                                                                                                           | Default                     |
+| :----------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :-------------------------- |
+| `STREAMING_MODE`                     | Streaming mode. `real` for real streaming, `fake` for fake streaming.                                                                                                                 | `real`                      |
+| `ENABLE_USAGE_STATS`                 | Whether to enable request usage statistics. Defaults to enabled. Set to `false` to skip loading local stats, skip writing stats, and make `/api/usage-stats` return an empty payload. | `true`                      |
+| `USAGE_DB_PATH`                      | SQLite usage database path. Relative paths resolve from the process working directory.                                                                                                | `./data/usage-stats.sqlite` |
+| `USAGE_LOG_RETENTION_DAYS`           | Request-detail retention in days; `0` retains details forever. Aggregates are not removed.                                                                                            | `30`                        |
+| `USAGE_LOG_CLEANUP_INTERVAL_MINUTES` | Expired-detail cleanup interval in minutes.                                                                                                                                           | `60`                        |
+| `USAGE_LOG_CLEANUP_BATCH_SIZE`       | Maximum requests removed per short transaction.                                                                                                                                       | `1000`                      |
+| `SAFETY_SETTINGS_THRESHOLD`          | Safety settings level. Official docs: [Safety settings](https://ai.google.dev/gemini-api/docs/safety-settings)                                                                        | `OFF`                       |
+| `FORCE_THINKING`                     | Force enable thinking mode for all requests.                                                                                                                                          | `false`                     |
+| `FORCE_WEB_SEARCH`                   | Force enable web search for all requests.                                                                                                                                             | `false`                     |
+| `FORCE_CODE_EXECUTION`               | Force enable code execution for all requests.                                                                                                                                         | `false`                     |
+| `FORCE_URL_CONTEXT`                  | Force enable URL context for all requests.                                                                                                                                            | `false`                     |
+| `CAMOUFOX_EXECUTABLE_PATH`           | Path to the Camoufox browser executable (supports both absolute and relative paths). Only required if manually downloaded.                                                            | Auto-detected               |
 
 ### ⚡ Account Auto-fill
 

@@ -327,19 +327,32 @@ class StatusRoutes {
             res.json(this._getStatusData());
         });
 
-        app.get("/api/usage-stats", isAuthenticated, (req, res) => {
-            const snapshot = this.serverSystem.usageStatsService?.getSnapshot();
-            res.json(snapshot || UsageStatsService.createEmptySnapshot());
-        });
-
-        app.get("/api/usage-stats/summary", isAuthenticated, (req, res) => {
-            const snapshot = this.serverSystem.usageStatsService?.getSummarySnapshot();
-            res.json(snapshot || UsageStatsService.createEmptySummarySnapshot());
-        });
-
-        app.get("/api/usage-stats/records", isAuthenticated, (req, res) => {
+        app.get("/api/usage-stats", isAuthenticated, async (req, res) => {
             try {
-                const result = this.serverSystem.usageStatsService?.queryRecords(req.query) || {
+                const service = this.serverSystem.usageStatsService;
+                if (!service) return res.json(UsageStatsService.createEmptySnapshot());
+                const [summary, records] = await Promise.all([
+                    service.getSummarySnapshotAsync(),
+                    service.queryRecordsAsync({ limit: 100 }),
+                ]);
+                res.json({ ...summary, records: records.records, records_limited: true });
+            } catch (error) {
+                res.status(error.status || 500).json({ error: error.message });
+            }
+        });
+
+        app.get("/api/usage-stats/summary", isAuthenticated, async (req, res) => {
+            try {
+                const snapshot = await this.serverSystem.usageStatsService?.getSummarySnapshotAsync();
+                res.json(snapshot || UsageStatsService.createEmptySummarySnapshot());
+            } catch (error) {
+                res.status(error.status || 500).json({ error: error.message });
+            }
+        });
+
+        app.get("/api/usage-stats/records", isAuthenticated, async (req, res) => {
+            try {
+                const result = (await this.serverSystem.usageStatsService?.queryRecordsAsync(req.query)) || {
                     dataset_revision: 0,
                     has_more: false,
                     next_cursor: null,
@@ -347,6 +360,14 @@ class StatusRoutes {
                     reset: false,
                 };
                 res.json(result);
+            } catch (error) {
+                res.status(error.status || 500).json({ error: error.message });
+            }
+        });
+
+        app.get("/api/usage-stats/storage", isAuthenticated, async (req, res) => {
+            try {
+                res.json(await this.serverSystem.usageStatsService.getStorageSnapshot());
             } catch (error) {
                 res.status(error.status || 500).json({ error: error.message });
             }
@@ -373,14 +394,8 @@ class StatusRoutes {
                 if (usageStatsService.isImportingStats) {
                     return res.status(409).json({ message: "usageStatsImportInProgress" });
                 }
-                const statsFilePath =
-                    usageStatsService?.statsFilePath || path.join(process.cwd(), "data", "usage-stats.jsonl");
-
-                if (usageStatsService?.appendPromise) {
-                    await usageStatsService.appendPromise.catch(() => {});
-                }
-
-                if (!fs.existsSync(statsFilePath)) {
+                const storage = await usageStatsService.getStorageSnapshot();
+                if (!storage.retained_records) {
                     return res.status(404).json({ message: "usageStatsDownloadNoData" });
                 }
 
@@ -389,7 +404,20 @@ class StatusRoutes {
                 }
 
                 res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
-                res.sendFile(statsFilePath);
+                res.setHeader("Content-Disposition", 'attachment; filename="usage-stats.jsonl"');
+                let afterId = 0;
+                while (!res.destroyed) {
+                    const records = await usageStatsService.exportBatch(afterId, 500);
+                    if (!records.length) break;
+                    for (const record of records) {
+                        afterId = record.sequence;
+                        if (!res.write(`${JSON.stringify(record)}\n`)) {
+                            await new Promise(resolve => res.once("drain", resolve));
+                        }
+                    }
+                    if (records.length < 500) break;
+                }
+                res.end();
             } catch (error) {
                 this.logger.error(`[WebUI] Failed to download usage stats: ${error.message}`);
                 res.status(500).json({ error: error.message, message: "usageStatsDownloadFailed" });
@@ -417,10 +445,12 @@ class StatusRoutes {
                 const result = await usageStatsService.importJsonl(content);
                 res.json({
                     duplicateCount: result.duplicateCount,
+                    expiredSkipped: result.expiredSkipped,
                     importedCount: result.importedCount,
                     invalidLineCount: result.invalidLineCount,
                     message: "usageStatsImportSuccess",
                     missingRequestIdCount: result.missingRequestIdCount,
+                    purgedHistorySkipped: result.purgedHistorySkipped,
                     totalRecords: result.totalRecords,
                 });
             } catch (error) {

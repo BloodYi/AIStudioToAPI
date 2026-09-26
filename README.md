@@ -58,7 +58,7 @@
    API 服务将在 `http://localhost:7860` 上运行。
 
    服务启动后，您可以在浏览器中访问 `http://localhost:7860` 打开 Web 控制台主页，在这里可以查看账号状态和服务状态。
-   请求统计数据会持久化保存到 `/data/usage-stats.jsonl`。
+   请求统计数据会持久化保存到 `/data/usage-stats.sqlite`；旧的 JSONL 会在首次启动时自动迁移并保留为备份。
 
 5. 更新到最新版本（已有本地部署时）：
 
@@ -96,7 +96,7 @@ docker run -d \
 
 - `-p 7860:7860`：API 服务器端口（如果使用反向代理，强烈建议改成 `127.0.0.1:7860`）
 - `-v /path/to/auth:/app/configs/auth`：挂载包含认证文件的目录
-- `-v /path/to/data:/app/data`：挂载统计数据持久化目录（`/app/data/usage-stats.jsonl`）
+- `-v /path/to/data:/app/data`：挂载统计数据持久化目录（`/app/data/usage-stats.sqlite` 及 WAL 文件）
 - `-e API_KEYS`：用于身份验证的 API 密钥列表（使用逗号分隔）
 - `-e TZ=Asia/Shanghai`：时区设置（可选，默认使用系统时区）
 
@@ -289,16 +289,20 @@ services:
 
 #### 🗒️ 其他配置
 
-| 变量名                      | 描述                                                                                                        | 默认值   |
-| :-------------------------- | :---------------------------------------------------------------------------------------------------------- | :------- |
-| `STREAMING_MODE`            | 流式传输模式。`real` 为真流式，`fake` 为假流式。                                                            | `real`   |
-| `ENABLE_USAGE_STATS`        | 是否启用请求统计。默认为启用；设为 `false` 后，不读取本地统计、不写入统计，`/api/usage-stats` 返回空数据。  | `true`   |
-| `SAFETY_SETTINGS_THRESHOLD` | 安全设置的等级。官方说明：[Safety settings](https://ai.google.dev/gemini-api/docs/safety-settings?hl=zh-cn) | `OFF`    |
-| `FORCE_THINKING`            | 强制为所有请求启用思考模式。                                                                                | `false`  |
-| `FORCE_WEB_SEARCH`          | 强制为所有请求启用网络搜索。                                                                                | `false`  |
-| `FORCE_CODE_EXECUTION`      | 强制为所有请求启用代码执行。                                                                                | `false`  |
-| `FORCE_URL_CONTEXT`         | 强制为所有请求启用 URL 上下文。                                                                             | `false`  |
-| `CAMOUFOX_EXECUTABLE_PATH`  | Camoufox 浏览器的可执行文件路径（支持绝对或相对路径）。仅在手动下载浏览器时需配置。                         | 自动检测 |
+| 变量名                               | 描述                                                                                                        | 默认值                      |
+| :----------------------------------- | :---------------------------------------------------------------------------------------------------------- | :-------------------------- |
+| `STREAMING_MODE`                     | 流式传输模式。`real` 为真流式，`fake` 为假流式。                                                            | `real`                      |
+| `ENABLE_USAGE_STATS`                 | 是否启用请求统计。默认为启用；设为 `false` 后，不读取本地统计、不写入统计，`/api/usage-stats` 返回空数据。  | `true`                      |
+| `USAGE_DB_PATH`                      | SQLite 统计数据库路径；相对路径以进程工作目录解析。                                                         | `./data/usage-stats.sqlite` |
+| `USAGE_LOG_RETENTION_DAYS`           | 请求明细保留天数，`0` 表示永久保留；汇总不会随明细清理。                                                    | `30`                        |
+| `USAGE_LOG_CLEANUP_INTERVAL_MINUTES` | 过期明细自动清理检查间隔（分钟）。                                                                          | `60`                        |
+| `USAGE_LOG_CLEANUP_BATCH_SIZE`       | 每个短事务最多删除的请求条数。                                                                              | `1000`                      |
+| `SAFETY_SETTINGS_THRESHOLD`          | 安全设置的等级。官方说明：[Safety settings](https://ai.google.dev/gemini-api/docs/safety-settings?hl=zh-cn) | `OFF`                       |
+| `FORCE_THINKING`                     | 强制为所有请求启用思考模式。                                                                                | `false`                     |
+| `FORCE_WEB_SEARCH`                   | 强制为所有请求启用网络搜索。                                                                                | `false`                     |
+| `FORCE_CODE_EXECUTION`               | 强制为所有请求启用代码执行。                                                                                | `false`                     |
+| `FORCE_URL_CONTEXT`                  | 强制为所有请求启用 URL 上下文。                                                                             | `false`                     |
+| `CAMOUFOX_EXECUTABLE_PATH`           | Camoufox 浏览器的可执行文件路径（支持绝对或相对路径）。仅在手动下载浏览器时需配置。                         | 自动检测                    |
 
 ### ⚡ 账号自动填充
 

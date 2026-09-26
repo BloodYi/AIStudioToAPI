@@ -48,6 +48,12 @@ class ConfigLoader {
             streamingMode: "real",
             streamTimeoutMs: 60000,
             switchOnUses: 40,
+            usageStorage: {
+                cleanupBatchSize: 1000,
+                cleanupIntervalMinutes: 60,
+                dbPath: path.join(process.cwd(), "data", "usage-stats.sqlite"),
+                retentionDays: 30,
+            },
             wsPort: 9998,
         };
 
@@ -163,6 +169,33 @@ class ConfigLoader {
             config.enableAuthUpdate = process.env.ENABLE_AUTH_UPDATE.toLowerCase() !== "false";
         if (process.env.ENABLE_USAGE_STATS)
             config.enableUsageStats = process.env.ENABLE_USAGE_STATS.toLowerCase() !== "false";
+        const strictInteger = (name, defaultValue, { allowZero = false, max = Number.MAX_SAFE_INTEGER } = {}) => {
+            if (process.env[name] === undefined) return defaultValue;
+            const raw = String(process.env[name]).trim();
+            const value = Number(raw);
+            if (
+                !/^\d+$/.test(raw) ||
+                !Number.isSafeInteger(value) ||
+                value > max ||
+                (allowZero ? value < 0 : value < 1)
+            ) {
+                throw new Error(`Invalid ${name}: expected ${allowZero ? "a non-negative" : "a positive"} integer`);
+            }
+            return value;
+        };
+        config.usageStorage.retentionDays = strictInteger("USAGE_LOG_RETENTION_DAYS", 30, {
+            allowZero: true,
+            max: Math.floor(Number.MAX_SAFE_INTEGER / 86400000),
+        });
+        config.usageStorage.cleanupIntervalMinutes = strictInteger("USAGE_LOG_CLEANUP_INTERVAL_MINUTES", 60, {
+            max: Math.floor(2147483647 / 60000),
+        });
+        config.usageStorage.cleanupBatchSize = strictInteger("USAGE_LOG_CLEANUP_BATCH_SIZE", 1000);
+        if (process.env.USAGE_DB_PATH !== undefined) {
+            const rawPath = String(process.env.USAGE_DB_PATH).trim();
+            if (!rawPath) throw new Error("Invalid USAGE_DB_PATH: expected a non-empty path");
+            config.usageStorage.dbPath = path.resolve(process.cwd(), rawPath);
+        }
 
         if (config.publicDashboard.enabled && [config.httpPort, config.wsPort].includes(config.publicDashboard.port)) {
             throw new Error("PUBLIC_DASHBOARD_PORT must differ from PORT and the internal WebSocket port");
@@ -250,6 +283,10 @@ class ConfigLoader {
         this.logger.info(`  Default Safety Threshold: ${config.safetySettingsThreshold}`);
         this.logger.info(`  Auto Update Auth: ${config.enableAuthUpdate}`);
         this.logger.info(`  Usage Stats: ${config.enableUsageStats}`);
+        if (config.enableUsageStats) {
+            this.logger.info(`  Usage Detail Retention: ${config.usageStorage.retentionDays || "Forever"}`);
+            this.logger.info(`  Usage Cleanup Interval: ${config.usageStorage.cleanupIntervalMinutes} minutes`);
+        }
         this.logger.info(
             `  Public Dashboard: ${
                 config.publicDashboard.enabled

@@ -1,6 +1,6 @@
 # SQLite 请求统计存储与日志过期管理改造设计
 
-状态：待实施。本文描述目标方案，所列新增配置、表和接口尚未实现。
+状态：已实施。本文同时作为存储结构、配置与运维行为说明。
 
 ## 1. 目标与范围
 
@@ -18,17 +18,17 @@
 
 ## 2. 现状与数据去向
 
-| 数据 | 当前方式 | 本期目标 |
-| --- | --- | --- |
-| 请求明细 | `data/usage-stats.jsonl` 逐行追加，全部记录保存在内存 | `requests` 表，数据库筛选和游标分页 |
-| 每次请求尝试的账号 | 请求记录内的 `attempts` 数组，目前只包含 `accountKey` | `request_attempts` 子表，保留顺序 |
-| 全站与各维度统计 | 内存聚合，启动读取全部 JSONL 重建 | 独立每日与累计汇总，不依赖旧明细存续 |
-| 正在处理的请求 | `activeRequests` 内存 Map | 继续放内存，完成后提交数据库 |
-| 系统/API 过程日志 | 控制台输出，管理页内存缓冲最多 1000 条 | 保持现状，Docker 设置容量轮转 |
-| 调度状态 | `data/scheduler-state.json`，路径可配置，替换快照 | 保持现状，不适用日志过期规则 |
-| 代理绑定 | `proxy_mapping.json`，替换快照 | 保持现状 |
-| 认证数据 | 认证 JSON 文件 | 保持现状 |
-| 调试截图和 HTML | 独立磁盘文件 | 后续单独制定清理策略 |
+| 数据               | 当前方式                                              | 本期目标                             |
+| ------------------ | ----------------------------------------------------- | ------------------------------------ |
+| 请求明细           | `data/usage-stats.jsonl` 逐行追加，全部记录保存在内存 | `requests` 表，数据库筛选和游标分页  |
+| 每次请求尝试的账号 | 请求记录内的 `attempts` 数组，目前只包含 `accountKey` | `request_attempts` 子表，保留顺序    |
+| 全站与各维度统计   | 内存聚合，启动读取全部 JSONL 重建                     | 独立每日与累计汇总，不依赖旧明细存续 |
+| 正在处理的请求     | `activeRequests` 内存 Map                             | 继续放内存，完成后提交数据库         |
+| 系统/API 过程日志  | 控制台输出，管理页内存缓冲最多 1000 条                | 保持现状，Docker 设置容量轮转        |
+| 调度状态           | `data/scheduler-state.json`，路径可配置，替换快照     | 保持现状，不适用日志过期规则         |
+| 代理绑定           | `proxy_mapping.json`，替换快照                        | 保持现状                             |
+| 认证数据           | 认证 JSON 文件                                        | 保持现状                             |
+| 调试截图和 HTML    | 独立磁盘文件                                          | 后续单独制定清理策略                 |
 
 主要改造入口：
 
@@ -44,15 +44,15 @@
 
 使用独立字段保存查询维度，避免把整条记录作为 JSON 字符串存入单列。
 
-| 字段组 | 建议字段 | 说明 |
-| --- | --- | --- |
-| 标识 | `id`、`request_id` | `id` 为持久递增序号；`request_id` 唯一 |
-| 时间 | `started_at_ms`、`finished_at_ms`、`duration_ms` | UTC 毫秒整数；接口按原有约定返回时间 |
-| 接口 | `method`、`path`、`api_format`、`request_category` | 对应已有字段 |
-| 模型与模式 | `model`、`is_streaming`、`stream_mode` | 保留现有流式分类 |
-| 客户端 | `client_ip` | 仅管理接口可见，不进入公开看板 |
-| 账号 | `account_key`、`initial_auth_index`、`initial_account_name`、`final_auth_index`、`final_account_name` | 保存请求发生时的账号信息 |
-| 结果 | `outcome`、`status_code`、`error_message`、`attempt_count` | 成功、失败、中断口径保持一致 |
+| 字段组     | 建议字段                                                                                              | 说明                                   |
+| ---------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------- |
+| 标识       | `id`、`request_id`                                                                                    | `id` 为持久递增序号；`request_id` 唯一 |
+| 时间       | `started_at_ms`、`finished_at_ms`、`duration_ms`                                                      | UTC 毫秒整数；接口按原有约定返回时间   |
+| 接口       | `method`、`path`、`api_format`、`request_category`                                                    | 对应已有字段                           |
+| 模型与模式 | `model`、`is_streaming`、`stream_mode`                                                                | 保留现有流式分类                       |
+| 客户端     | `client_ip`                                                                                           | 仅管理接口可见，不进入公开看板         |
+| 账号       | `account_key`、`initial_auth_index`、`initial_account_name`、`final_auth_index`、`final_account_name` | 保存请求发生时的账号信息               |
+| 结果       | `outcome`、`status_code`、`error_message`、`attempt_count`                                            | 成功、失败、中断口径保持一致           |
 
 初始索引：`request_id` 唯一索引，以及 `finished_at_ms`、`(model, id)`、`(account_key, id)`。其他索引结合实际查询计划补充，不为每种字段组合创建索引。
 
@@ -90,12 +90,12 @@
 
 ### 4.1 新增配置
 
-| 配置项 | 默认值 | 语义 |
-| --- | --- | --- |
-| `USAGE_DB_PATH` | `./data/usage-stats.sqlite` | 数据库文件路径，相对路径以进程工作目录解析 |
-| `USAGE_LOG_RETENTION_DAYS` | `30` | 请求明细保留天数；正整数；`0` 表示永久保留 |
-| `USAGE_LOG_CLEANUP_INTERVAL_MINUTES` | `60` | 自动清理检查间隔，正整数分钟 |
-| `USAGE_LOG_CLEANUP_BATCH_SIZE` | `1000` | 单次删除事务最多处理的请求条数，正整数 |
+| 配置项                               | 默认值                      | 语义                                       |
+| ------------------------------------ | --------------------------- | ------------------------------------------ |
+| `USAGE_DB_PATH`                      | `./data/usage-stats.sqlite` | 数据库文件路径，相对路径以进程工作目录解析 |
+| `USAGE_LOG_RETENTION_DAYS`           | `30`                        | 请求明细保留天数；正整数；`0` 表示永久保留 |
+| `USAGE_LOG_CLEANUP_INTERVAL_MINUTES` | `60`                        | 自动清理检查间隔，正整数分钟               |
+| `USAGE_LOG_CLEANUP_BATCH_SIZE`       | `1000`                      | 单次删除事务最多处理的请求条数，正整数     |
 
 现有 `ENABLE_USAGE_STATS=false` 时，不读写统计数据库、不迁移、不启动清理；管理面板显示“使用统计已关闭”，已有磁盘数据保持原样。
 

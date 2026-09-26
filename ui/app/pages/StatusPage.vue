@@ -2510,6 +2510,31 @@
                 </div>
 
                 <div class="full-width-section">
+                    <section class="status-card storage-retention-card">
+                        <div class="card-header-v2">
+                            <h3 class="card-title-usage">{{ t("logRetention") }}</h3>
+                        </div>
+                        <div v-if="!storageState.enabled" class="empty-state">{{ t("usageStatsDisabled") }}</div>
+                        <template v-else>
+                            <div class="storage-retention-grid">
+                                <span>{{ t("requestDetails") }}</span
+                                ><strong>{{ storageRetentionText }}</strong> <span>{{ t("automaticCleanup") }}</span
+                                ><strong>{{ storageCleanupIntervalText }}</strong> <span>{{ t("lastCleanup") }}</span
+                                ><strong>{{ storageLastCleanupText }}</strong> <span>{{ t("nextCleanup") }}</span
+                                ><strong>{{ storageNextCleanupText }}</strong>
+                            </div>
+                            <p v-if="storageState.cleanup_status === 'error'" class="storage-error">
+                                {{ t("cleanupFailedRetry") }} {{ storageState.cleanup_error || "" }}
+                            </p>
+                            <p v-if="storageState.retention_mode !== 'forever'" class="storage-retention-note">
+                                {{ t("retentionExplanation", { days: storageState.retention_days }) }}
+                            </p>
+                            <p class="storage-retention-note">{{ t("retentionConfigNotice") }}</p>
+                        </template>
+                    </section>
+                </div>
+
+                <div class="full-width-section">
                     <section class="status-card records-card">
                         <div class="card-header-v2">
                             <h3 class="card-title-usage">{{ t("requestRecords") }}</h3>
@@ -2523,6 +2548,7 @@
                                 <thead>
                                     <tr>
                                         <th>{{ t("requestTime") }}</th>
+                                        <th>{{ t("expirationTime") }}</th>
                                         <th>{{ t("requestId") }}</th>
                                         <th>{{ t("apiFormat") }}</th>
                                         <th>{{ t("streamingMode") }}</th>
@@ -2538,6 +2564,7 @@
                                 <tbody>
                                     <tr v-for="record in paginatedRecords" :key="record.sequence">
                                         <td class="sticky-time-col">{{ formatDateTime(record.startedAt) }}</td>
+                                        <td :title="record.expires_at || ''">{{ formatRecordExpiration(record) }}</td>
                                         <td class="mono truncate-cell">{{ record.requestId }}</td>
                                         <td>{{ translateLabel(record.apiFormat) }}</td>
                                         <td>{{ translateLabel(record.streamMode) }}</td>
@@ -2716,6 +2743,7 @@
                         <span style="font-size: 0.9rem; font-weight: 500">{{ t("downloadLogs") }}</span>
                     </button>
                 </header>
+                <p class="logs-retention-note">{{ t("runtimeLogsRetentionNotice") }}</p>
                 <div class="status-card logs-card">
                     <pre id="log-container" v-html="formattedLogs"></pre>
                 </div>
@@ -2818,6 +2846,8 @@ const activeTab = ref("home");
 const isDownloadingUsageStats = ref(false);
 const isImportingUsageStats = ref(false);
 const isUsageStatsTransferBusy = computed(() => isDownloadingUsageStats.value || isImportingUsageStats.value);
+const storageState = reactive({ enabled: false });
+let storageFetchedAt = 0;
 const accountSearchQuery = ref("");
 const showExpiredOnly = ref(false);
 
@@ -3461,6 +3491,31 @@ const formatStatsUptime = (startedAt, seconds) => {
     return formatUptime(seconds);
 };
 
+const localTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const formatStorageTime = value => (value ? `${formatDateTime(value)} (${localTimezone})` : t("notAvailable"));
+const formatRecordExpiration = record => {
+    if (!record.expires_at) return t("retainedForever");
+    if (record.expired) return t("expiredPendingCleanup");
+    return formatStorageTime(record.expires_at);
+};
+const storageRetentionText = computed(() =>
+    storageState.retention_mode === "forever"
+        ? t("retainedForever")
+        : t("retainedDays", { days: storageState.retention_days })
+);
+const storageCleanupIntervalText = computed(() =>
+    storageState.retention_mode === "forever"
+        ? t("cleanupDisabled")
+        : t("cleanupEveryMinutes", { minutes: storageState.cleanup_interval_minutes })
+);
+const storageLastCleanupText = computed(() => {
+    if (!storageState.last_cleanup_success_at) return t("neverCompleted");
+    return `${formatStorageTime(storageState.last_cleanup_success_at)}, ${t("deletedRecords", { count: storageState.last_deleted_records || 0 })}`;
+});
+const storageNextCleanupText = computed(() =>
+    storageState.retention_mode === "forever" ? t("cleanupDisabled") : formatStorageTime(storageState.next_cleanup_at)
+);
+
 const formatAccount = (authIndex, accountName) => {
     if (authIndex === null || authIndex === undefined) {
         return accountName || "-";
@@ -3470,15 +3525,18 @@ const formatAccount = (authIndex, accountName) => {
 let latestUsageSequence = null;
 let usageDatasetRevision = null;
 const fetchUsageStats = async (signal, includeRecords = true) => {
-    const requests = [fetch("/api/usage-stats/summary", { signal })];
+    const summaryPromise = fetch("/api/usage-stats/summary", { signal });
+    let recordsPromise = null;
     if (includeRecords) {
         const after =
             latestUsageSequence === null
                 ? ""
                 : `&after_sequence=${latestUsageSequence}&dataset_revision=${usageDatasetRevision}`;
-        requests.push(fetch(`/api/usage-stats/records?limit=100${after}`, { signal }));
+        recordsPromise = fetch(`/api/usage-stats/records?limit=100${after}`, { signal });
     }
-    const [summaryRes, recordsRes] = await Promise.all(requests);
+    const shouldFetchStorage = Date.now() - storageFetchedAt >= 30000;
+    const storagePromise = shouldFetchStorage ? fetch("/api/usage-stats/storage", { signal }) : null;
+    const [summaryRes, recordsRes, storageRes] = await Promise.all([summaryPromise, recordsPromise, storagePromise]);
     const res = summaryRes;
     if (res.redirected) {
         window.location.href = res.url;
@@ -3495,6 +3553,11 @@ const fetchUsageStats = async (signal, includeRecords = true) => {
     if (recordsRes && !recordsRes.ok) throw new Error(`HTTP ${recordsRes.status}`);
     const data = await res.json();
     const recordsData = recordsRes ? await recordsRes.json() : null;
+    if (storageRes) {
+        if (!storageRes.ok) throw new Error(`HTTP ${storageRes.status}`);
+        Object.assign(storageState, await storageRes.json());
+        storageFetchedAt = Date.now();
+    }
     statsState.accounts = data.accounts || [];
     statsState.models = data.models || [];
     if (recordsData) {
@@ -5258,6 +5321,23 @@ watchEffect(() => {
 .full-width-section {
     margin-top: 24px;
     width: 100%;
+}
+
+.storage-retention-grid {
+    display: grid;
+    grid-template-columns: minmax(140px, 220px) 1fr;
+    gap: 10px 20px;
+}
+
+.storage-retention-note,
+.logs-retention-note {
+    color: @text-secondary;
+    font-size: 0.86rem;
+    margin: 12px 0 0;
+}
+
+.storage-error {
+    color: #dc2626;
 }
 
 /* Common Card Styles */
