@@ -60,9 +60,9 @@ Playwright 代理配置在 Browser Context 创建时传入，不能在 Context �
 第一阶段交付可控、可观察的手工节点池：
 
 1. Docker 镜像内置固定版本的 Mihomo 内核；
-2. 支持手工添加 Shadowsocks 和 SOCKS5 节点；
+2. 支持手工添加直连、Shadowsocks 和 SOCKS5 节点；
 3. 支持分享链接和结构化表单批量导入；
-4. 每个节点分配稳定的本地 SOCKS5 监听端口；
+4. 每个远程代理节点分配稳定的本地 SOCKS5 监听端口；直连节点不分配端口；
 5. 在独立前端页面管理节点和账号绑定；
 6. 展示账号期望出口、当前出口和待应用状态；
 7. 支持单账号或批量账号在空闲后重建 Context；
@@ -222,6 +222,17 @@ Docker 已经建议挂载 `/app/data`，因此新增文件可以随现有数据�
       "enabled": true,
       "createdAt": "2026-09-26T00:00:00.000Z",
       "updatedAt": "2026-09-26T00:00:00.000Z"
+    },
+    {
+      "id": "node-direct",
+      "name": "VPS 直连",
+      "type": "direct",
+      "host": "",
+      "port": null,
+      "localPort": null,
+      "enabled": true,
+      "createdAt": "2026-09-26T00:00:00.000Z",
+      "updatedAt": "2026-09-26T00:00:00.000Z"
     }
   ],
   "bindings": {
@@ -255,7 +266,10 @@ Docker 已经建议挂载 `/app/data`，因此新增文件可以随现有数据�
 
 - 节点 ID 使用不可变随机 ID，不使用节点名称作为主键；
 - 节点名称可以修改；
-- `localPort` 第一次创建时分配并持久化；
+- 节点类型创建后不可修改；代理节点与直连节点之间切换时必须新建节点并重新绑定，避免运行中 Context 的应用状态失真；
+- 远程代理节点的 `localPort` 第一次创建时分配并持久化；
+- `type=direct` 表示 VPS 自身公网出口，只允许配置一个，`host`、`port` 和 `localPort` 均为空；
+- 直连节点是账号分组和出口意图，不生成 Mihomo proxy/listener，不经过 Mihomo，也不继承 `proxylist.txt` 或代理环境变量；
 - 节点排序、服务重启和订阅刷新不能改变已有端口；
 - `controllerPort` 必须从节点端口分配范围排除；
 - 删除节点前必须确认没有期望绑定或运行中的 Context 使用该节点；
@@ -289,7 +303,7 @@ Docker 已经建议挂载 `/app/data`，因此新增文件可以随现有数据�
 
 | 状态 | 含义 |
 | --- | --- |
-| `unbound` | 没有节点池绑定 |
+| `unbound` | 没有任何节点池绑定；不包含已经绑定直连节点的账号 |
 | `pending` | 期望节点与当前 Context 使用节点不同 |
 | `applied` | 当前 Context 已使用期望节点 |
 | `offline` | 没有运行中的 Context，新建时将使用期望节点 |
@@ -305,7 +319,9 @@ Docker 已经建议挂载 `/app/data`，因此新增文件可以随现有数据�
 
 ```text
 节点池中的账号绑定
-  ↓ 未配置
+  ├─ 绑定直连节点：强制 VPS 直连，不经过 Mihomo
+  └─ 绑定远程节点：使用该节点的 Mihomo 本地 SOCKS5 listener
+  ↓ 未绑定
 proxylist.txt 固定代理
   ↓ 未启用
 HTTPS_PROXY / HTTP_PROXY / ALL_PROXY
@@ -315,12 +331,17 @@ HTTPS_PROXY / HTTP_PROXY / ALL_PROXY
 
 如果命中节点池绑定但节点不可用，解析立即失败，不能继续向下回退。
 
+直连节点同样属于明确绑定。命中直连节点后返回无代理的 Browser Context 配置，并立即停止优先级解析；即使存在 `proxylist.txt`、`HTTP_PROXY`、`HTTPS_PROXY` 或 `ALL_PROXY`，该账号也必须使用 VPS 自身出口。节点池总开关和 Mihomo 进程状态不影响直连节点。
+
 旧固定代理功能在第一阶段保留，以便平滑升级。管理页面需要明确标注账号当前代理来源：
 
 - `mihomo_pool`
+- `direct_node`
 - `sticky_proxy_file`
 - `environment`
 - `direct`
+
+其中 `direct_node` 表示显式绑定到“VPS 直连”节点，`direct` 仅表示未绑定账号经过全部兼容配置后自然落到直连。两者必须在接口和页面中区分。
 
 ## 8. Mihomo 生命周期
 
@@ -509,6 +530,8 @@ HTTPS_PROXY / HTTP_PROXY / ALL_PROXY
 
 节点编辑弹窗支持 Shadowsocks 和 SOCKS5 的类型字段。批量导入支持一行一个 URI，并在保存前展示解析成功、重复和失败条目。
 
+节点编辑弹窗还支持创建唯一的“直连（VPS 出口）”节点。该节点的远程地址和本地端口显示为“不适用”，测试操作直接从应用进程访问测试地址，不能调用 Mihomo 控制端进行测试。
+
 ### 11.3 账号出口列表
 
 每行展示：
@@ -525,6 +548,8 @@ HTTPS_PROXY / HTTP_PROXY / ALL_PROXY
 - 保存绑定和立即应用操作。
 
 需要支持分页、搜索、按状态过滤、多选和批量操作。账号数量超过 100 时，不能每次轮询都返回完整节点密码、日志或大对象。
+
+账号筛选必须把“未绑定”和“直连组”分开：`unbound` 只展示尚未选择任何节点的账号；直连组账号通过其直连节点 ID 查询和统计。这样未绑定筛选可以直接用于发现尚未分配出口的新账号。
 
 ### 11.4 影响确认
 
@@ -718,6 +743,7 @@ Mihomo 意外退出后：
 - SS、SOCKS5 URI 解析；
 - 节点字段校验与凭据脱敏；
 - 节点 ID 和端口稳定性；
+- 直连节点唯一性、无本地端口和不生成 Mihomo listener；
 - 控制端端口冲突检测；
 - 配置文件原子写入和损坏恢复；
 - Mihomo YAML 生成；
@@ -725,6 +751,7 @@ Mihomo 意外退出后：
 - 账号身份和绑定解析；
 - 节点池、旧固定代理、环境代理的优先级；
 - 命中无效节点绑定时禁止直连回退；
+- 显式直连绑定忽略 Mihomo、旧固定代理和代理环境变量；
 - 批量绑定单事务写入；
 - 自动化默认关闭。
 
@@ -786,6 +813,7 @@ Mihomo 意外退出后：
 10. API 和日志不泄露节点密码；
 11. 旧 `proxylist.txt` 和环境代理继续工作；
 12. 100 个账号规模下，页面和绑定接口可正常使用。
+13. 页面能区分未绑定账号与显式直连组，直连组流量不经过 Mihomo。
 
 ## 18. 推荐实施顺序
 

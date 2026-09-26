@@ -23,6 +23,18 @@ class ProxyBindingService {
                 throw Object.assign(new Error(`Bound proxy node does not exist: ${desiredNodeId}`), {
                     code: "PROXY_POOL_NODE_MISSING",
                 });
+            if (node.type === "direct") {
+                if (node.enabled === false)
+                    throw Object.assign(new Error(`Bound direct node is disabled: ${node.name}`), {
+                        code: "PROXY_POOL_NODE_UNAVAILABLE",
+                    });
+                return {
+                    appliedNodeId: node.id,
+                    display: "direct",
+                    proxy: null,
+                    source: "direct_node",
+                };
+            }
             if (!snapshot.settings.enabled)
                 throw Object.assign(new Error("Proxy pool is disabled for a bound account"), {
                     code: "PROXY_POOL_DISABLED",
@@ -66,7 +78,8 @@ class ProxyBindingService {
                 try {
                     source = this.resolve(authIndex).source;
                 } catch (cause) {
-                    source = "mihomo_pool";
+                    const desired = snapshot.nodes.find(node => node.id === desiredNodeId);
+                    source = desired?.type === "direct" ? "direct_node" : "mihomo_pool";
                     error ||= cause.message;
                 }
             }

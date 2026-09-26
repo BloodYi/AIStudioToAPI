@@ -72,9 +72,17 @@ class ProxyPoolStore {
             throw new Error("Invalid proxy pool nodes or bindings");
         const ids = new Set();
         const ports = new Set([Number(candidate.settings.controllerPort)]);
+        let directNodeCount = 0;
         for (const node of candidate.nodes) {
             if (!node.id || ids.has(node.id)) throw new Error(`Duplicate or missing node id: ${node.id || "(empty)"}`);
             ids.add(node.id);
+            if (node.type === "direct") {
+                directNodeCount++;
+                if (directNodeCount > 1) throw new Error("Only one direct node can be configured");
+                if (node.localPort !== null && node.localPort !== undefined)
+                    throw new Error(`Direct node ${node.id} cannot have a local port`);
+                continue;
+            }
             if (!Number.isInteger(node.localPort) || node.localPort < 1 || node.localPort > 65535)
                 throw new Error(`Invalid local port for node ${node.id}`);
             if (ports.has(node.localPort)) throw new Error(`Local port conflict: ${node.localPort}`);

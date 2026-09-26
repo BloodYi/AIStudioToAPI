@@ -105,6 +105,17 @@ class ProxyNodeParser {
     }
 
     static validate(node) {
+        if (node?.type === "direct") {
+            if (!node.name || typeof node.name !== "string") throw new Error("Direct node requires a name");
+            return {
+                ...node,
+                host: "",
+                password: "",
+                port: null,
+                type: "direct",
+                username: "",
+            };
+        }
         if (!node.name || !node.type || !node.host || !Number.isInteger(Number(node.port)))
             throw new Error("Node requires name, type, host and port");
         if (Number(node.port) < 1 || Number(node.port) > 65535) throw new Error("Invalid node port");

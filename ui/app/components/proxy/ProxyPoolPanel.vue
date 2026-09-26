@@ -39,11 +39,19 @@
             </div>
             <el-table :data="nodes" empty-text="暂无节点">
                 <el-table-column prop="name" label="名称" min-width="130" />
-                <el-table-column prop="type" label="类型" width="90" />
+                <el-table-column label="类型" width="90">
+                    <template #default="{ row }">{{ row.type === "direct" ? "直连" : row.type }}</template>
+                </el-table-column>
                 <el-table-column label="远程地址" min-width="180"
-                    ><template #default="{ row }">{{ row.host }}:{{ row.port }}</template></el-table-column
+                    ><template #default="{ row }">{{
+                        row.type === "direct" ? "VPS 本机出口" : `${row.host}:${row.port}`
+                    }}</template></el-table-column
                 >
-                <el-table-column prop="localPort" label="本地端口" width="100" />
+                <el-table-column label="本地端口" width="100">
+                    <template #default="{ row }">{{
+                        row.type === "direct" ? "不经过 Mihomo" : row.localPort
+                    }}</template>
+                </el-table-column>
                 <el-table-column label="延迟" width="90">
                     <template #default="{ row }">{{ row.latencyMs == null ? "-" : `${row.latencyMs} ms` }}</template>
                 </el-table-column>
@@ -97,6 +105,10 @@
                 <el-select v-model="stateFilter" clearable placeholder="全部状态" style="width: 140px">
                     <el-option v-for="state in bindingStates" :key="state" :label="state" :value="state" />
                 </el-select>
+                <el-select v-model="nodeFilter" clearable placeholder="全部出口组" style="width: 180px">
+                    <el-option label="未绑定" value="__unbound__" />
+                    <el-option v-for="node in nodes" :key="node.id" :label="node.name" :value="node.id" />
+                </el-select>
                 <el-select v-model="batchNodeId" clearable placeholder="批量绑定节点" style="width: 180px">
                     <el-option v-for="node in usableNodes" :key="node.id" :label="node.name" :value="node.id" />
                 </el-select>
@@ -149,13 +161,22 @@
                 <el-form-item label="类型"
                     ><el-select v-model="nodeForm.type"
                         ><el-option
-                            v-for="type in ['ss', 'socks5', 'trojan', 'vless', 'vmess']"
+                            v-for="type in ['direct', 'ss', 'socks5', 'trojan', 'vless', 'vmess']"
                             :key="type"
+                            :label="type === 'direct' ? '直连（VPS 出口）' : type"
                             :value="type" /></el-select
                 ></el-form-item>
                 <el-form-item label="名称"><el-input v-model="nodeForm.name" /></el-form-item>
-                <el-form-item label="主机"><el-input v-model="nodeForm.host" /></el-form-item>
-                <el-form-item label="端口"
+                <el-alert
+                    v-if="nodeForm.type === 'direct'"
+                    title="直连节点使用 VPS 自身出口，不启动 Mihomo listener，也不继承环境代理。"
+                    type="info"
+                    :closable="false"
+                />
+                <el-form-item v-if="nodeForm.type !== 'direct'" label="主机"
+                    ><el-input v-model="nodeForm.host"
+                /></el-form-item>
+                <el-form-item v-if="nodeForm.type !== 'direct'" label="端口"
                     ><el-input-number v-model="nodeForm.port" :min="1" :max="65535"
                 /></el-form-item>
                 <el-form-item v-if="nodeForm.type === 'ss'" label="加密"
@@ -167,7 +188,7 @@
                 <el-form-item v-if="['vless', 'vmess'].includes(nodeForm.type)" label="UUID"
                     ><el-input v-model="nodeForm.uuid"
                 /></el-form-item>
-                <el-form-item v-if="!['vless', 'vmess'].includes(nodeForm.type)" label="密码"
+                <el-form-item v-if="!['direct', 'vless', 'vmess'].includes(nodeForm.type)" label="密码"
                     ><el-input
                         v-model="nodeForm.password"
                         show-password
@@ -238,6 +259,7 @@ const accountPageSize = ref(20);
 const accountSearch = ref("");
 const batchNodeId = ref("");
 const bindingStates = ["unbound", "pending", "applied", "offline", "draining", "rebuilding", "error"];
+const nodeFilter = ref("");
 const selectedBindings = ref([]);
 const stateFilter = ref("");
 const usableNodes = computed(() => nodes.value.filter(node => node.enabled && node.status !== "missing"));
@@ -246,7 +268,9 @@ const filteredBindings = computed(() => {
     return bindings.value.filter(
         item =>
             (!query || item.accountName.toLowerCase().includes(query) || item.accountKey.includes(query)) &&
-            (!stateFilter.value || item.state === stateFilter.value)
+            (!stateFilter.value || item.state === stateFilter.value) &&
+            (!nodeFilter.value ||
+                (nodeFilter.value === "__unbound__" ? !item.desiredNodeId : item.desiredNodeId === nodeFilter.value))
     );
 });
 const pagedBindings = computed(() => {

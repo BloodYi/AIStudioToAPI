@@ -68,6 +68,11 @@ class ProxyPoolService {
         const snapshot = this.store.snapshot();
         const node = snapshot.nodes.find(entry => entry.id === id);
         if (!node) throw Object.assign(new Error("Node not found"), { status: 404 });
+        if (node.type === "direct") {
+            if (node.enabled === false)
+                throw Object.assign(new Error("Selected direct node is disabled"), { status: 503 });
+            return { display: "direct", nodeId: node.id, proxy: null, source: "direct_node" };
+        }
         if (
             !snapshot.settings.enabled ||
             node.enabled === false ||
@@ -84,7 +89,10 @@ class ProxyPoolService {
     }
 
     _allocatePort(data) {
-        const used = new Set([data.settings.controllerPort, ...data.nodes.map(node => node.localPort)]);
+        const used = new Set([
+            data.settings.controllerPort,
+            ...data.nodes.map(node => node.localPort).filter(Number.isInteger),
+        ]);
         let port = data.settings.basePort;
         while (used.has(port) && port <= 65535) port++;
         if (port > 65535) throw Object.assign(new Error("No local proxy port available"), { status: 409 });
@@ -92,18 +100,27 @@ class ProxyPoolService {
     }
 
     _normalizeNode(input, data, existing = null) {
+        if (existing && input.type && input.type !== existing.type)
+            throw Object.assign(new Error("Node type cannot be changed; create a new node instead"), { status: 409 });
         const parsed = ProxyNodeParser.validate({
             ...existing,
             ...input,
             password: input.password || existing?.password || "",
         });
         const now = new Date().toISOString();
+        if (parsed.type === "direct" && data.nodes.some(node => node.type === "direct" && node.id !== existing?.id))
+            throw Object.assign(new Error("Only one direct node can be configured"), { status: 409 });
         return {
             ...parsed,
             createdAt: existing?.createdAt || now,
             enabled: input.enabled !== false,
             id: existing?.id || `node-${crypto.randomBytes(6).toString("hex")}`,
-            localPort: existing?.localPort || this._allocatePort(data),
+            localPort:
+                parsed.type === "direct"
+                    ? null
+                    : Number.isInteger(existing?.localPort)
+                      ? existing.localPort
+                      : this._allocatePort(data),
             source: existing?.source || input.source || "manual",
             updatedAt: now,
         };
@@ -355,6 +372,33 @@ class ProxyPoolService {
         const node = this.store.data.nodes.find(entry => entry.id === id);
         if (!node) throw Object.assign(new Error("Node not found"), { status: 404 });
         try {
+            if (node.type === "direct") {
+                const started = Date.now();
+                const testUrl = this.store.data.automation.exitIpUrl || this.store.data.automation.testUrl;
+                const response = await axios.get(testUrl, {
+                    maxContentLength: 1024 * 1024,
+                    proxy: false,
+                    timeout: this.store.data.automation.healthTimeoutMs,
+                    validateStatus: status => status >= 200 && status < 300,
+                });
+                let exitIp = null;
+                if (this.store.data.automation.exitIpUrl) {
+                    if (typeof response.data === "object")
+                        exitIp = response.data.ip || response.data.query || response.data.address || null;
+                    else
+                        exitIp =
+                            String(response.data).match(/\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[0-9a-f:]{3,}\b/i)?.[0] || null;
+                }
+                const result = {
+                    exitIp,
+                    latencyMs: Date.now() - started,
+                    message: "ok",
+                    success: true,
+                    testedAt: new Date().toISOString(),
+                };
+                this.testResults.set(id, result);
+                return result;
+            }
             if (!this.manager.status.ready) throw Object.assign(new Error("Mihomo is not ready"), { status: 503 });
             const latencyMs = await this.manager.testProxy(
                 node,

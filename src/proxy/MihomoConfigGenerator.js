@@ -39,7 +39,9 @@ class MihomoConfigGenerator {
     }
 
     static generate(snapshot, secret) {
-        const nodes = snapshot.nodes.filter(node => node.enabled !== false && node.status !== "missing");
+        const nodes = snapshot.nodes.filter(
+            node => node.type !== "direct" && node.enabled !== false && node.status !== "missing"
+        );
         const config = {
             "allow-lan": false,
             "external-controller": `127.0.0.1:${snapshot.settings.controllerPort}`,

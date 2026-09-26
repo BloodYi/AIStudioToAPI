@@ -6,6 +6,7 @@ const ProxyNodeParser = require("../src/proxy/ProxyNodeParser");
 const ProxyPoolStore = require("../src/proxy/ProxyPoolStore");
 const MihomoConfigGenerator = require("../src/proxy/MihomoConfigGenerator");
 const ProxyBindingService = require("../src/proxy/ProxyBindingService");
+const ProxyPoolService = require("../src/proxy/ProxyPoolService");
 
 const logger = { error() {}, info() {}, warn() {} };
 
@@ -40,6 +41,13 @@ async function main() {
     assert.strictEqual(data.automation.enabled, false);
     assert.strictEqual(data.automation.subscriptionsEnabled, false);
     data.nodes.push({ ...ss, enabled: true, id: "node-one", localPort: 10801 });
+    const direct = {
+        ...ProxyNodeParser.validate({ name: "VPS Direct", type: "direct" }),
+        enabled: true,
+        id: "node-direct",
+        localPort: null,
+    };
+    data.nodes.push(direct);
     await store.replace(data);
     assert.strictEqual(fs.statSync(filePath).mode & 0o777, 0o600);
     assert.strictEqual(new ProxyPoolStore(logger, filePath).snapshot().nodes[0].localPort, 10801);
@@ -52,11 +60,27 @@ async function main() {
     assert.match(yaml, /127\.0\.0\.1/);
     assert.match(yaml, /listener-node-one/);
     assert.match(yaml, /secret: not-public/);
+    assert.doesNotMatch(yaml, /node-direct/);
+
+    const serviceMethods = Object.create(ProxyPoolService.prototype);
+    assert.throws(
+        () => serviceMethods._normalizeNode({ name: "Second Direct", type: "direct" }, data),
+        /Only one direct node/
+    );
+    assert.throws(
+        () => store.validate({ ...data, nodes: [...data.nodes, { ...direct, id: "node-direct-2" }] }),
+        /Only one direct node/
+    );
+    assert.throws(
+        () => serviceMethods._normalizeNode({ type: "direct" }, data, data.nodes[0]),
+        /Node type cannot be changed/
+    );
 
     const authSource = { accountNameMap: new Map([[0, "User@Example.com"]]), availableIndices: [0] };
     const browserManager = {
         contexts: new Map(),
         contextUnavailable: new Map(),
+        initializingContexts: new Set(),
         stickyProxyManager: { getProxyForAuth: () => null },
     };
     const manager = { status: { ready: false } };
@@ -67,6 +91,21 @@ async function main() {
     assert.throws(() => bindingService.resolve(0), /Mihomo is not ready/);
     manager.status.ready = true;
     assert.strictEqual(bindingService.resolve(0).proxy.server, "socks5://127.0.0.1:10801");
+    data.bindings["user@example.com"] = { desiredNodeId: "node-direct", updatedAt: new Date().toISOString() };
+    data.settings.enabled = false;
+    await store.replace(data);
+    const oldHttpsProxy = process.env.HTTPS_PROXY;
+    process.env.HTTPS_PROXY = "http://environment-proxy.invalid:8080";
+    const directResolution = bindingService.resolve(0);
+    assert.strictEqual(directResolution.appliedNodeId, "node-direct");
+    assert.strictEqual(directResolution.proxy, null);
+    assert.strictEqual(directResolution.source, "direct_node");
+    assert.strictEqual(bindingService.list()[0].state, "offline");
+    browserManager.contexts.set(0, { proxyInfo: directResolution, state: "READY" });
+    assert.strictEqual(bindingService.list()[0].state, "applied");
+    assert.notStrictEqual(bindingService.list()[0].state, "unbound");
+    if (oldHttpsProxy === undefined) delete process.env.HTTPS_PROXY;
+    else process.env.HTTPS_PROXY = oldHttpsProxy;
 
     fs.rmSync(temp, { recursive: true });
     console.log("proxy-pool tests passed");

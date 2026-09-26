@@ -1457,7 +1457,7 @@ class BrowserManager {
             throw new Error(`Browser executable not found at path: ${browserExecutablePath}`);
         }
 
-        const proxyConfig = selectedProxy?.proxy || (stickyProxy ? stickyProxy.proxy : parseProxyFromEnv());
+        const proxyConfig = selectedProxy ? selectedProxy.proxy : stickyProxy ? stickyProxy.proxy : parseProxyFromEnv();
         if (proxyConfig) {
             this.logger.info(
                 selectedProxy
