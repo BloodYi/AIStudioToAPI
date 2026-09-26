@@ -1,0 +1,492 @@
+<template>
+    <div class="proxy-pool">
+        <header class="page-header">
+            <h1>节点池</h1>
+            <el-button @click="loadAll">刷新</el-button>
+        </header>
+
+        <section class="pool-card">
+            <div class="section-title">
+                <h3>Mihomo 状态</h3>
+                <el-tag :type="status.mihomo?.ready ? 'success' : 'danger'">{{
+                    status.mihomo?.ready ? "就绪" : "未就绪"
+                }}</el-tag>
+            </div>
+            <div class="status-grid">
+                <span>节点池：{{ status.enabled ? "已启用" : "已停用" }}</span>
+                <span>二进制：{{ status.mihomo?.binaryFound ? "已找到" : "未找到" }}</span>
+                <span>版本：{{ status.mihomo?.version || "-" }}</span>
+                <span>节点 / 绑定：{{ status.nodeCount || 0 }} / {{ status.bindingCount || 0 }}</span>
+            </div>
+            <el-alert v-if="status.mihomo?.lastError" :title="status.mihomo.lastError" type="error" :closable="false" />
+            <div class="actions">
+                <el-switch v-model="settings.enabled" active-text="启用节点池" @change="saveSettings" />
+                <el-input-number v-model="settings.basePort" :min="1024" :max="65535" controls-position="right" />
+                <span>起始端口</span>
+                <el-button @click="mihomo('start')">启动</el-button>
+                <el-button @click="mihomo('stop')">停止</el-button>
+                <el-button @click="mihomo('reload')">重载</el-button>
+            </div>
+        </section>
+
+        <section class="pool-card">
+            <div class="section-title">
+                <h3>代理节点</h3>
+                <div>
+                    <el-button @click="importVisible = true">批量导入</el-button
+                    ><el-button type="primary" @click="openNode()">添加节点</el-button>
+                </div>
+            </div>
+            <el-table :data="nodes" empty-text="暂无节点">
+                <el-table-column prop="name" label="名称" min-width="130" />
+                <el-table-column prop="type" label="类型" width="90" />
+                <el-table-column label="远程地址" min-width="180"
+                    ><template #default="{ row }">{{ row.host }}:{{ row.port }}</template></el-table-column
+                >
+                <el-table-column prop="localPort" label="本地端口" width="100" />
+                <el-table-column label="延迟" width="90">
+                    <template #default="{ row }">{{ row.latencyMs == null ? "-" : `${row.latencyMs} ms` }}</template>
+                </el-table-column>
+                <el-table-column prop="exitIp" label="出口 IP" min-width="130" />
+                <el-table-column prop="boundAccounts" label="绑定" width="70" />
+                <el-table-column label="状态" width="100"
+                    ><template #default="{ row }"
+                        ><el-tag :type="row.enabled && row.status !== 'missing' ? 'success' : 'info'">{{
+                            row.status === "missing" ? "订阅缺失" : row.enabled ? "启用" : "停用"
+                        }}</el-tag></template
+                    ></el-table-column
+                >
+                <el-table-column label="操作" width="220"
+                    ><template #default="{ row }"
+                        ><el-button link @click="testNode(row)">测试</el-button
+                        ><el-button link @click="openNode(row)">编辑</el-button
+                        ><el-button link type="danger" @click="removeNode(row)">删除</el-button></template
+                    ></el-table-column
+                >
+            </el-table>
+        </section>
+
+        <section class="pool-card">
+            <div class="section-title">
+                <h3>订阅（手动刷新）</h3>
+                <el-button type="primary" @click="subscriptionVisible = true">添加订阅</el-button>
+            </div>
+            <el-table :data="subscriptions" empty-text="暂无订阅">
+                <el-table-column prop="name" label="名称" />
+                <el-table-column prop="url" label="地址（已脱敏）" min-width="220" />
+                <el-table-column prop="nodeCount" label="节点" width="70" />
+                <el-table-column prop="lastRefreshedAt" label="最近刷新" min-width="170" />
+                <el-table-column label="操作" width="100"
+                    ><template #default="{ row }"
+                        ><el-button link @click="refreshSubscription(row)">刷新</el-button></template
+                    ></el-table-column
+                >
+            </el-table>
+        </section>
+
+        <section class="pool-card">
+            <div class="section-title">
+                <h3>账号出口</h3>
+                <div>
+                    <el-button @click="applyIdle">应用空闲账号</el-button
+                    ><el-button @click="applyPending">排队应用全部</el-button>
+                </div>
+            </div>
+            <div class="actions">
+                <el-input v-model="accountSearch" clearable placeholder="搜索账号" style="width: 220px" />
+                <el-select v-model="stateFilter" clearable placeholder="全部状态" style="width: 140px">
+                    <el-option v-for="state in bindingStates" :key="state" :label="state" :value="state" />
+                </el-select>
+                <el-select v-model="batchNodeId" clearable placeholder="批量绑定节点" style="width: 180px">
+                    <el-option v-for="node in usableNodes" :key="node.id" :label="node.name" :value="node.id" />
+                </el-select>
+                <el-button :disabled="!selectedBindings.length" @click="saveBatchBinding">保存选中绑定</el-button>
+            </div>
+            <el-table :data="pagedBindings" empty-text="暂无账号" @selection-change="selectedBindings = $event">
+                <el-table-column type="selection" width="45" />
+                <el-table-column prop="authIndex" label="#" width="55" />
+                <el-table-column prop="accountName" label="账号" min-width="180" />
+                <el-table-column prop="proxySource" label="当前来源" width="145" />
+                <el-table-column label="期望节点" min-width="170"
+                    ><template #default="{ row }"
+                        ><el-select
+                            v-model="row.desiredNodeId"
+                            clearable
+                            placeholder="未绑定"
+                            @change="saveBinding(row)"
+                            ><el-option
+                                v-for="node in usableNodes"
+                                :key="node.id"
+                                :label="node.name"
+                                :value="node.id" /></el-select></template
+                ></el-table-column>
+                <el-table-column label="状态" width="110"
+                    ><template #default="{ row }"
+                        ><el-tag :type="stateType(row.state)">{{ row.state }}</el-tag></template
+                    ></el-table-column
+                >
+                <el-table-column prop="inflight" label="在途" width="70" />
+                <el-table-column label="操作" width="90"
+                    ><template #default="{ row }"
+                        ><el-button link :disabled="row.state === 'applied'" @click="applyOne(row)"
+                            >应用</el-button
+                        ></template
+                    ></el-table-column
+                >
+            </el-table>
+            <el-pagination
+                v-model:current-page="accountPage"
+                v-model:page-size="accountPageSize"
+                class="pagination"
+                layout="total, sizes, prev, pager, next"
+                :page-sizes="[20, 50, 100]"
+                :total="filteredBindings.length"
+            />
+        </section>
+
+        <el-dialog v-model="nodeVisible" :title="editingId ? '编辑节点' : '添加节点'" width="520px">
+            <el-form label-width="95px">
+                <el-form-item label="类型"
+                    ><el-select v-model="nodeForm.type"
+                        ><el-option
+                            v-for="type in ['ss', 'socks5', 'trojan', 'vless', 'vmess']"
+                            :key="type"
+                            :value="type" /></el-select
+                ></el-form-item>
+                <el-form-item label="名称"><el-input v-model="nodeForm.name" /></el-form-item>
+                <el-form-item label="主机"><el-input v-model="nodeForm.host" /></el-form-item>
+                <el-form-item label="端口"
+                    ><el-input-number v-model="nodeForm.port" :min="1" :max="65535"
+                /></el-form-item>
+                <el-form-item v-if="nodeForm.type === 'ss'" label="加密"
+                    ><el-input v-model="nodeForm.cipher"
+                /></el-form-item>
+                <el-form-item v-if="nodeForm.type === 'socks5'" label="用户名"
+                    ><el-input v-model="nodeForm.username"
+                /></el-form-item>
+                <el-form-item v-if="['vless', 'vmess'].includes(nodeForm.type)" label="UUID"
+                    ><el-input v-model="nodeForm.uuid"
+                /></el-form-item>
+                <el-form-item v-if="!['vless', 'vmess'].includes(nodeForm.type)" label="密码"
+                    ><el-input
+                        v-model="nodeForm.password"
+                        show-password
+                        :placeholder="editingId ? '留空保留原密码' : ''"
+                /></el-form-item>
+                <el-form-item label="启用"><el-switch v-model="nodeForm.enabled" /></el-form-item>
+            </el-form>
+            <template #footer
+                ><el-button @click="nodeVisible = false">取消</el-button
+                ><el-button type="primary" @click="saveNode">保存</el-button></template
+            >
+        </el-dialog>
+
+        <el-dialog v-model="importVisible" title="批量导入分享链接 / Clash / Base64" width="650px">
+            <el-radio-group v-model="importFormat"
+                ><el-radio-button value="links">分享链接</el-radio-button
+                ><el-radio-button value="subscription">Clash / Base64</el-radio-button></el-radio-group
+            >
+            <el-input v-model="importText" type="textarea" :rows="10" placeholder="粘贴订阅内容，或每行一个分享链接" />
+            <template #footer
+                ><el-button @click="previewImport">预览</el-button
+                ><el-button type="primary" @click="commitImport">导入</el-button></template
+            >
+        </el-dialog>
+
+        <el-dialog v-model="subscriptionVisible" title="添加订阅" width="520px">
+            <el-input v-model="subscriptionForm.name" placeholder="名称" /><el-input
+                v-model="subscriptionForm.url"
+                placeholder="https://..."
+            />
+            <template #footer
+                ><el-button @click="subscriptionVisible = false">取消</el-button
+                ><el-button type="primary" @click="addSubscription">保存</el-button></template
+            >
+        </el-dialog>
+    </div>
+</template>
+
+<script setup>
+import { computed, onMounted, reactive, ref } from "vue";
+import { ElMessage, ElMessageBox } from "element-plus";
+
+const status = reactive({ mihomo: {} });
+const settings = reactive({ basePort: 10801, controllerPort: 19090, enabled: false });
+const nodes = ref([]);
+const bindings = ref([]);
+const subscriptions = ref([]);
+const nodeVisible = ref(false);
+const importVisible = ref(false);
+const subscriptionVisible = ref(false);
+const editingId = ref(null);
+const importText = ref("");
+const importFormat = ref("links");
+const nodeForm = reactive({
+    cipher: "aes-256-gcm",
+    enabled: true,
+    host: "",
+    name: "",
+    password: "",
+    port: 443,
+    type: "ss",
+    username: "",
+    uuid: "",
+});
+const subscriptionForm = reactive({ name: "", url: "" });
+const accountPage = ref(1);
+const accountPageSize = ref(20);
+const accountSearch = ref("");
+const batchNodeId = ref("");
+const bindingStates = ["unbound", "pending", "applied", "offline", "draining", "rebuilding", "error"];
+const selectedBindings = ref([]);
+const stateFilter = ref("");
+const usableNodes = computed(() => nodes.value.filter(node => node.enabled && node.status !== "missing"));
+const filteredBindings = computed(() => {
+    const query = accountSearch.value.trim().toLowerCase();
+    return bindings.value.filter(
+        item =>
+            (!query || item.accountName.toLowerCase().includes(query) || item.accountKey.includes(query)) &&
+            (!stateFilter.value || item.state === stateFilter.value)
+    );
+});
+const pagedBindings = computed(() => {
+    const start = (accountPage.value - 1) * accountPageSize.value;
+    return filteredBindings.value.slice(start, start + accountPageSize.value);
+});
+const request = async (url, options = {}) => {
+    const response = await fetch(url, { headers: { "Content-Type": "application/json" }, ...options });
+    const body = response.status === 204 ? null : await response.json();
+    if (!response.ok) throw new Error(body?.error || `HTTP ${response.status}`);
+    return body;
+};
+const loadAll = async () => {
+    try {
+        const [s, cfg, n, b, sub] = await Promise.all([
+            request("/api/proxy-pool/status"),
+            request("/api/proxy-pool/settings"),
+            request("/api/proxy-pool/nodes"),
+            request("/api/proxy-pool/bindings"),
+            request("/api/proxy-pool/subscriptions"),
+        ]);
+        Object.assign(status, s);
+        Object.assign(settings, cfg);
+        nodes.value = n.nodes;
+        bindings.value = b.bindings;
+        subscriptions.value = sub.subscriptions;
+    } catch (error) {
+        ElMessage.error(error.message);
+    }
+};
+const saveSettings = async () => {
+    try {
+        await request("/api/proxy-pool/settings", { body: JSON.stringify(settings), method: "PUT" });
+        await loadAll();
+    } catch (error) {
+        settings.enabled = !settings.enabled;
+        ElMessage.error(error.message);
+    }
+};
+const mihomo = async action => {
+    try {
+        await request(`/api/proxy-pool/mihomo/${action}`, { method: "POST" });
+        await loadAll();
+    } catch (error) {
+        ElMessage.error(error.message);
+    }
+};
+const openNode = row => {
+    editingId.value = row?.id || null;
+    Object.assign(
+        nodeForm,
+        {
+            cipher: "aes-256-gcm",
+            enabled: true,
+            host: "",
+            name: "",
+            password: "",
+            port: 443,
+            type: "ss",
+            username: "",
+            uuid: "",
+        },
+        row || {},
+        { password: "" }
+    );
+    nodeVisible.value = true;
+};
+const saveNode = async () => {
+    try {
+        await request(editingId.value ? `/api/proxy-pool/nodes/${editingId.value}` : "/api/proxy-pool/nodes", {
+            body: JSON.stringify(nodeForm),
+            method: editingId.value ? "PUT" : "POST",
+        });
+        nodeVisible.value = false;
+        await loadAll();
+    } catch (error) {
+        ElMessage.error(error.message);
+    }
+};
+const removeNode = async row => {
+    try {
+        await ElMessageBox.confirm(`删除节点 ${row.name}？当前绑定 ${row.boundAccounts} 个账号。`, "影响确认", {
+            type: "warning",
+        });
+        await request(`/api/proxy-pool/nodes/${row.id}`, { method: "DELETE" });
+        await loadAll();
+    } catch (error) {
+        if (error !== "cancel") ElMessage.error(error.message);
+    }
+};
+const testNode = async row => {
+    try {
+        const result = await request(`/api/proxy-pool/nodes/${row.id}/test`, { method: "POST" });
+        ElMessage.success(`延迟 ${result.latencyMs} ms`);
+    } catch (error) {
+        ElMessage.error(error.message);
+    }
+};
+const doImport = preview =>
+    request("/api/proxy-pool/nodes/import", {
+        body: JSON.stringify({ format: importFormat.value, preview, text: importText.value }),
+        method: "POST",
+    });
+const previewImport = async () => {
+    try {
+        const result = await doImport(true);
+        ElMessage.info(`解析成功 ${result.nodes.length}，失败 ${result.errors.length}`);
+    } catch (error) {
+        ElMessage.error(error.message);
+    }
+};
+const commitImport = async () => {
+    try {
+        const result = await doImport(false);
+        ElMessage.success(`已导入 ${result.added.length}，跳过 ${result.skipped}`);
+        importVisible.value = false;
+        await loadAll();
+    } catch (error) {
+        ElMessage.error(error.message);
+    }
+};
+const saveBinding = async row => {
+    try {
+        await request(`/api/proxy-pool/bindings/${encodeURIComponent(row.accountKey)}`, {
+            body: JSON.stringify({ desiredNodeId: row.desiredNodeId || null }),
+            method: "PUT",
+        });
+        await loadAll();
+    } catch (error) {
+        ElMessage.error(error.message);
+    }
+};
+const saveBatchBinding = async () => {
+    try {
+        await request("/api/proxy-pool/bindings/batch", {
+            body: JSON.stringify({
+                bindings: selectedBindings.value.map(item => ({
+                    accountKey: item.accountKey,
+                    desiredNodeId: batchNodeId.value || null,
+                })),
+            }),
+            method: "POST",
+        });
+        ElMessage.success(`已保存 ${selectedBindings.value.length} 个账号绑定`);
+        await loadAll();
+    } catch (error) {
+        ElMessage.error(error.message);
+    }
+};
+const applyOne = async row => {
+    try {
+        await request(`/api/proxy-pool/bindings/${encodeURIComponent(row.accountKey)}/apply`, { method: "POST" });
+        ElMessage.success("已加入安全排空队列");
+        setTimeout(loadAll, 1000);
+    } catch (error) {
+        ElMessage.error(error.message);
+    }
+};
+const applyIdle = async () => {
+    await request("/api/proxy-pool/bindings/apply-idle", { method: "POST" });
+    ElMessage.success("已处理空闲账号");
+    setTimeout(loadAll, 1000);
+};
+const applyPending = async () => {
+    try {
+        await ElMessageBox.confirm("待应用账号将在请求排空后重建 Context，期间暂不可调度。", "影响确认", {
+            type: "warning",
+        });
+        await request("/api/proxy-pool/bindings/apply-pending", { method: "POST" });
+        ElMessage.success("已加入排空队列");
+    } catch (error) {
+        if (error !== "cancel") ElMessage.error(error.message);
+    }
+};
+const addSubscription = async () => {
+    try {
+        await request("/api/proxy-pool/subscriptions", { body: JSON.stringify(subscriptionForm), method: "POST" });
+        subscriptionVisible.value = false;
+        await loadAll();
+    } catch (error) {
+        ElMessage.error(error.message);
+    }
+};
+const refreshSubscription = async row => {
+    try {
+        const result = await request(`/api/proxy-pool/subscriptions/${row.id}/refresh`, { method: "POST" });
+        ElMessage.success(`刷新完成：${result.nodeCount} 个节点`);
+        await loadAll();
+    } catch (error) {
+        ElMessage.error(error.message);
+    }
+};
+const stateType = state =>
+    ({ applied: "success", draining: "warning", error: "danger", pending: "warning", rebuilding: "warning" })[state] ||
+    "info";
+onMounted(loadAll);
+</script>
+
+<style scoped lang="less">
+.proxy-pool {
+    display: grid;
+    gap: 18px;
+}
+.page-header,
+.section-title,
+.actions,
+.status-grid {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.page-header,
+.section-title {
+    justify-content: space-between;
+}
+.pool-card {
+    padding: 20px;
+    border: 1px solid var(--el-border-color-light);
+    border-radius: 12px;
+    background: var(--el-bg-color);
+}
+.status-grid {
+    flex-wrap: wrap;
+    margin: 12px 0;
+    gap: 14px 30px;
+}
+.actions {
+    flex-wrap: wrap;
+    margin-top: 14px;
+}
+.el-textarea,
+.el-dialog .el-input {
+    margin-top: 14px;
+}
+.pagination {
+    justify-content: flex-end;
+    margin-top: 14px;
+}
+h1,
+h3 {
+    margin: 0;
+}
+</style>

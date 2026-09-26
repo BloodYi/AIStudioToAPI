@@ -335,16 +335,21 @@ class CreateAuth {
             checkAborted();
 
             this.logger.info("[VNC] Launching browser for VNC session...");
+            const selectedProxy = req.body?.nodeId
+                ? this.serverSystem.proxyPoolService.proxyForNode(req.body.nodeId)
+                : null;
             const { browser, context, stickyProxy } = await this._runWithSignal(
                 this.serverSystem.browserManager.launchBrowserForVNC({
                     env: { DISPLAY: display },
                     isMobile,
+                    proxyInfo: selectedProxy,
                 }),
                 signal
             );
             sessionResources.browser = browser;
             sessionResources.context = context;
             sessionResources.stickyProxy = stickyProxy;
+            sessionResources.nodeId = selectedProxy?.nodeId || null;
 
             browser.once("disconnected", () => {
                 this.logger.warn("[VNC] Browser disconnected. Triggering cleanup.");
@@ -520,6 +525,12 @@ class CreateAuth {
                     stickyProxy.proxyLine,
                     accountName,
                     nextAuthIndex
+                );
+            }
+            if (sessionRef.nodeId) {
+                await this.serverSystem.proxyPoolService.setBinding(
+                    accountName.trim().toLowerCase(),
+                    sessionRef.nodeId
                 );
             }
 

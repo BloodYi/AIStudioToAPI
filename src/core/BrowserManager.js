@@ -79,6 +79,7 @@ class BrowserManager {
         // issued at the same time. Serialize only that short protocol step;
         // page navigation and WebSocket initialization remain parallel.
         this._contextCreationQueue = Promise.resolve();
+        this._proxyResolver = null;
         this.contextCreationTimeoutMs = config.scheduler?.contextCreationTimeoutMs || CONTEXT_CREATION_TIMEOUT_MS;
 
         // Background wakeup service status (instance-level, tracks this.page)
@@ -189,6 +190,21 @@ class BrowserManager {
 
     setSystemBusyProvider(provider) {
         this._isSystemBusyProvider = typeof provider === "function" ? provider : null;
+    }
+
+    setProxyResolver(resolver) {
+        this._proxyResolver = typeof resolver === "function" ? resolver : null;
+    }
+
+    isAccountContextIdle(authIndex) {
+        return this._isContextIdle(authIndex);
+    }
+
+    async rebuildAccountContext(authIndex) {
+        await this.closeContext(authIndex, { keepBrowser: true });
+        this.contextUnavailable.delete(authIndex);
+        if (this.scheduler) await this.ensureWorkerContext(authIndex);
+        else await this.launchOrSwitchContext(authIndex);
     }
 
     _isSystemBusy() {
@@ -1431,19 +1447,24 @@ class BrowserManager {
     }
 
     async launchBrowserForVNC(extraArgs = {}) {
-        const stickyProxy = this.stickyProxyManager.reserveProxyForNewAccount("VNC account binding");
+        const selectedProxy = extraArgs.proxyInfo || null;
+        const stickyProxy = selectedProxy
+            ? null
+            : this.stickyProxyManager.reserveProxyForNewAccount("VNC account binding");
         this.logger.info("🚀 [VNC] Launching a new, separate, headful browser instance for VNC session...");
         const browserExecutablePath = this._getBrowserExecutablePath();
         if (!fs.existsSync(browserExecutablePath)) {
             throw new Error(`Browser executable not found at path: ${browserExecutablePath}`);
         }
 
-        const proxyConfig = stickyProxy ? stickyProxy.proxy : parseProxyFromEnv();
+        const proxyConfig = selectedProxy?.proxy || (stickyProxy ? stickyProxy.proxy : parseProxyFromEnv());
         if (proxyConfig) {
             this.logger.info(
-                stickyProxy
-                    ? `[VNC] Launching browser with proxy: ${stickyProxy.display}`
-                    : `[VNC] 🌐 Using proxy: ${proxyConfig.server}`
+                selectedProxy
+                    ? `[VNC] Launching browser with selected Mihomo node: ${selectedProxy.nodeId}`
+                    : stickyProxy
+                      ? `[VNC] Launching browser with proxy: ${stickyProxy.display}`
+                      : `[VNC] 🌐 Using proxy: ${proxyConfig.server}`
             );
         }
 
@@ -1481,7 +1502,7 @@ class BrowserManager {
         this.logger.info("✅ [VNC] VNC browser context successfully created.");
 
         // Return both the browser and context so the caller can manage their lifecycle.
-        return { browser: vncBrowser, context, stickyProxy };
+        return { browser: vncBrowser, context, selectedProxy, stickyProxy };
     }
 
     /**
@@ -1952,7 +1973,7 @@ class BrowserManager {
         if (this.browser) return;
 
         const isStickyProxyEnabled = this.stickyProxyManager.isEnabled();
-        const proxyConfig = isStickyProxyEnabled ? null : parseProxyFromEnv();
+        const proxyConfig = this._proxyResolver || isStickyProxyEnabled ? null : parseProxyFromEnv();
         if (isStickyProxyEnabled) {
             this.logger.info(
                 "[Browser] Sticky proxy mode enabled; main browser launch will not use environment proxy."
@@ -2581,11 +2602,22 @@ class BrowserManager {
             // Check if this context has been marked for abort before starting
             this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
-            const stickyProxy = this.stickyProxyManager.getProxyForAuth(authIndex);
-            const proxyConfig = stickyProxy ? stickyProxy.proxy : parseProxyFromEnv();
-            if (stickyProxy) {
+            const proxyInfo = this._proxyResolver
+                ? await this._proxyResolver(authIndex)
+                : (() => {
+                      const stickyProxy = this.stickyProxyManager.getProxyForAuth(authIndex);
+                      return stickyProxy
+                          ? { ...stickyProxy, source: "sticky_proxy_file" }
+                          : { proxy: parseProxyFromEnv(), source: parseProxyFromEnv() ? "environment" : "direct" };
+                  })();
+            const proxyConfig = proxyInfo?.proxy || null;
+            if (proxyInfo?.source === "sticky_proxy_file") {
                 this.logger.info(
-                    `[Context#${authIndex}] Using sticky proxy for account "${stickyProxy.accountKey}": ${stickyProxy.display}`
+                    `[Context#${authIndex}] Using sticky proxy for account "${proxyInfo.accountKey}": ${proxyInfo.display}`
+                );
+            } else if (proxyInfo?.source === "mihomo_pool") {
+                this.logger.info(
+                    `[Context#${authIndex}] Using Mihomo node ${proxyInfo.appliedNodeId} via ${proxyInfo.display}`
                 );
             }
             const storageStateObject = this.authSource.getAuth(authIndex);
@@ -2733,6 +2765,7 @@ class BrowserManager {
                     healthMonitorInterval: null,
                     lastRequestAt: 0,
                     page,
+                    proxyInfo,
                     state: "READY",
                 });
             } else {

@@ -1,6 +1,11 @@
 # Single-stage build with Node.js 24
 FROM node:24-slim
 
+ARG TARGETARCH
+ARG MIHOMO_VERSION=v1.19.31
+ARG MIHOMO_SHA256_AMD64=04cf9f09671704f839ddbee2e93069dc831a4123a75281e725d1d96ab9ac1afc
+ARG MIHOMO_SHA256_ARM64=9e0f11afbf38426b8bd88fdc594678f8161c57eccb4e1b77acb12b493904f1d4
+
 WORKDIR /app
 
 # Install system dependencies required for Playwright/Camoufox browser, VNC, and dev tools (git)
@@ -34,6 +39,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     websockify \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
+
+# Install a pinned Mihomo release for both published image architectures.
+RUN case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+        amd64) MIHOMO_ASSET="mihomo-linux-amd64-compatible-${MIHOMO_VERSION}.gz"; MIHOMO_SHA256="${MIHOMO_SHA256_AMD64}" ;; \
+        arm64) MIHOMO_ASSET="mihomo-linux-arm64-${MIHOMO_VERSION}.gz"; MIHOMO_SHA256="${MIHOMO_SHA256_ARM64}" ;; \
+        *) echo "Unsupported Mihomo architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/${MIHOMO_ASSET}" -o /tmp/mihomo.gz \
+    && echo "${MIHOMO_SHA256}  /tmp/mihomo.gz" | sha256sum -c - \
+    && gzip -dc /tmp/mihomo.gz > /usr/local/bin/mihomo \
+    && chmod 0755 /usr/local/bin/mihomo \
+    && mkdir -p /usr/share/licenses/mihomo \
+    && curl -fsSL "https://raw.githubusercontent.com/MetaCubeX/mihomo/${MIHOMO_VERSION}/LICENSE" -o /usr/share/licenses/mihomo/LICENSE \
+    && printf '%s\n' "Source: https://github.com/MetaCubeX/mihomo/tree/${MIHOMO_VERSION}" > /usr/share/licenses/mihomo/SOURCE \
+    && rm /tmp/mihomo.gz \
+    && mihomo -v
 
 # Copy package manifests and install all dependencies (including dev for build tools)
 # Layer is cached unless package.json changes
@@ -93,7 +114,10 @@ EXPOSE 7860 7861
 
 # Configure runtime environment
 ENV NODE_ENV=production \
-    CAMOUFOX_EXECUTABLE_PATH=/app/camoufox-linux/camoufox
+    CAMOUFOX_EXECUTABLE_PATH=/app/camoufox-linux/camoufox \
+    MIHOMO_PATH=/usr/local/bin/mihomo
+
+VOLUME ["/app/data"]
 
 # Health check for container orchestration platforms
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \

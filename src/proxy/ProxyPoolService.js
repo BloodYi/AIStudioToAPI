@@ -1,0 +1,400 @@
+const crypto = require("crypto");
+const axios = require("axios");
+const { SocksProxyAgent } = require("socks-proxy-agent");
+const ProxyPoolStore = require("./ProxyPoolStore");
+const ProxyNodeParser = require("./ProxyNodeParser");
+const MihomoManager = require("./MihomoManager");
+const ProxyBindingService = require("./ProxyBindingService");
+
+class ProxyPoolService {
+    constructor({ authSource, browserManager, logger }) {
+        this.logger = logger;
+        this.browserManager = browserManager;
+        this.store = new ProxyPoolStore(logger);
+        this.manager = new MihomoManager(logger);
+        this.bindings = new ProxyBindingService(this.store, this.manager, browserManager, authSource);
+        this.tasks = new Map();
+        this.testResults = new Map();
+        browserManager.setProxyResolver(authIndex => this.bindings.resolve(authIndex));
+    }
+
+    async initialize() {
+        const snapshot = this.store.snapshot();
+        if (snapshot.settings.enabled) {
+            try {
+                await this.manager.start(snapshot);
+            } catch (error) {
+                this.logger.error(
+                    `[ProxyPool] Mihomo startup failed; bound accounts will remain unavailable: ${error.message}`
+                );
+            }
+        }
+    }
+
+    sanitizeNode(node) {
+        const { password, ...safe } = node;
+        return { ...safe, hasPassword: Boolean(password) };
+    }
+
+    status() {
+        const data = this.store.snapshot();
+        return {
+            bindingCount: Object.values(data.bindings).filter(item => item.desiredNodeId).length,
+            enabled: data.settings.enabled,
+            enabledNodeCount: data.nodes.filter(node => node.enabled !== false && node.status !== "missing").length,
+            mihomo: this.manager.inspect(data.settings),
+            nodeCount: data.nodes.length,
+            subscriptionCount: data.subscriptions.length,
+        };
+    }
+
+    settings() {
+        const { binaryPath, ...settings } = this.store.snapshot().settings;
+        return { ...settings, binaryPath: binaryPath ? "(configured)" : "" };
+    }
+
+    nodes() {
+        const bindings = Object.values(this.store.data.bindings);
+        const contexts = [...this.browserManager.contexts.values()];
+        return this.store.snapshot().nodes.map(node => ({
+            ...this.sanitizeNode(node),
+            ...(this.testResults.get(node.id) || {}),
+            boundAccounts: bindings.filter(binding => binding.desiredNodeId === node.id).length,
+            runningContexts: contexts.filter(context => context.proxyInfo?.appliedNodeId === node.id).length,
+        }));
+    }
+
+    proxyForNode(id) {
+        const snapshot = this.store.snapshot();
+        const node = snapshot.nodes.find(entry => entry.id === id);
+        if (!node) throw Object.assign(new Error("Node not found"), { status: 404 });
+        if (
+            !snapshot.settings.enabled ||
+            node.enabled === false ||
+            node.status === "missing" ||
+            !this.manager.status.ready
+        )
+            throw Object.assign(new Error("Selected VNC proxy node is unavailable"), { status: 503 });
+        return {
+            display: `socks5://127.0.0.1:${node.localPort}`,
+            nodeId: node.id,
+            proxy: { server: `socks5://127.0.0.1:${node.localPort}` },
+            source: "mihomo_pool",
+        };
+    }
+
+    _allocatePort(data) {
+        const used = new Set([data.settings.controllerPort, ...data.nodes.map(node => node.localPort)]);
+        let port = data.settings.basePort;
+        while (used.has(port) && port <= 65535) port++;
+        if (port > 65535) throw Object.assign(new Error("No local proxy port available"), { status: 409 });
+        return port;
+    }
+
+    _normalizeNode(input, data, existing = null) {
+        const parsed = ProxyNodeParser.validate({
+            ...existing,
+            ...input,
+            password: input.password || existing?.password || "",
+        });
+        const now = new Date().toISOString();
+        return {
+            ...parsed,
+            createdAt: existing?.createdAt || now,
+            enabled: input.enabled !== false,
+            id: existing?.id || `node-${crypto.randomBytes(6).toString("hex")}`,
+            localPort: existing?.localPort || this._allocatePort(data),
+            source: existing?.source || input.source || "manual",
+            updatedAt: now,
+        };
+    }
+
+    async _commit(next) {
+        const previous = this.store.snapshot();
+        if (next.settings.enabled) {
+            try {
+                await this.manager.reload(next);
+            } catch (error) {
+                if (previous.settings.enabled && this.manager.status.running)
+                    await this.manager.reload(previous).catch(() => {});
+                throw error;
+            }
+        }
+        await this.store.replace(next);
+        if (!next.settings.enabled && this.manager.status.running) await this.manager.stop();
+        return next;
+    }
+
+    async updateSettings(input) {
+        const next = this.store.snapshot();
+        for (const key of ["enabled", "binaryPath", "basePort", "controllerPort"])
+            if (
+                Object.prototype.hasOwnProperty.call(input, key) &&
+                !(key === "binaryPath" && input[key] === "(configured)")
+            )
+                next.settings[key] = input[key];
+        next.settings.basePort = Number(next.settings.basePort);
+        next.settings.controllerPort = Number(next.settings.controllerPort);
+        if (
+            ![next.settings.basePort, next.settings.controllerPort].every(
+                port => Number.isInteger(port) && port > 0 && port < 65536
+            )
+        )
+            throw Object.assign(new Error("Invalid basePort or controllerPort"), { status: 400 });
+        await this._commit(next);
+        return this.settings();
+    }
+
+    async addNode(input) {
+        const next = this.store.snapshot();
+        const node = this._normalizeNode(input, next);
+        next.nodes.push(node);
+        await this._commit(next);
+        return this.sanitizeNode(node);
+    }
+
+    async updateNode(id, input) {
+        const next = this.store.snapshot();
+        const index = next.nodes.findIndex(node => node.id === id);
+        if (index < 0) throw Object.assign(new Error("Node not found"), { status: 404 });
+        next.nodes[index] = this._normalizeNode(input, next, next.nodes[index]);
+        await this._commit(next);
+        return this.sanitizeNode(next.nodes[index]);
+    }
+
+    async deleteNode(id) {
+        const next = this.store.snapshot();
+        const bound = Object.values(next.bindings).some(binding => binding.desiredNodeId === id);
+        const running = [...this.browserManager.contexts.values()].some(data => data.proxyInfo?.appliedNodeId === id);
+        if (bound || running)
+            throw Object.assign(new Error("Node is used by a binding or running context"), { status: 409 });
+        const index = next.nodes.findIndex(node => node.id === id);
+        if (index < 0) throw Object.assign(new Error("Node not found"), { status: 404 });
+        next.nodes.splice(index, 1);
+        await this._commit(next);
+    }
+
+    previewImport(text, format = "links") {
+        const result =
+            format === "subscription" ? ProxyNodeParser.parseSubscription(text) : ProxyNodeParser.parseText(text);
+        return { ...result, nodes: result.nodes.map(node => this.sanitizeNode(node)) };
+    }
+
+    async importNodes(text, format = "links") {
+        const parsed =
+            format === "subscription" ? ProxyNodeParser.parseSubscription(text) : ProxyNodeParser.parseText(text);
+        const next = this.store.snapshot();
+        const existing = new Set(next.nodes.map(node => `${node.type}|${node.host}|${node.port}|${node.name}`));
+        const added = [];
+        for (const value of parsed.nodes) {
+            const key = `${value.type}|${value.host}|${value.port}|${value.name}`;
+            if (existing.has(key)) continue;
+            const node = this._normalizeNode(value, next);
+            next.nodes.push(node);
+            added.push(node);
+            existing.add(key);
+        }
+        await this._commit(next);
+        return {
+            added: added.map(node => this.sanitizeNode(node)),
+            errors: parsed.errors,
+            skipped: parsed.nodes.length - added.length,
+        };
+    }
+
+    subscriptions() {
+        return this.store.snapshot().subscriptions.map(({ url, ...item }) => {
+            try {
+                const parsed = new URL(url);
+                return { ...item, url: `${parsed.origin}${parsed.pathname}` };
+            } catch {
+                return { ...item, url: "(invalid URL)" };
+            }
+        });
+    }
+
+    async addSubscription(input) {
+        let parsedUrl;
+        try {
+            parsedUrl = new URL(input.url);
+        } catch {
+            throw Object.assign(new Error("Valid subscription URL is required"), { status: 400 });
+        }
+        if (!["http:", "https:"].includes(parsedUrl.protocol))
+            throw Object.assign(new Error("Only HTTP(S) subscriptions are supported"), { status: 400 });
+        const next = this.store.snapshot();
+        const subscription = {
+            createdAt: new Date().toISOString(),
+            enabled: input.enabled !== false,
+            id: `sub-${crypto.randomBytes(6).toString("hex")}`,
+            lastError: null,
+            lastRefreshedAt: null,
+            name: input.name || parsedUrl.hostname,
+            url: input.url,
+        };
+        next.subscriptions.push(subscription);
+        await this.store.replace(next);
+        return { ...subscription, url: parsedUrl.origin };
+    }
+
+    async refreshSubscription(id) {
+        const current = this.store.snapshot();
+        const subscription = current.subscriptions.find(item => item.id === id);
+        if (!subscription) throw Object.assign(new Error("Subscription not found"), { status: 404 });
+        try {
+            const response = await fetch(subscription.url, { redirect: "follow", signal: AbortSignal.timeout(15000) });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const parsed = ProxyNodeParser.parseSubscription(
+                await response.text(),
+                response.headers.get("content-type") || ""
+            );
+            const next = this.store.snapshot();
+            const sub = next.subscriptions.find(item => item.id === id);
+            const oldByStable = new Map(
+                next.nodes.filter(node => node.subscriptionId === id).map(node => [node.stableKey, node])
+            );
+            const seen = new Set();
+            for (const value of parsed.nodes) {
+                const stableKey = `${value.type}|${value.host}|${value.port}|${value.name}`;
+                seen.add(stableKey);
+                const old = oldByStable.get(stableKey);
+                if (old)
+                    Object.assign(old, value, { enabled: true, status: "active", updatedAt: new Date().toISOString() });
+                else
+                    next.nodes.push({
+                        ...this._normalizeNode(value, next),
+                        id: ProxyNodeParser.stableId(value, id),
+                        source: "subscription",
+                        stableKey,
+                        status: "active",
+                        subscriptionId: id,
+                    });
+            }
+            for (const node of next.nodes.filter(node => node.subscriptionId === id && !seen.has(node.stableKey)))
+                node.status = "missing";
+            sub.lastError = null;
+            sub.lastRefreshedAt = new Date().toISOString();
+            sub.nodeCount = parsed.nodes.length;
+            await this._commit(next);
+            return { errors: parsed.errors, nodeCount: parsed.nodes.length, refreshedAt: sub.lastRefreshedAt };
+        } catch (error) {
+            const failed = this.store.snapshot();
+            const sub = failed.subscriptions.find(item => item.id === id);
+            sub.lastError = error.message;
+            await this.store.replace(failed);
+            throw Object.assign(new Error(`Subscription refresh failed: ${error.message}`), { status: 502 });
+        }
+    }
+
+    async setBinding(accountKey, desiredNodeId) {
+        return this.setBindings([{ accountKey, desiredNodeId }]);
+    }
+
+    async setBindings(items) {
+        const next = this.store.snapshot();
+        const validAccounts = new Set(this.bindings.list().map(item => item.accountKey));
+        for (const item of items) {
+            const key = String(item.accountKey || "").toLowerCase();
+            if (!validAccounts.has(key)) throw Object.assign(new Error(`Unknown account: ${key}`), { status: 404 });
+            if (item.desiredNodeId && !next.nodes.some(node => node.id === item.desiredNodeId))
+                throw Object.assign(new Error(`Unknown node: ${item.desiredNodeId}`), { status: 400 });
+            if (item.desiredNodeId)
+                next.bindings[key] = { desiredNodeId: item.desiredNodeId, updatedAt: new Date().toISOString() };
+            else delete next.bindings[key];
+        }
+        await this.store.replace(next);
+        return this.bindings.list();
+    }
+
+    apply(accountKey, waitForIdle = true) {
+        const account = this.bindings.list().find(item => item.accountKey === String(accountKey).toLowerCase());
+        if (!account) throw Object.assign(new Error("Account not found"), { status: 404 });
+        const id = `task-${crypto.randomBytes(8).toString("hex")}`;
+        const task = { accountKey: account.accountKey, createdAt: new Date().toISOString(), id, state: "queued" };
+        this.tasks.set(id, task);
+        this._runApply(task, account.authIndex, waitForIdle).catch(() => {});
+        return task;
+    }
+
+    async _runApply(task, authIndex, waitForIdle) {
+        try {
+            task.state = "draining";
+            const data = this.browserManager.contexts.get(authIndex);
+            if (data) {
+                data.draining = true;
+                data.proxyPoolState = "draining";
+            }
+            while (!this.browserManager.isAccountContextIdle(authIndex)) {
+                if (!waitForIdle) {
+                    task.state = "skipped_busy";
+                    if (data) {
+                        data.draining = false;
+                        delete data.proxyPoolState;
+                    }
+                    return;
+                }
+                await new Promise(resolve => setTimeout(resolve, 250));
+            }
+            task.state = "rebuilding";
+            if (data) data.proxyPoolState = "rebuilding";
+            await this.browserManager.rebuildAccountContext(authIndex);
+            task.state = "completed";
+            task.completedAt = new Date().toISOString();
+        } catch (error) {
+            task.state = "failed";
+            task.error = error.message;
+            task.completedAt = new Date().toISOString();
+        }
+    }
+
+    task(id) {
+        return this.tasks.get(id) || null;
+    }
+
+    async testNode(id) {
+        const node = this.store.data.nodes.find(entry => entry.id === id);
+        if (!node) throw Object.assign(new Error("Node not found"), { status: 404 });
+        try {
+            if (!this.manager.status.ready) throw Object.assign(new Error("Mihomo is not ready"), { status: 503 });
+            const latencyMs = await this.manager.testProxy(
+                node,
+                this.store.data.automation.testUrl,
+                this.store.data.automation.healthTimeoutMs,
+                this.store.data.settings.controllerPort
+            );
+            let exitIp = null;
+            if (this.store.data.automation.exitIpUrl) {
+                const agent = new SocksProxyAgent(`socks5h://127.0.0.1:${node.localPort}`);
+                const response = await axios.get(this.store.data.automation.exitIpUrl, {
+                    httpAgent: agent,
+                    httpsAgent: agent,
+                    maxContentLength: 1024 * 1024,
+                    proxy: false,
+                    timeout: this.store.data.automation.healthTimeoutMs,
+                });
+                if (typeof response.data === "object")
+                    exitIp = response.data.ip || response.data.query || response.data.address || null;
+                else
+                    exitIp = String(response.data).match(/\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[0-9a-f:]{3,}\b/i)?.[0] || null;
+            }
+            const result = { exitIp, latencyMs, message: "ok", success: true, testedAt: new Date().toISOString() };
+            this.testResults.set(id, result);
+            return result;
+        } catch (error) {
+            this.testResults.set(id, {
+                exitIp: null,
+                latencyMs: null,
+                message: error.message,
+                success: false,
+                testedAt: new Date().toISOString(),
+            });
+            throw error;
+        }
+    }
+
+    async shutdown() {
+        await this.manager.stop();
+    }
+}
+
+module.exports = ProxyPoolService;

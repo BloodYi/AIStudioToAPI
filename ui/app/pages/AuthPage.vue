@@ -30,6 +30,15 @@
             style="position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 999"
         >
             <div class="vnc-action-bar">
+                <select
+                    v-model="selectedNodeId"
+                    class="vnc-proxy-select"
+                    title="登录代理节点"
+                    @change="changeProxyNode"
+                >
+                    <option value="">默认代理</option>
+                    <option v-for="node in proxyNodes" :key="node.id" :value="node.id">{{ node.name }}</option>
+                </select>
                 <button
                     class="vnc-bar-button"
                     type="button"
@@ -263,6 +272,8 @@ const statusTitle = ref("");
 const statusTone = ref("info");
 const textInput = ref("");
 const textInputRef = ref(null);
+const proxyNodes = ref([]);
+const selectedNodeId = ref(sessionStorage.getItem("vncProxyNodeId") || "");
 
 // Initialize theme
 useTheme();
@@ -309,6 +320,12 @@ const cleanupSession = () => {
             method: "DELETE",
         }).catch(() => {});
     }
+};
+
+const changeProxyNode = () => {
+    sessionStorage.setItem("vncProxyNodeId", selectedNodeId.value);
+    cleanupSession();
+    window.location.reload();
 };
 
 const clearStatus = () => {
@@ -399,7 +416,7 @@ const loadVncClient = async (vncContainer, vncSurface) => {
         const initialHeight = vncContainer.clientHeight;
 
         const response = await fetch("/api/vnc/sessions", {
-            body: JSON.stringify({ height: initialHeight, width: initialWidth }),
+            body: JSON.stringify({ height: initialHeight, nodeId: selectedNodeId.value || null, width: initialWidth }),
             headers: { "Content-Type": "application/json" },
             method: "POST",
         });
@@ -612,7 +629,16 @@ const startVncIfNeeded = () => {
     initializeVnc();
 };
 
-onMounted(() => {
+onMounted(async () => {
+    try {
+        const response = await fetch("/api/proxy-pool/nodes");
+        if (response.ok) {
+            const data = await response.json();
+            proxyNodes.value = (data.nodes || []).filter(node => node.enabled && node.status !== "missing");
+        }
+    } catch {
+        proxyNodes.value = [];
+    }
     document.title = t("authPageTitle");
 
     // Listen for language changes
@@ -779,6 +805,16 @@ onBeforeUnmount(() => {
     display: flex;
     gap: @vnc-bar-gap;
     padding: @vnc-bar-padding @vnc-bar-padding;
+}
+
+.vnc-proxy-select {
+    max-width: 160px;
+    height: @vnc-button-size;
+    padding: 0 10px;
+    border: 1px solid @vnc-toolbar-border;
+    border-radius: 8px;
+    background: @vnc-toolbar-bg;
+    color: inherit;
 }
 
 .vnc-bar-button {

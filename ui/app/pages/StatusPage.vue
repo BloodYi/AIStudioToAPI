@@ -99,6 +99,27 @@
                         <path d="M7 16l4-4 3 3 5-7"></path>
                     </svg>
                 </button>
+                <button
+                    class="menu-item"
+                    :class="{ active: activeTab === 'proxy-pool' }"
+                    title="节点池"
+                    @click="switchTab('proxy-pool')"
+                >
+                    <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        width="24"
+                        height="24"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                    >
+                        <circle cx="6" cy="6" r="3" />
+                        <circle cx="18" cy="6" r="3" />
+                        <circle cx="12" cy="18" r="3" />
+                        <path d="m8.6 7.5 2.1 7M15.4 7.5l-2.1 7M9 6h6" />
+                    </svg>
+                </button>
             </div>
 
             <div class="sidebar-footer">
@@ -2705,6 +2726,10 @@
                 </div>
             </div>
 
+            <div v-if="activeTab === 'proxy-pool'" class="view-container">
+                <ProxyPoolPanel />
+            </div>
+
             <!-- LOGS VIEW -->
             <div v-if="activeTab === 'logs'" class="view-container logs-view-container">
                 <header class="page-header" style="display: flex; justify-content: space-between; align-items: center">
@@ -2837,6 +2862,7 @@ import { useTheme } from "../utils/useTheme";
 import EnvVarTooltip from "../components/EnvVarTooltip.vue";
 
 import SchedulerStatus from "../components/SchedulerStatus.vue";
+import ProxyPoolPanel from "../components/proxy/ProxyPoolPanel.vue";
 
 const schedulerData = ref(null);
 const router = useRouter();

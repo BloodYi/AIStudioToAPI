@@ -31,7 +31,7 @@
         "lint:css:fix": "stylelint \"{ui,ui-public}/**/*.{css,less}\" --fix",
         "format": "prettier --write .",
         "format:check": "prettier --check .",
-        "test": "node tests/model-scheduler.test.js && node tests/scheduled-request.test.js && node tests/browser-workers.test.js && node tests/realtime-dashboard.test.js && node tests/public-dashboard.test.js && node tests/sqlite-storage.test.js"
+        "test": "node tests/model-scheduler.test.js && node tests/scheduled-request.test.js && node tests/browser-workers.test.js && node tests/realtime-dashboard.test.js && node tests/public-dashboard.test.js && node tests/sqlite-storage.test.js && node tests/proxy-pool.test.js"
     },
     "dependencies": {
         "archiver": "^7.0.1",
@@ -44,12 +44,15 @@
         "jszip": "^3.10.1",
         "mime-types": "^3.0.2",
         "playwright": "1.59.1",
-        "ws": "^8.17.0"
+        "socks-proxy-agent": "^8.0.5",
+        "ws": "^8.17.0",
+        "yaml": "^2.9.1"
     },
     "devDependencies": {
         "@babel/core": "^7.28.5",
         "@babel/eslint-parser": "^7.28.5",
         "@vitejs/plugin-vue": "^5.1.0",
+        "@vue/shared": "^3.4.26",
         "concurrently": "^9.2.1",
         "cross-env": "^7.0.3",
         "element-plus": "^2.7.2",
@@ -73,8 +76,7 @@
         "vite": "^5.4.8",
         "vue": "^3.4.26",
         "vue-eslint-parser": "^10.2.0",
-        "vue-router": "^4.3.2",
-        "@vue/shared": "^3.4.26"
+        "vue-router": "^4.3.2"
     },
     "lint-staged": {
         "*.{js,jsx,ts,tsx}": [

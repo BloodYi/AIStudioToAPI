@@ -24,6 +24,7 @@ const UsageStatsService = require("./UsageStatsService");
 const ConfigLoader = require("../utils/ConfigLoader");
 const WebRoutes = require("../routes/WebRoutes");
 const PublicDashboardServer = require("../public/PublicDashboardServer");
+const ProxyPoolService = require("../proxy/ProxyPoolService");
 
 /**
  * Proxy Server System
@@ -117,6 +118,12 @@ class ProxyServerSystem extends EventEmitter {
         }
         this.browserManager.setSystemBusyProvider(() => this.requestHandler?.isSystemBusy === true);
 
+        this.proxyPoolService = new ProxyPoolService({
+            authSource: this.authSource,
+            browserManager: this.browserManager,
+            logger: this.logger,
+        });
+
         this.httpServer = null;
         this.publicDashboardServer = null;
         this.wsServer = null;
@@ -125,6 +132,7 @@ class ProxyServerSystem extends EventEmitter {
 
     async start(initialAuthIndex = null) {
         this.logger.info("[System] Starting flexible startup process...");
+        await this.proxyPoolService.initialize();
         await this.usageStatsService.ready;
         await this._startHttpServer();
         try {
@@ -659,6 +667,8 @@ class ProxyServerSystem extends EventEmitter {
         }
 
         this.scheduler?.close();
+
+        await this.proxyPoolService?.shutdown();
 
         // Close all message queues
         if (this.connectionRegistry) {
