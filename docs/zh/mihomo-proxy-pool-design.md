@@ -466,6 +466,7 @@ HTTPS_PROXY / HTTP_PROXY / ALL_PROXY
 | `POST` | `/api/proxy-pool/nodes/import` | 批量导入分享链接或结构化文本 |
 | `POST` | `/api/proxy-pool/nodes/:id/test` | 测试单个节点 |
 | `POST` | `/api/proxy-pool/nodes/test` | 测试选中节点 |
+| `POST` | `/api/proxy-pool/nodes/delete` | 事务性批量删除未使用节点 |
 
 测试结果示例：
 
@@ -481,6 +482,8 @@ HTTPS_PROXY / HTTP_PROXY / ALL_PROXY
 
 `exitIp` 只有在配置了出口 IP 测试地址时返回。测试失败只更新展示状态，不自动解绑账号。
 
+远程节点测试必须通过该节点对应的本地 SOCKS listener 发起真实 HTTP(S) 请求，不能仅依赖 Mihomo 控制端 `/delay` 的笼统状态码。管理页允许配置测试 URL、可选出口 IP URL 和超时时间；失败信息应区分 Mihomo 未就绪、SOCKS listener 连接失败、超时和目标 HTTP 状态。
+
 ### 10.3 绑定
 
 | 方法 | 路径 | 说明 |
@@ -494,6 +497,8 @@ HTTPS_PROXY / HTTP_PROXY / ALL_PROXY
 | `GET` | `/api/proxy-pool/tasks/:taskId` | 查询应用任务状态 |
 
 批量绑定请求必须是单次持久化事务，不能逐个账号写文件。
+
+订阅管理另外提供 `DELETE /api/proxy-pool/subscriptions/:id` 和 `POST /api/proxy-pool/subscriptions/delete`。删除订阅时一并删除其生成的节点；只要其中任一节点仍有期望绑定或运行中 Context，整批操作返回 `409` 且不写入部分结果。
 
 ## 11. 前端页面设计
 
@@ -531,6 +536,8 @@ HTTPS_PROXY / HTTP_PROXY / ALL_PROXY
 节点编辑弹窗支持 Shadowsocks 和 SOCKS5 的类型字段。批量导入支持一行一个 URI，并在保存前展示解析成功、重复和失败条目。
 
 节点编辑弹窗还支持创建唯一的“直连（VPS 出口）”节点。该节点的远程地址和本地端口显示为“不适用”，测试操作直接从应用进程访问测试地址，不能调用 Mihomo 控制端进行测试。
+
+节点表和订阅表均提供行复选框、表头全选框和批量删除按钮。批量删除必须先展示选中数量和影响范围，并由后端以单次事务执行，不能逐行调用删除接口造成部分成功。
 
 ### 11.3 账号出口列表
 
@@ -636,6 +643,7 @@ Dockerfile 增加：
 - 管理 API 永远不返回明文密码；
 - 更新节点时，空密码表示保留旧值；
 - 日志中的 URI、用户名、密码和控制端 secret 必须脱敏；
+- 订阅列表只返回协议、主机、端口和固定的 `/***` 占位符；用户名、密码、路径和查询参数均不得返回到前端；
 - 分享链接解析失败时，不把完整含密钥链接写入日志；
 - 前端不能把密码保存在浏览器持久化存储中；
 - 批量导出默认不包含密码；

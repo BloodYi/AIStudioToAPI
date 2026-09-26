@@ -59,6 +59,10 @@ class ProxyPoolRoutes {
             })
         );
         app.post(
+            "/api/proxy-pool/nodes/delete",
+            route(async (req, res) => res.json(await this.service.deleteNodes(req.body?.ids)))
+        );
+        app.post(
             "/api/proxy-pool/nodes/import",
             route(async (req, res) => {
                 const action = req.body?.preview ? "previewImport" : "importNodes";
@@ -142,6 +146,14 @@ class ProxyPoolRoutes {
         app.post(
             "/api/proxy-pool/subscriptions/:id/refresh",
             route(async (req, res) => res.json(await this.service.refreshSubscription(req.params.id)))
+        );
+        app.delete(
+            "/api/proxy-pool/subscriptions/:id",
+            route(async (req, res) => res.json(await this.service.deleteSubscriptions([req.params.id])))
+        );
+        app.post(
+            "/api/proxy-pool/subscriptions/delete",
+            route(async (req, res) => res.json(await this.service.deleteSubscriptions(req.body?.ids)))
         );
     }
 }

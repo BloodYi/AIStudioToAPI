@@ -49,8 +49,15 @@ class ProxyPoolService {
     }
 
     settings() {
-        const { binaryPath, ...settings } = this.store.snapshot().settings;
-        return { ...settings, binaryPath: binaryPath ? "(configured)" : "" };
+        const snapshot = this.store.snapshot();
+        const { binaryPath, ...settings } = snapshot.settings;
+        return {
+            ...settings,
+            binaryPath: binaryPath ? "(configured)" : "",
+            exitIpUrl: snapshot.automation.exitIpUrl,
+            healthTimeoutMs: snapshot.automation.healthTimeoutMs,
+            testUrl: snapshot.automation.testUrl,
+        };
     }
 
     nodes() {
@@ -150,14 +157,34 @@ class ProxyPoolService {
                 !(key === "binaryPath" && input[key] === "(configured)")
             )
                 next.settings[key] = input[key];
+        for (const key of ["exitIpUrl", "healthTimeoutMs", "testUrl"])
+            if (Object.prototype.hasOwnProperty.call(input, key)) next.automation[key] = input[key];
         next.settings.basePort = Number(next.settings.basePort);
         next.settings.controllerPort = Number(next.settings.controllerPort);
+        next.automation.healthTimeoutMs = Number(next.automation.healthTimeoutMs);
         if (
             ![next.settings.basePort, next.settings.controllerPort].every(
                 port => Number.isInteger(port) && port > 0 && port < 65536
             )
         )
             throw Object.assign(new Error("Invalid basePort or controllerPort"), { status: 400 });
+        if (
+            !Number.isInteger(next.automation.healthTimeoutMs) ||
+            next.automation.healthTimeoutMs < 1000 ||
+            next.automation.healthTimeoutMs > 120000
+        )
+            throw Object.assign(new Error("healthTimeoutMs must be between 1000 and 120000"), { status: 400 });
+        for (const key of ["testUrl", "exitIpUrl"]) {
+            if (!next.automation[key] && key === "exitIpUrl") continue;
+            let parsed;
+            try {
+                parsed = new URL(next.automation[key]);
+            } catch {
+                throw Object.assign(new Error(`${key} must be a valid HTTP(S) URL`), { status: 400 });
+            }
+            if (!["http:", "https:"].includes(parsed.protocol))
+                throw Object.assign(new Error(`${key} must use HTTP(S)`), { status: 400 });
+        }
         await this._commit(next);
         return this.settings();
     }
@@ -180,15 +207,36 @@ class ProxyPoolService {
     }
 
     async deleteNode(id) {
+        await this.deleteNodes([id]);
+    }
+
+    async deleteNodes(ids) {
+        const uniqueIds = [...new Set((Array.isArray(ids) ? ids : []).map(String).filter(Boolean))];
+        if (!uniqueIds.length) throw Object.assign(new Error("At least one node id is required"), { status: 400 });
         const next = this.store.snapshot();
-        const bound = Object.values(next.bindings).some(binding => binding.desiredNodeId === id);
-        const running = [...this.browserManager.contexts.values()].some(data => data.proxyInfo?.appliedNodeId === id);
-        if (bound || running)
-            throw Object.assign(new Error("Node is used by a binding or running context"), { status: 409 });
-        const index = next.nodes.findIndex(node => node.id === id);
-        if (index < 0) throw Object.assign(new Error("Node not found"), { status: 404 });
-        next.nodes.splice(index, 1);
+        const selected = next.nodes.filter(node => uniqueIds.includes(node.id));
+        if (selected.length !== uniqueIds.length)
+            throw Object.assign(new Error("One or more nodes were not found"), { status: 404 });
+        const selectedIds = new Set(uniqueIds);
+        const boundIds = new Set(
+            Object.values(next.bindings)
+                .map(binding => binding.desiredNodeId)
+                .filter(id => selectedIds.has(id))
+        );
+        const runningIds = new Set(
+            [...this.browserManager.contexts.values()]
+                .map(data => data.proxyInfo?.appliedNodeId)
+                .filter(id => selectedIds.has(id))
+        );
+        const blocked = selected.filter(node => boundIds.has(node.id) || runningIds.has(node.id));
+        if (blocked.length)
+            throw Object.assign(new Error(`Cannot delete in-use nodes: ${blocked.map(node => node.name).join(", ")}`), {
+                status: 409,
+            });
+        next.nodes = next.nodes.filter(node => !selectedIds.has(node.id));
         await this._commit(next);
+        for (const id of selectedIds) this.testResults.delete(id);
+        return { deleted: selected.length };
     }
 
     previewImport(text, format = "links") {
@@ -223,7 +271,7 @@ class ProxyPoolService {
         return this.store.snapshot().subscriptions.map(({ url, ...item }) => {
             try {
                 const parsed = new URL(url);
-                return { ...item, url: `${parsed.origin}${parsed.pathname}` };
+                return { ...item, url: `${parsed.protocol}//${parsed.host}/***` };
             } catch {
                 return { ...item, url: "(invalid URL)" };
             }
@@ -301,6 +349,36 @@ class ProxyPoolService {
             await this.store.replace(failed);
             throw Object.assign(new Error(`Subscription refresh failed: ${error.message}`), { status: 502 });
         }
+    }
+
+    async deleteSubscriptions(ids) {
+        const uniqueIds = [...new Set((Array.isArray(ids) ? ids : []).map(String).filter(Boolean))];
+        if (!uniqueIds.length)
+            throw Object.assign(new Error("At least one subscription id is required"), { status: 400 });
+        const next = this.store.snapshot();
+        const selected = next.subscriptions.filter(subscription => uniqueIds.includes(subscription.id));
+        if (selected.length !== uniqueIds.length)
+            throw Object.assign(new Error("One or more subscriptions were not found"), { status: 404 });
+        const selectedIds = new Set(uniqueIds);
+        const ownedNodes = next.nodes.filter(node => selectedIds.has(node.subscriptionId));
+        const ownedNodeIds = new Set(ownedNodes.map(node => node.id));
+        const boundIds = new Set(Object.values(next.bindings).map(binding => binding.desiredNodeId));
+        const runningIds = new Set(
+            [...this.browserManager.contexts.values()].map(data => data.proxyInfo?.appliedNodeId).filter(Boolean)
+        );
+        const blocked = ownedNodes.filter(node => boundIds.has(node.id) || runningIds.has(node.id));
+        if (blocked.length)
+            throw Object.assign(
+                new Error(
+                    `Cannot delete subscriptions with in-use nodes: ${blocked.map(node => node.name).join(", ")}`
+                ),
+                { status: 409 }
+            );
+        next.subscriptions = next.subscriptions.filter(subscription => !selectedIds.has(subscription.id));
+        next.nodes = next.nodes.filter(node => !ownedNodeIds.has(node.id));
+        await this._commit(next);
+        for (const id of ownedNodeIds) this.testResults.delete(id);
+        return { deletedNodes: ownedNodes.length, deletedSubscriptions: selected.length };
     }
 
     async setBinding(accountKey, desiredNodeId) {
@@ -400,15 +478,25 @@ class ProxyPoolService {
                 return result;
             }
             if (!this.manager.status.ready) throw Object.assign(new Error("Mihomo is not ready"), { status: 503 });
-            const latencyMs = await this.manager.testProxy(
-                node,
-                this.store.data.automation.testUrl,
-                this.store.data.automation.healthTimeoutMs,
-                this.store.data.settings.controllerPort
-            );
+            const agent = new SocksProxyAgent(`socks5h://127.0.0.1:${node.localPort}`);
+            const started = Date.now();
+            try {
+                await axios.get(this.store.data.automation.testUrl, {
+                    httpAgent: agent,
+                    httpsAgent: agent,
+                    maxContentLength: 1024 * 1024,
+                    maxRedirects: 3,
+                    proxy: false,
+                    timeout: this.store.data.automation.healthTimeoutMs,
+                    validateStatus: status => status >= 200 && status < 400,
+                });
+            } catch (cause) {
+                const detail = cause.response?.status ? `HTTP ${cause.response.status}` : cause.code || cause.message;
+                throw Object.assign(new Error(`SOCKS listener test failed: ${detail}`), { status: 502 });
+            }
+            const latencyMs = Date.now() - started;
             let exitIp = null;
             if (this.store.data.automation.exitIpUrl) {
-                const agent = new SocksProxyAgent(`socks5h://127.0.0.1:${node.localPort}`);
                 const response = await axios.get(this.store.data.automation.exitIpUrl, {
                     httpAgent: agent,
                     httpsAgent: agent,

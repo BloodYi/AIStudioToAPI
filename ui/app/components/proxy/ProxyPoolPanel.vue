@@ -20,12 +20,30 @@
             </div>
             <el-alert v-if="status.mihomo?.lastError" :title="status.mihomo.lastError" type="error" :closable="false" />
             <div class="actions">
-                <el-switch v-model="settings.enabled" active-text="启用节点池" @change="saveSettings" />
+                <el-switch v-model="settings.enabled" active-text="启用节点池" @change="saveSettings(true)" />
                 <el-input-number v-model="settings.basePort" :min="1024" :max="65535" controls-position="right" />
                 <span>起始端口</span>
                 <el-button @click="mihomo('start')">启动</el-button>
                 <el-button @click="mihomo('stop')">停止</el-button>
                 <el-button @click="mihomo('reload')">重载</el-button>
+            </div>
+            <div class="actions">
+                <el-input v-model="settings.testUrl" placeholder="节点测试 URL" style="width: 360px" />
+                <el-input
+                    v-model="settings.exitIpUrl"
+                    clearable
+                    placeholder="出口 IP URL（可选）"
+                    style="width: 360px"
+                />
+                <el-input-number
+                    v-model="settings.healthTimeoutMs"
+                    :min="1000"
+                    :max="120000"
+                    :step="1000"
+                    controls-position="right"
+                />
+                <span>超时毫秒</span>
+                <el-button @click="saveSettings(false)">保存测试设置</el-button>
             </div>
         </section>
 
@@ -33,11 +51,14 @@
             <div class="section-title">
                 <h3>代理节点</h3>
                 <div>
-                    <el-button @click="importVisible = true">批量导入</el-button
+                    <el-button type="danger" plain :disabled="!selectedNodes.length" @click="deleteSelectedNodes"
+                        >删除选中</el-button
+                    ><el-button @click="importVisible = true">批量导入</el-button
                     ><el-button type="primary" @click="openNode()">添加节点</el-button>
                 </div>
             </div>
-            <el-table :data="nodes" empty-text="暂无节点">
+            <el-table :data="nodes" empty-text="暂无节点" @selection-change="selectedNodes = $event">
+                <el-table-column type="selection" width="45" />
                 <el-table-column prop="name" label="名称" min-width="130" />
                 <el-table-column label="类型" width="90">
                     <template #default="{ row }">{{ row.type === "direct" ? "直连" : row.type }}</template>
@@ -77,16 +98,27 @@
         <section class="pool-card">
             <div class="section-title">
                 <h3>订阅（手动刷新）</h3>
-                <el-button type="primary" @click="subscriptionVisible = true">添加订阅</el-button>
+                <div>
+                    <el-button
+                        type="danger"
+                        plain
+                        :disabled="!selectedSubscriptions.length"
+                        @click="deleteSelectedSubscriptions"
+                        >删除选中</el-button
+                    >
+                    <el-button type="primary" @click="subscriptionVisible = true">添加订阅</el-button>
+                </div>
             </div>
-            <el-table :data="subscriptions" empty-text="暂无订阅">
+            <el-table :data="subscriptions" empty-text="暂无订阅" @selection-change="selectedSubscriptions = $event">
+                <el-table-column type="selection" width="45" />
                 <el-table-column prop="name" label="名称" />
                 <el-table-column prop="url" label="地址（已脱敏）" min-width="220" />
                 <el-table-column prop="nodeCount" label="节点" width="70" />
                 <el-table-column prop="lastRefreshedAt" label="最近刷新" min-width="170" />
-                <el-table-column label="操作" width="100"
+                <el-table-column label="操作" width="140"
                     ><template #default="{ row }"
-                        ><el-button link @click="refreshSubscription(row)">刷新</el-button></template
+                        ><el-button link @click="refreshSubscription(row)">刷新</el-button
+                        ><el-button link type="danger" @click="removeSubscription(row)">删除</el-button></template
                     ></el-table-column
                 >
             </el-table>
@@ -232,7 +264,14 @@ import { computed, onMounted, reactive, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 const status = reactive({ mihomo: {} });
-const settings = reactive({ basePort: 10801, controllerPort: 19090, enabled: false });
+const settings = reactive({
+    basePort: 10801,
+    controllerPort: 19090,
+    enabled: false,
+    exitIpUrl: "",
+    healthTimeoutMs: 5000,
+    testUrl: "https://www.google.com/generate_204",
+});
 const nodes = ref([]);
 const bindings = ref([]);
 const subscriptions = ref([]);
@@ -261,6 +300,8 @@ const batchNodeId = ref("");
 const bindingStates = ["unbound", "pending", "applied", "offline", "draining", "rebuilding", "error"];
 const nodeFilter = ref("");
 const selectedBindings = ref([]);
+const selectedNodes = ref([]);
+const selectedSubscriptions = ref([]);
 const stateFilter = ref("");
 const usableNodes = computed(() => nodes.value.filter(node => node.enabled && node.status !== "missing"));
 const filteredBindings = computed(() => {
@@ -301,12 +342,12 @@ const loadAll = async () => {
         ElMessage.error(error.message);
     }
 };
-const saveSettings = async () => {
+const saveSettings = async (fromToggle = false) => {
     try {
         await request("/api/proxy-pool/settings", { body: JSON.stringify(settings), method: "PUT" });
         await loadAll();
     } catch (error) {
-        settings.enabled = !settings.enabled;
+        if (fromToggle) settings.enabled = !settings.enabled;
         ElMessage.error(error.message);
     }
 };
@@ -356,6 +397,24 @@ const removeNode = async row => {
             type: "warning",
         });
         await request(`/api/proxy-pool/nodes/${row.id}`, { method: "DELETE" });
+        await loadAll();
+    } catch (error) {
+        if (error !== "cancel") ElMessage.error(error.message);
+    }
+};
+const deleteSelectedNodes = async () => {
+    try {
+        const boundCount = selectedNodes.value.reduce((sum, node) => sum + (node.boundAccounts || 0), 0);
+        await ElMessageBox.confirm(
+            `删除选中的 ${selectedNodes.value.length} 个节点？其中绑定账号数为 ${boundCount}，被使用的节点将拒绝整批删除。`,
+            "批量删除节点",
+            { type: "warning" }
+        );
+        const result = await request("/api/proxy-pool/nodes/delete", {
+            body: JSON.stringify({ ids: selectedNodes.value.map(node => node.id) }),
+            method: "POST",
+        });
+        ElMessage.success(`已删除 ${result.deleted} 个节点`);
         await loadAll();
     } catch (error) {
         if (error !== "cancel") ElMessage.error(error.message);
@@ -461,6 +520,28 @@ const refreshSubscription = async row => {
         await loadAll();
     } catch (error) {
         ElMessage.error(error.message);
+    }
+};
+const removeSubscription = async row => {
+    await deleteSubscriptions([row]);
+};
+const deleteSelectedSubscriptions = async () => deleteSubscriptions(selectedSubscriptions.value);
+const deleteSubscriptions = async selected => {
+    try {
+        const nodeCount = selected.reduce((sum, subscription) => sum + (subscription.nodeCount || 0), 0);
+        await ElMessageBox.confirm(
+            `删除选中的 ${selected.length} 个订阅及其 ${nodeCount} 个节点？存在账号绑定或运行中 Context 时将拒绝整批删除。`,
+            "批量删除订阅",
+            { type: "warning" }
+        );
+        const result = await request("/api/proxy-pool/subscriptions/delete", {
+            body: JSON.stringify({ ids: selected.map(subscription => subscription.id) }),
+            method: "POST",
+        });
+        ElMessage.success(`已删除 ${result.deletedSubscriptions} 个订阅和 ${result.deletedNodes} 个节点`);
+        await loadAll();
+    } catch (error) {
+        if (error !== "cancel") ElMessage.error(error.message);
     }
 };
 const stateType = state =>

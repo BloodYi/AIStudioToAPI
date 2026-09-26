@@ -1,5 +1,7 @@
 const assert = require("assert");
 const fs = require("fs");
+const http = require("http");
+const net = require("net");
 const os = require("os");
 const path = require("path");
 const ProxyNodeParser = require("../src/proxy/ProxyNodeParser");
@@ -9,6 +11,44 @@ const ProxyBindingService = require("../src/proxy/ProxyBindingService");
 const ProxyPoolService = require("../src/proxy/ProxyPoolService");
 
 const logger = { error() {}, info() {}, warn() {} };
+
+const listen = server =>
+    new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => resolve(server.address().port));
+    });
+
+const close = server => new Promise((resolve, reject) => server.close(error => (error ? reject(error) : resolve())));
+
+function createSocksServer() {
+    return net.createServer(client => {
+        client.once("data", () => {
+            client.write(Buffer.from([5, 0]));
+            client.once("data", request => {
+                const addressType = request[3];
+                let host;
+                let portOffset;
+                if (addressType === 1) {
+                    host = [...request.subarray(4, 8)].join(".");
+                    portOffset = 8;
+                } else if (addressType === 3) {
+                    const length = request[4];
+                    host = request.subarray(5, 5 + length).toString();
+                    portOffset = 5 + length;
+                } else {
+                    client.destroy(new Error(`Unsupported SOCKS address type: ${addressType}`));
+                    return;
+                }
+                const port = request.readUInt16BE(portOffset);
+                const upstream = net.connect({ host, port }, () => {
+                    client.write(Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 0, 0]));
+                    client.pipe(upstream).pipe(client);
+                });
+                upstream.once("error", error => client.destroy(error));
+            });
+        });
+    });
+}
 
 async function main() {
     const ss = ProxyNodeParser.parseUri("ss://YWVzLTI1Ni1nY206c2VjcmV0@example.com:443#US-01");
@@ -104,6 +144,54 @@ async function main() {
     browserManager.contexts.set(0, { proxyInfo: directResolution, state: "READY" });
     assert.strictEqual(bindingService.list()[0].state, "applied");
     assert.notStrictEqual(bindingService.list()[0].state, "unbound");
+    Object.assign(serviceMethods, {
+        browserManager,
+        manager: { status: { running: false } },
+        store,
+        testResults: new Map(),
+    });
+    await assert.rejects(() => serviceMethods.deleteNodes(["node-direct"]), /Cannot delete in-use nodes/);
+
+    const subscriptionData = store.snapshot();
+    subscriptionData.bindings = {};
+    subscriptionData.subscriptions = [
+        {
+            id: "sub-one",
+            name: "Private subscription",
+            url: "https://user:password@subscription.example.com/private/token-value?key=secret",
+        },
+    ];
+    subscriptionData.nodes.find(node => node.id === "node-one").subscriptionId = "sub-one";
+    browserManager.contexts.clear();
+    await store.replace(subscriptionData);
+    assert.strictEqual(serviceMethods.subscriptions()[0].url, "https://subscription.example.com/***");
+    const deleted = await serviceMethods.deleteSubscriptions(["sub-one"]);
+    assert.deepStrictEqual(deleted, { deletedNodes: 1, deletedSubscriptions: 1 });
+    assert.deepStrictEqual(
+        store.snapshot().nodes.map(node => node.id),
+        ["node-direct"]
+    );
+
+    const targetServer = http.createServer((request, response) => {
+        response.writeHead(204, { Connection: "close" });
+        response.end();
+    });
+    const socksServer = createSocksServer();
+    try {
+        const targetPort = await listen(targetServer);
+        const socksPort = await listen(socksServer);
+        const probeData = store.snapshot();
+        probeData.nodes.push({ ...ss, enabled: true, id: "node-probe", localPort: socksPort });
+        probeData.automation.testUrl = `http://127.0.0.1:${targetPort}/generate_204`;
+        await store.replace(probeData);
+        serviceMethods.manager.status.ready = true;
+        const result = await serviceMethods.testNode("node-probe");
+        assert.strictEqual(result.success, true);
+        assert.ok(Number.isInteger(result.latencyMs));
+    } finally {
+        await Promise.all([close(socksServer), close(targetServer)]);
+    }
+
     if (oldHttpsProxy === undefined) delete process.env.HTTPS_PROXY;
     else process.env.HTTPS_PROXY = oldHttpsProxy;
 
