@@ -48,7 +48,10 @@ class ProxyBindingService {
             return {
                 appliedNodeId: node.id,
                 display: `socks5://127.0.0.1:${node.localPort}`,
-                proxy: { server: `socks5://127.0.0.1:${node.localPort}` },
+                proxy: {
+                    bypass: "localhost,127.0.0.1,::1",
+                    server: `socks5://127.0.0.1:${node.localPort}`,
+                },
                 source: "mihomo_pool",
             };
         }
