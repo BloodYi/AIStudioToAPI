@@ -227,13 +227,30 @@ class StatusRoutes {
                 timestamp = now.toISOString();
             }
 
+            const browserManager = this.serverSystem.browserManager;
+            const contextPool = browserManager.getContextInitHealth?.() || {
+                initializing: browserManager.initializingContexts?.size || 0,
+                oldestInitializingMs: 0,
+                ready: browserManager.contexts?.size || 0,
+                staleInitializing: 0,
+            };
+            const browserConnected = Boolean(browserManager.browser?.isConnected?.() ?? browserManager.browser);
+            const initLimit = this.serverSystem.scheduler?.config?.contextInitConcurrency || 1;
+            const status = !browserConnected
+                ? "unhealthy"
+                : contextPool.staleInitializing >= initLimit
+                  ? "unhealthy"
+                  : contextPool.staleInitializing > 0
+                    ? "degraded"
+                    : "ok";
             const healthStatus = {
-                browserConnected: !!this.serverSystem.browserManager.browser,
-                status: "ok",
+                browserConnected,
+                contextPool,
+                status,
                 timestamp,
                 uptime: process.uptime(),
             };
-            res.status(200).json(healthStatus);
+            res.status(status === "unhealthy" ? 503 : 200).json(healthStatus);
         });
 
         app.get("/", isAuthenticated, (req, res) => {

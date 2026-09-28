@@ -61,13 +61,23 @@ function loadSchedulerConfig(env = process.env) {
         if ((modelConcurrency[model] ?? globalConcurrency) < value.min)
             throw new Error(`Concurrency below minimum for ${model}`);
     }
+    const contextOperationTimeoutMs = integer("CONTEXT_OPERATION_TIMEOUT_MS", 10000);
+    const contextInitTotalTimeoutMs = integer("CONTEXT_INIT_TOTAL_TIMEOUT_MS", 180000);
+    if (contextInitTotalTimeoutMs <= contextOperationTimeoutMs) {
+        throw new Error("CONTEXT_INIT_TOTAL_TIMEOUT_MS must exceed CONTEXT_OPERATION_TIMEOUT_MS");
+    }
     return {
         accountConcurrency,
         accountModelConcurrency,
         allocation,
+        browserRpcFailureThreshold: integer("BROWSER_RPC_FAILURE_THRESHOLD", 2),
+        browserRpcFailureWindowMs: integer("BROWSER_RPC_FAILURE_WINDOW_MS", 60000),
+        contextCleanupTimeoutMs: integer("CONTEXT_CLEANUP_TIMEOUT_MS", 5000),
         contextCreationTimeoutMs: integer("CONTEXT_CREATION_TIMEOUT_MS", 120000),
         contextInitConcurrency: integer("CONTEXT_INIT_CONCURRENCY", 2),
+        contextInitTotalTimeoutMs,
         contextMaxConcurrency,
+        contextOperationTimeoutMs,
         contextPoolMinReady,
         dailyResetEnabled: env.SCHEDULER_DAILY_RESET_ENABLED !== "false",
         dailyResetTime,

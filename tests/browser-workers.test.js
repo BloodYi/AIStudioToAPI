@@ -612,3 +612,102 @@ test("100 cold accounts with 16-worker capacity and two launchers never overlap 
     assert.ok([...peak.values()].every(value => value === 1));
     assert.equal(peak.size, 100);
 });
+
+test("init locator and evaluate RPCs that never settle are interrupted by operation hard timeouts", async () => {
+    const manager = singleFlightFixture();
+    manager.contextOperationTimeoutMs = 10;
+    const attempt = { aborted: false, authIndex: 2, id: "2:1", phase: "ws_initialization" };
+    manager._contextInitAttempts = new Map([[2, attempt]]);
+
+    for (const operation of ["continue_button.locator.count", "launch_button.evaluate"]) {
+        await assert.rejects(
+            manager._runInitOperation(attempt, operation, () => new Promise(() => {})),
+            error => {
+                assert.equal(error.code, "PLAYWRIGHT_RPC_TIMEOUT");
+                assert.equal(error.reason, "playwright_rpc_timeout");
+                assert.equal(error.operation, operation);
+                assert.equal(error.attemptId, "2:1");
+                return true;
+            }
+        );
+    }
+});
+
+test("total init watchdog releases ownership even when runner and context close never settle", async () => {
+    const messages = [];
+    const manager = singleFlightFixture();
+    manager.contextInitTotalTimeoutMs = 10;
+    manager.contextCleanupTimeoutMs = 10;
+    manager.contexts = new Map();
+    manager.logger = {
+        debug() {},
+        error(message) {
+            messages.push(message);
+        },
+        info() {},
+        warn() {},
+    };
+
+    await assert.rejects(
+        manager._getOrStartContextInit(5, {
+            runner: async attempt => {
+                attempt.phase = "ws_initialization";
+                attempt.operation = "continue_button.locator.count";
+                attempt.context = { close: () => new Promise(() => {}) };
+                await new Promise(() => {});
+            },
+        }),
+        error => error.code === "CONTEXT_INIT_TOTAL_TIMEOUT"
+    );
+
+    assert.equal(manager._contextInitTasks.size, 0);
+    assert.equal(manager._contextInitAttempts.size, 0);
+    assert.equal(manager.initializingContexts.size, 0);
+    await new Promise(resolve => setTimeout(resolve, 15));
+    assert.ok(messages.some(message => message.includes("context_init_timeout")));
+    assert.ok(messages.some(message => message.includes("context_cleanup_timeout")));
+});
+
+test("a runner resolving after its watchdog cannot overwrite a newer attempt", async () => {
+    const manager = singleFlightFixture();
+    manager.contextInitTotalTimeoutMs = 10;
+    manager.contextCleanupTimeoutMs = 5;
+    manager.contexts = new Map();
+    let releaseOld;
+    const old = manager._getOrStartContextInit(6, {
+        runner: async attempt => {
+            await new Promise(resolve => {
+                releaseOld = resolve;
+            });
+            if (manager._isCurrentInitAttempt(attempt)) {
+                manager.contexts.set(6, { attemptId: attempt.id, value: "old" });
+            }
+        },
+    });
+    await assert.rejects(old, error => error.code === "CONTEXT_INIT_TOTAL_TIMEOUT");
+
+    manager.contextInitTotalTimeoutMs = 100;
+    await manager._getOrStartContextInit(6, {
+        runner: async attempt => {
+            manager.contexts.set(6, { attemptId: attempt.id, value: "new" });
+        },
+    });
+    releaseOld();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contexts.get(6).value, "new");
+});
+
+test("RPC timeouts require distinct accounts before browser recovery is triggered", () => {
+    const manager = singleFlightFixture();
+    manager.browserRpcFailureThreshold = 2;
+    manager.browserRpcFailureWindowMs = 60000;
+    manager._browserRpcFailures = [];
+    const recoveries = [];
+    manager._triggerBrowserRecovery = reason => recoveries.push(reason);
+
+    manager._recordBrowserRpcTimeout({ authIndex: 1 }, { operation: "page.evaluate" });
+    manager._recordBrowserRpcTimeout({ authIndex: 1 }, { operation: "locator.count" });
+    assert.deepEqual(recoveries, []);
+    manager._recordBrowserRpcTimeout({ authIndex: 2 }, { operation: "locator.count" });
+    assert.deepEqual(recoveries, ["playwright_rpc_timeout"]);
+});
