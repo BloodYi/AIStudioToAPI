@@ -153,6 +153,8 @@ If you prefer to build the Docker image yourself, you can use the following comm
 
 #### 🔑 Step 2: Account Management
 
+The console now has a dedicated `/accounts` page for password/TOTP login, background session recovery, imports and failure diagnostics. See the [deployment and operations guide](docs/zh/account-auto-login-operations.md) (Chinese).
+
 After deployment, you need to add Google accounts using one of these methods:
 
 **Method 1: VNC-Based Login (Recommended)**

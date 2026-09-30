@@ -511,10 +511,16 @@ class CreateAuth {
             // Always use max index + 1 to ensure new auth is always the latest
             // This simplifies dedup logic assumption: higher index = newer auth
             const existingIndices = this.serverSystem.authSource.availableIndices || [];
-            const nextAuthIndex = existingIndices.length > 0 ? Math.max(...existingIndices) + 1 : 0;
+            let nextAuthIndex = existingIndices.length > 0 ? Math.max(...existingIndices) + 1 : 0;
+            if (this.serverSystem.accountLoginService?.state) {
+                nextAuthIndex = await this.serverSystem.accountLoginService.exclusive(() =>
+                    this.serverSystem.accountLoginService.upload(authData)
+                );
+            }
 
             const newAuthFilePath = path.join(configDir, `auth-${nextAuthIndex}.json`);
-            fs.writeFileSync(newAuthFilePath, JSON.stringify(authData, null, 2));
+            if (!this.serverSystem.accountLoginService?.state)
+                fs.writeFileSync(newAuthFilePath, JSON.stringify(authData, null, 2));
 
             this.logger.info(`[VNC] Saved new auth file: ${newAuthFilePath}`);
 

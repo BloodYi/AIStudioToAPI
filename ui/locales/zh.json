@@ -1,7 +1,9 @@
 {
     "aborted": "已中止",
     "account": "账号",
-    "accountDedupConfirm": "将按同一邮箱保留最大 index 的 auth 文件并删除其余重复文件（前提：同一账号的多个 auth 按 index 递增生成，index 越大越新）。是否继续？",
+    "accountCredentialChooseIndex": "请输入要保留凭据的账号编号",
+    "accountCredentialConflict": "重复账号的凭据存在冲突，请选择保留哪条记录的凭据",
+    "accountDedupConfirm": "按完整邮箱去重，优先保留有效会话，再保留最大编号；凭据冲突时需选择保留的记录。是否继续？",
     "accountDedupFailed": "去重清理失败：{error}",
     "accountDedupNoop": "未发现需要清理的重复 auth。",
     "accountDedupPartialFailed": "部分去重清理失败。已删除：{removedIndices}；失败：{failed}",

@@ -1,0 +1,374 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs/promises");
+const path = require("node:path");
+const os = require("node:os");
+const { performance } = require("node:perf_hooks");
+const Service = require("../src/accounts/AccountLoginService");
+const Totp = require("../src/accounts/TotpService");
+const { parseImport, Payload } = require("../src/accounts/AuthenticatorImportService");
+const AccountRoutes = require("../src/routes/AccountRoutes");
+const logger = { debug() {}, error() {}, info() {}, warn() {} };
+const secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+async function until(predicate, timeout = 4000) {
+    const deadline = performance.now() + timeout;
+    while (!predicate()) {
+        if (performance.now() > deadline) throw new Error("Condition timed out");
+        await wait(20);
+    }
+}
+async function fixture(t, count = 0) {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "account-management-test-"));
+    const authDir = path.join(directory, "auth");
+    await fs.mkdir(authDir);
+    for (let index = 0; index < count; index++)
+        await fs.writeFile(
+            path.join(authDir, `auth-${index}.json`),
+            JSON.stringify({ accountName: `user${index}@example.com`, cookies: [], origins: [] })
+        );
+    const system = {
+        authSource: { availableIndices: Array.from({ length: count }, (_, index) => index), reloadAuthSources() {} },
+        logger,
+        scheduler: { isAccountDisabled: () => false },
+    };
+    const options = {
+        artifactDir: path.join(directory, "artifacts"),
+        authDir,
+        storePath: path.join(directory, "accounts.sqlite"),
+        workerPath: path.join(__dirname, "fixtures/account-login-executor.js"),
+    };
+    const service = new Service(system, options);
+    await service.initialize({ startQueue: false });
+    let closed = false;
+    t.after(async () => {
+        if (!closed) await service.close();
+        await fs.rm(directory, { force: true, recursive: true });
+    });
+    return {
+        close: async () => {
+            await service.close();
+            closed = true;
+        },
+        directory,
+        options,
+        service,
+        system,
+    };
+}
+test("RFC 6238 SHA1 vectors and strict OTP parameter rejection", () => {
+    const parameters = Totp.normalize(secret);
+    for (const [epoch, expected] of [
+        [59, "287082"],
+        [1111111109, "081804"],
+        [1111111111, "050471"],
+        [1234567890, "005924"],
+        [2000000000, "279037"],
+        [20000000000, "353130"],
+    ])
+        assert.equal(Totp.code(parameters, epoch * 1000), expected);
+    assert.equal(Totp.normalize("gezd gnbv gy3t qojq gezd gnbv gy3t qojq").secret, secret);
+    for (const input of [
+        `otpauth://hotp/test?secret=${secret}`,
+        `otpauth://totp/test?secret=${secret}&digits=8`,
+        `otpauth://totp/test?secret=${secret}&algorithm=SHA256`,
+        "NOT-A-SECRET",
+    ])
+        assert.throws(() => Totp.normalize(input));
+});
+test("CSV preserves BOM, quoted commas, quotes, newlines and password whitespace", () => {
+    const parsed = parseImport(
+        "csv",
+        '\ufeffemail,password,totpSecret\r\nUser@Example.com," p,a""ss\nword ",\r\nuser@example.com,second,\r\ninvalid,,'
+    );
+    assert.equal(parsed.rows[0].password, ' p,a"ss\nword ');
+    assert.equal(parsed.rows[0].email, "user@example.com");
+    assert.match(parsed.rows[1].error, /Duplicate/);
+    assert.ok(parsed.rows[2].error);
+});
+function migration(batchIndex = 0, batchSize = 1, overrides = {}) {
+    const bytes = Payload.encode(
+        Payload.create({
+            batchId: 9,
+            batchIndex,
+            batchSize,
+            entries: [
+                {
+                    algorithm: 1,
+                    digits: 1,
+                    name: "Google:user@example.com",
+                    secret: Buffer.from("12345678901234567890"),
+                    type: 2,
+                    ...overrides,
+                },
+            ],
+            version: 1,
+        })
+    ).finish();
+    return `otpauth-migration://offline?data=${Buffer.from(bytes).toString("base64")}`;
+}
+test("migration schema handles complete, missing, duplicate and unsupported batches", () => {
+    assert.equal(parseImport("authenticator", migration()).rows[0].totp.secret, secret);
+    assert.equal(parseImport("authenticator", migration(0, 2)).complete, false);
+    const complete = parseImport(
+        "authenticator",
+        `${migration(0, 2)}\n${migration(0, 2)}\n${migration(1, 2, { name: "other@example.com" })}`
+    );
+    assert.equal(complete.complete, true);
+    assert.equal(complete.rows.length, 2);
+    assert.ok(parseImport("authenticator", migration(0, 1, { type: 1 })).rows[0].error);
+    const uri = migration();
+    assert.equal(
+        parseImport("authenticator", uri.replace("data=", "data=").replace(/=$/, "%3D")).rows[0].email,
+        "user@example.com"
+    );
+    assert.ok(parseImport("authenticator", "otpauth-migration://offline?data=%%%bad").rows[0].error);
+});
+test("150 existing Cookie accounts migrate without rewriting cookies or exposing secrets", async t => {
+    const { service, directory } = await fixture(t, 150);
+    assert.equal(service.list().length, 150);
+    const account = service.state.accounts[0],
+        before = await fs.readFile(path.join(directory, "auth/auth-0.json"), "utf8");
+    await service.edit(account.accountId, {
+        credentialVersion: account.credentialVersion,
+        password: "synthetic-password",
+        totpSecret: secret,
+    });
+    assert.equal(await fs.readFile(path.join(directory, "auth/auth-0.json"), "utf8"), before);
+    assert.equal(account.sessionState, "valid");
+    const metadata = JSON.stringify(service.list());
+    assert.ok(!metadata.includes("synthetic-password"));
+    assert.ok(!metadata.includes(secret));
+    const stat = await fs.stat(service.store.dbPath);
+    assert.equal(stat.mode & 0o777, 0o600);
+});
+test("credential edits reject empty values, distinguish clear and enforce optimistic versions", async t => {
+    const { service } = await fixture(t);
+    const created = await service.create(
+        { email: "edit@example.com", password: "synthetic-password", totpSecret: secret },
+        false
+    );
+    const id = created.account.accountId;
+    await assert.rejects(service.edit(id, { credentialVersion: 1, password: "" }), { status: 400 });
+    await service.edit(id, { autoRecovery: false, credentialVersion: 1 });
+    assert.equal(service.credentials(id).password, "synthetic-password");
+    await service.edit(id, { clearTotpSecret: true, credentialVersion: 1 });
+    assert.equal(service.credentials(id).totpSecret, null);
+    await assert.rejects(service.edit(id, { credentialVersion: 1, password: "new" }), { status: 409 });
+});
+test("same-account deduplication, queue capacity, pause and disabled auto recovery", async t => {
+    const { service, system } = await fixture(t, 1);
+    const account = service.state.accounts[0];
+    await service.edit(account.accountId, { credentialVersion: 1, password: "synthetic" });
+    account.sessionState = "expired";
+    system.scheduler.isAccountDisabled = () => true;
+    await service.scanRecovery();
+    assert.equal(service.state.tasks.length, 0);
+    const first = await service.login(account.accountId),
+        second = await service.login(account.accountId);
+    assert.equal(first.taskId, second.taskId);
+    service.state.config.queueLimit = 1;
+    await assert.rejects(service.create({ email: "another@example.com", password: "synthetic" }), { status: 429 });
+    service.state.config.paused = true;
+    await service.queue.tick();
+    assert.equal(service.queue.running.size, 0);
+    await service.cancel(first.taskId);
+    assert.equal(service.state.tasks[0].status, "cancelled");
+});
+test("per-attempt hard timeout kills hanging executor descendants and next account succeeds", async t => {
+    const { service } = await fixture(t);
+    Object.assign(service.state.config, {
+        attemptTimeout: 300,
+        cleanupTimeout: 100,
+        maxAttempts: 1,
+        screenshotTimeout: 50,
+        stepTimeout: 50,
+    });
+    await service.create({ email: "hang@example.com", password: "synthetic" });
+    const next = await service.create({ email: "success@example.com", password: "synthetic" });
+    await service.queue.tick();
+    assert.equal(service.queue.running.size, 1);
+    await until(() => service.state.tasks.every(task => ["failed", "succeeded"].includes(task.status)));
+    assert.equal(service.state.tasks[0].error, "attempt_timeout");
+    assert.equal(service.state.tasks[1].status, "succeeded");
+    assert.equal(service.account(next.account.accountId).authIndex, 0);
+    assert.equal(service.queue.snapshot().faultSlots, 0);
+});
+test("temporary failure releases slot during retry, consumes at most three attempts", async t => {
+    const { service } = await fixture(t);
+    Object.assign(service.state.config, { attemptTimeout: 2000, cleanupTimeout: 100, stepTimeout: 20 });
+    await service.create({ email: "network@example.com", password: "synthetic" });
+    const task = service.state.tasks[0];
+    await service.queue.tick();
+    await until(() => task.status === "retry_wait");
+    assert.equal(service.queue.running.size, 0);
+    for (let attempt = 2; attempt <= 3; attempt++) {
+        task.nextAttemptAt = Date.now();
+        await service.queue.tick();
+        await until(() => task.attempts === attempt && task.status !== "running");
+    }
+    assert.equal(task.status, "failed");
+    assert.equal(task.attempts, 3);
+});
+test("wrong password immediately requires manual action without retry", async t => {
+    const { service } = await fixture(t);
+    Object.assign(service.state.config, { attemptTimeout: 2000, cleanupTimeout: 100, stepTimeout: 20 });
+    const created = await service.create({ email: "wrong@example.com", password: "synthetic" });
+    await service.queue.tick();
+    await until(() => service.state.tasks[0].status === "failed");
+    assert.equal(service.state.tasks[0].attempts, 1);
+    assert.equal(service.account(created.account.accountId).recoveryState, "manual_required");
+});
+test("late success after credential mutation or cancellation cannot write auth files", async t => {
+    const { service, directory } = await fixture(t);
+    Object.assign(service.state.config, {
+        attemptTimeout: 2000,
+        cleanupTimeout: 100,
+        screenshotTimeout: 50,
+        stepTimeout: 20,
+    });
+    const created = await service.create({ email: "late@example.com", password: "synthetic" });
+    await service.queue.tick();
+    await service.exclusive(() =>
+        service.edit(created.account.accountId, { credentialVersion: 1, password: "new-synthetic" })
+    );
+    await until(() => !service.queue.running.size);
+    assert.equal(service.state.tasks[0].status, "cancelled");
+    assert.deepEqual(await fs.readdir(path.join(directory, "auth")), []);
+    await service.login(created.account.accountId);
+    await service.queue.tick();
+    await service.cancel(service.state.tasks[1].taskId);
+    await until(() => !service.queue.running.size);
+    assert.deepEqual(await fs.readdir(path.join(directory, "auth")), []);
+});
+test("old Context refresh and expiration cannot overwrite new Cookie; disabled state survives", async t => {
+    const { service, system } = await fixture(t, 1);
+    system.scheduler.isAccountDisabled = () => true;
+    await service.upload({
+        accountName: "user0@example.com",
+        cookies: [{ name: "fresh", value: "synthetic-cookie" }],
+        origins: [],
+    });
+    const account = service.state.accounts[0],
+        version = account.sessionVersion;
+    assert.equal(await service.markExpired(0, 0), false);
+    assert.equal(await service.refreshSession(0, 0, { cookies: [], origins: [] }), false);
+    assert.equal((await service.readAuth(0)).cookies[0].name, "fresh");
+    assert.equal(service.list()[0].disabled, true);
+    assert.equal(await service.markExpired(0, version), true);
+    await service.removeIndex(0);
+    await service.upload({ accountName: "replacement@example.com", cookies: [], origins: [] });
+    assert.notEqual(service.state.accounts[0].accountId, account.accountId);
+    assert.equal(await service.refreshSession(0, version, { cookies: [], origins: [] }), false);
+});
+test("import preview is secret-free, session-bound, versioned and idempotent", async t => {
+    const { service } = await fixture(t, 1);
+    const content = 'email,password\nuser0@example.com,"synthetic, password"\nnew@example.com,new-synthetic';
+    const preview = service.preview("session-a", "csv", content);
+    assert.ok(!JSON.stringify(preview).includes("synthetic"));
+    await assert.rejects(service.importCommit("session-b", { previewId: preview.previewId, rows: [] }), {
+        status: 409,
+    });
+    const result = await service.importCommit("session-a", {
+        previewId: preview.previewId,
+        rows: [{ index: 0 }, { create: true, index: 1 }],
+    });
+    assert.equal(result.updated, 1);
+    assert.equal(result.created, 1);
+    assert.equal(service.state.tasks.length, 0);
+    assert.equal(service.state.accounts[0].password, "synthetic, password");
+    assert.deepEqual(await service.importCommit("session-a", { previewId: preview.previewId, rows: [] }), result);
+    const stale = service.preview("session-a", "csv", content);
+    const account = service.state.accounts[0];
+    await service.edit(account.accountId, { credentialVersion: account.credentialVersion, password: "changed" });
+    assert.equal(
+        (await service.importCommit("session-a", { previewId: stale.previewId, rows: [{ index: 0, overwrite: true }] }))
+            .failed,
+        1
+    );
+});
+test("queue state and consumed attempts survive manager restart; commit journal rolls forward", async t => {
+    const { service, system, options, close } = await fixture(t, 1);
+    const account = service.state.accounts[0];
+    await service.edit(account.accountId, { credentialVersion: 1, password: "synthetic" });
+    const task = service.enqueue(account, "manual");
+    Object.assign(task, { attempts: 2, deadline: Date.now() + 900000, startedAt: Date.now(), status: "running" });
+    await service.save();
+    await close();
+    const resumed = new Service(system, options);
+    t.after(() => resumed.close());
+    await resumed.initialize({ startQueue: false });
+    assert.equal(resumed.state.tasks[0].attempts, 2);
+    assert.equal(resumed.state.tasks[0].status, "retry_wait");
+    const target = resumed.state.accounts[0];
+    resumed.state.commits.push({ accountId: target.accountId, authIndex: 0, sessionVersion: 10, taskId: task.taskId });
+    await resumed.atomicAuth(0, { _accountSessionVersion: 10, accountName: target.email, cookies: [], origins: [] });
+    await resumed.save();
+    await resumed.close();
+    const recovered = new Service(system, options);
+    t.after(() => recovered.close());
+    await recovered.initialize({ startQueue: false });
+    assert.equal(recovered.state.accounts[0].sessionVersion, 10);
+    assert.equal(recovered.state.tasks[0].status, "succeeded");
+    await recovered.close();
+});
+test("failure artifacts expire as 410 without deleting attempt metadata", async t => {
+    const { service } = await fixture(t);
+    const artifact = await service.artifacts.save("synthetic-account", "synthetic-task", Buffer.from("synthetic-png"));
+    service.state.artifacts.push(artifact);
+    artifact.createdAt = Date.now() - 8 * 86400000;
+    await service.cleanup();
+    await assert.rejects(service.artifacts.read(artifact), { status: 410 });
+    assert.equal(service.state.artifacts[0].id, artifact.id);
+});
+test("deduplication exposes conflicts without secrets and merges only explicit versioned choices", async t => {
+    const { service } = await fixture(t, 2);
+    const first = service.state.accounts[0],
+        second = service.state.accounts[1];
+    second.email = first.email;
+    first.password = "synthetic-one";
+    second.password = "synthetic-two";
+    const groups = [{ email: first.email, keptIndex: 0, removedIndices: [1] }];
+    const result = await service.prepareDeduplicate(groups);
+    assert.equal(result.conflicts.length, 1);
+    assert.ok(!JSON.stringify(result).includes("synthetic-one"));
+    const choice = {
+        [first.email]: {
+            accountId: second.accountId,
+            versions: { [first.accountId]: first.credentialVersion, [second.accountId]: second.credentialVersion },
+        },
+    };
+    assert.equal((await service.prepareDeduplicate(groups, choice)).conflicts.length, 0);
+    assert.equal(first.password, "synthetic-two");
+    await assert.rejects(
+        service.edit(first.accountId, { credentialVersion: first.credentialVersion, password: "other" }),
+        { status: 409 }
+    );
+    await service.removeIndex(1, { dedup: true });
+    service.deduplicating = false;
+    assert.equal(service.state.accounts.length, 1);
+    assert.equal(service.state.accounts[0].password, "synthetic-two");
+});
+test("every management route shares existing console authentication and no-store", () => {
+    const registered = [],
+        middleware = [],
+        guard = () => {};
+    const app = { use: (...args) => middleware.push(args) };
+    for (const method of ["get", "post", "patch", "delete"]) app[method] = (...args) => registered.push(args);
+    new AccountRoutes({}).setupRoutes(app, guard);
+    assert.equal(middleware[0][0], "/api/account-management");
+    assert.equal(middleware[0][1], guard);
+    const headers = {};
+    middleware[0][2](
+        {},
+        {
+            set: (key, value) => {
+                headers[key] = value;
+            },
+        },
+        () => {}
+    );
+    assert.equal(headers["Cache-Control"], "no-store");
+    assert.ok(registered.some(args => args[0] === "/accounts" && args[1] === guard));
+    assert.ok(registered.length >= 14);
+});

@@ -1,7 +1,9 @@
 {
     "aborted": "Aborted",
     "account": "Account",
-    "accountDedupConfirm": "Deduplicate auth files by email, keeping the highest index and deleting other duplicates (assumes indices increase over time for the same account). Continue?",
+    "accountCredentialChooseIndex": "Enter the account index whose credentials should be kept",
+    "accountCredentialConflict": "Duplicate accounts have conflicting credentials; choose which record to retain",
+    "accountDedupConfirm": "Deduplicate by full email, preferring valid sessions and then the highest index. Conflicting credentials require an explicit choice. Continue?",
     "accountDedupFailed": "Deduplication failed: {error}",
     "accountDedupNoop": "No duplicate auth files found to clean up.",
     "accountDedupPartialFailed": "Partial deduplication failure. Deleted: {removedIndices}; Failed: {failed}",

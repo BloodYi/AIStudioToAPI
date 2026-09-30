@@ -31,19 +31,22 @@
         "lint:css:fix": "stylelint \"{ui,ui-public}/**/*.{css,less}\" --fix",
         "format": "prettier --write .",
         "format:check": "prettier --check .",
-        "test": "node tests/model-scheduler.test.js && node tests/scheduled-request.test.js && node tests/browser-workers.test.js && node tests/realtime-dashboard.test.js && node tests/public-dashboard.test.js && node tests/sqlite-storage.test.js && node tests/proxy-pool.test.js"
+        "test": "node tests/model-scheduler.test.js && node tests/scheduled-request.test.js && node tests/browser-workers.test.js && node tests/realtime-dashboard.test.js && node tests/public-dashboard.test.js && node tests/sqlite-storage.test.js && node tests/proxy-pool.test.js && node tests/account-management.test.js && node tests/account-login-flow.test.js && node --test tests/account-login-browser.test.js"
     },
     "dependencies": {
         "archiver": "^7.0.1",
         "axios": "^1.13.2",
         "basic-auth": "^2.0.1",
         "cookie-parser": "^1.4.6",
+        "csv-parse": "^6.2.1",
         "dotenv": "^16.4.5",
         "express": "^4.19.2",
         "express-session": "^1.18.0",
         "jszip": "^3.10.1",
         "mime-types": "^3.0.2",
+        "otplib": "^13.5.0",
         "playwright": "1.59.1",
+        "protobufjs": "^7.6.6",
         "socks-proxy-agent": "^8.0.5",
         "ws": "^8.17.0",
         "yaml": "^2.9.1"

@@ -8,6 +8,7 @@
 const fs = require("fs");
 const path = require("path");
 const { firefox } = require("playwright");
+const { pageErrors } = require("../auth/TargetServiceValidation");
 const os = require("os");
 
 const { parseProxyFromEnv } = require("../utils/ProxyUtils");
@@ -235,6 +236,16 @@ class BrowserManager {
     }
 
     _isCurrentInitAttempt(attempt) {
+        const service = this.authSource?.accountLoginService;
+        if (service?.state && attempt?.sessionVersion !== undefined) {
+            const account = service.state.accounts.find(item => item.authIndex === attempt.authIndex);
+            if (
+                !account ||
+                service.invalidated.has(attempt.authIndex) ||
+                account.sessionVersion !== attempt.sessionVersion
+            )
+                return false;
+        }
         if (!this._contextInitAttempts) return Boolean(attempt && !attempt.aborted);
         return Boolean(attempt && this._contextInitAttempts?.get(attempt.authIndex) === attempt && !attempt.aborted);
     }
@@ -424,20 +435,7 @@ class BrowserManager {
      */
     async _checkPageErrors(page, attempt = null) {
         try {
-            return await this._runInitOperation(attempt, "page_errors.evaluate", () =>
-                page.evaluate(() => {
-                    // eslint-disable-next-line no-undef
-                    const bodyText = document.body.innerText || "";
-                    return {
-                        appletFailed: bodyText.includes("Failed to initialize applet"),
-                        concurrentUpdates:
-                            bodyText.includes("There are concurrent updates") ||
-                            bodyText.includes("concurrent updates"),
-                        snapshotFailed:
-                            bodyText.includes("Failed to create snapshot") || bodyText.includes("Please try again"),
-                    };
-                })
-            );
+            return await this._runInitOperation(attempt, "page_errors.evaluate", () => page.evaluate(pageErrors));
         } catch (e) {
             if (e?.code === "PLAYWRIGHT_RPC_TIMEOUT") throw e;
             return { appletFailed: false, concurrentUpdates: false, snapshotFailed: false };
@@ -839,6 +837,17 @@ class BrowserManager {
             );
 
             if (attempt) this._assertCurrentInitAttempt(attempt);
+
+            if (this.authSource.accountLoginService?.state) {
+                await this.authSource.accountLoginService.exclusive(() =>
+                    this.authSource.accountLoginService.refreshSession(
+                        authIndex,
+                        contextData.page?.accountSessionVersion,
+                        storageState
+                    )
+                );
+                return;
+            }
 
             // Merge new credentials into existing data
             authData.cookies = storageState.cookies;
@@ -1287,7 +1296,7 @@ class BrowserManager {
         ) {
             // Mark auth as expired if authIndex is provided
             if (authIndex >= 0 && this.authSource) {
-                await this.authSource.markAsExpired(authIndex);
+                await this.authSource.markAsExpired(authIndex, page.accountSessionVersion);
             }
             throw new AuthExpiredError();
         }
@@ -2932,6 +2941,7 @@ class BrowserManager {
                 );
             }
             const storageStateObject = this.authSource.getAuth(authIndex);
+            attempt.sessionVersion = storageStateObject?._accountSessionVersion || 0;
             if (!storageStateObject) {
                 throw new Error(`Failed to get or parse auth source for index ${authIndex}.`);
             }
@@ -2965,6 +2975,7 @@ class BrowserManager {
             await this._runInitOperation(attempt, "context.addInitScript", () => context.addInitScript(privacyScript));
 
             page = await this._runInitOperation(attempt, "context.newPage", () => context.newPage());
+            page.accountSessionVersion = storageStateObject._accountSessionVersion || 0;
             attempt.page = page;
 
             // Pure JS Wakeup (Focus & Mouse Movement)
@@ -3108,6 +3119,7 @@ class BrowserManager {
                     lastRequestAt: 0,
                     page,
                     proxyInfo,
+                    sessionVersion: page.accountSessionVersion,
                     state: "READY",
                 });
             } else {
@@ -3221,7 +3233,7 @@ class BrowserManager {
                             `[FastSwitch] Account #${authIndex} auth expired (redirected to login), marking as expired...`
                         );
                         // Mark auth as expired
-                        await this.authSource.markAsExpired(authIndex);
+                        await this.authSource.markAsExpired(authIndex, contextData.page.accountSessionVersion);
                         // Clean up the expired context
                         await this.closeContext(authIndex);
                         // Don't retry initialization - auth is expired, it will fail again
@@ -3233,7 +3245,7 @@ class BrowserManager {
                             this.logger.info(
                                 `[FastSwitch] Account #${authIndex} was expired but is now valid, restoring...`
                             );
-                            await this.authSource.unmarkAsExpired(authIndex);
+                            await this.authSource.unmarkAsExpired(authIndex, contextData.page.accountSessionVersion);
                             // Note: rebalanceContextPool() will be called by the caller (AuthSwitcher)
                         }
 
@@ -3307,7 +3319,7 @@ class BrowserManager {
             // If this account was marked as expired but login succeeded, restore it
             if (this.authSource.isExpired(authIndex)) {
                 this.logger.info(`[Browser] Account #${authIndex} was expired but login succeeded, restoring...`);
-                await this.authSource.unmarkAsExpired(authIndex);
+                await this.authSource.unmarkAsExpired(authIndex, page.accountSessionVersion);
                 // Note: rebalanceContextPool() will be called by the caller (AuthSwitcher)
             }
 

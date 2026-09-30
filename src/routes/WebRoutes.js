@@ -12,6 +12,7 @@ const path = require("path");
 const AuthRoutes = require("./AuthRoutes");
 const StatusRoutes = require("./StatusRoutes");
 const ProxyPoolRoutes = require("./ProxyPoolRoutes");
+const AccountRoutes = require("./AccountRoutes");
 
 /**
  * Web Routes Manager
@@ -30,6 +31,7 @@ class WebRoutes {
         this.authRoutes = new AuthRoutes(serverSystem);
         this.statusRoutes = new StatusRoutes(serverSystem);
         this.proxyPoolRoutes = new ProxyPoolRoutes(serverSystem);
+        this.accountRoutes = new AccountRoutes(serverSystem);
     }
 
     /**
@@ -62,6 +64,7 @@ class WebRoutes {
 
         // Setup all route handlers
         this.authRoutes.setupRoutes(app);
+        this.accountRoutes.setupRoutes(app, this.authRoutes.isAuthenticated.bind(this.authRoutes));
         this.statusRoutes.setupRoutes(app, this.authRoutes.isAuthenticated.bind(this.authRoutes));
         this.proxyPoolRoutes.setupRoutes(app, this.authRoutes.isAuthenticated.bind(this.authRoutes));
     }

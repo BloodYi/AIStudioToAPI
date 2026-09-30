@@ -61,7 +61,10 @@ class AuthSource {
         return false; // No changes
     }
 
-    removeAuth(index) {
+    async removeAuth(index, options) {
+        if (this.accountLoginService?.state) {
+            return this.accountLoginService.exclusive(() => this.accountLoginService.removeIndex(index, options));
+        }
         if (!Number.isInteger(index)) {
             throw new Error("Invalid account index.");
         }
@@ -176,15 +179,16 @@ class AuthSource {
 
         const emailKeyToIndices = new Map();
 
-        // Only process non-expired accounts for rotation and deduplication
+        // Rotation excludes expired sessions; deduplication prefers a valid
+        // session before considering the latest index across all duplicates.
         const nonExpiredIndices = this.availableIndices.filter(idx => !this.expiredIndices.includes(idx));
 
-        for (const index of nonExpiredIndices) {
+        for (const index of this.availableIndices) {
             const accountName = this.accountNameMap.get(index);
             const emailKey = this._normalizeEmailKey(accountName);
 
             if (!emailKey) {
-                this.rotationIndices.push(index);
+                if (nonExpiredIndices.includes(index)) this.rotationIndices.push(index);
                 this.canonicalIndexMap.set(index, index);
                 continue;
             }
@@ -196,8 +200,9 @@ class AuthSource {
 
         for (const [emailKey, indices] of emailKeyToIndices.entries()) {
             indices.sort((a, b) => a - b);
-            const keptIndex = indices[indices.length - 1];
-            this.rotationIndices.push(keptIndex);
+            const validIndices = indices.filter(index => nonExpiredIndices.includes(index));
+            const keptIndex = validIndices.at(-1) ?? indices.at(-1);
+            if (validIndices.length) this.rotationIndices.push(keptIndex);
 
             const duplicateIndices = [];
             for (const index of indices) {
@@ -291,7 +296,12 @@ class AuthSource {
      * @param {number} index - Auth index to mark as expired
      * @returns {Promise<boolean>} True if successfully marked as expired, false if auth doesn't exist, is already expired, or file operation fails
      */
-    async markAsExpired(index) {
+    async markAsExpired(index, sessionVersion) {
+        if (this.accountLoginService?.state) {
+            return this.accountLoginService.exclusive(() =>
+                this.accountLoginService.markExpired(index, sessionVersion)
+            );
+        }
         if (!this.availableIndices.includes(index)) {
             this.logger.warn(`[Auth] Cannot mark non-existent auth #${index} as expired`);
             return false;
@@ -335,7 +345,12 @@ class AuthSource {
      * @param {number} index - Auth index to restore
      * @returns {Promise<boolean>} True if successfully restored, false if auth doesn't exist, is not expired, or file operation fails
      */
-    async unmarkAsExpired(index) {
+    async unmarkAsExpired(index, sessionVersion) {
+        if (this.accountLoginService?.state) {
+            return this.accountLoginService.exclusive(() =>
+                this.accountLoginService.refreshSession(index, sessionVersion, null, true)
+            );
+        }
         if (!this.availableIndices.includes(index)) {
             this.logger.warn(`[Auth] Cannot unmark non-existent auth #${index}`);
             return false;

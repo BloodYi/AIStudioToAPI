@@ -515,6 +515,18 @@ class StatusRoutes {
                 const { authSource, requestHandler } = this.serverSystem;
 
                 const duplicateGroups = authSource.getDuplicateGroups() || [];
+                if (this.serverSystem.accountLoginService?.state && duplicateGroups.length) {
+                    const result = await this.serverSystem.accountLoginService.exclusive(() =>
+                        this.serverSystem.accountLoginService.prepareDeduplicate(
+                            duplicateGroups,
+                            req.body?.credentialChoices
+                        )
+                    );
+                    if (result.conflicts.length)
+                        return res
+                            .status(409)
+                            .json({ conflicts: result.conflicts, message: "accountCredentialConflict" });
+                }
                 if (duplicateGroups.length === 0) {
                     return res.status(200).json({
                         message: "accountDedupNoop",
@@ -523,8 +535,7 @@ class StatusRoutes {
                 }
 
                 this.logger.warn(
-                    "[Auth] Dedup cleanup will keep the auth file with the highest index per email and delete the other duplicates. " +
-                        "Assumption: for the same account, auth indices are created in chronological order (higher index = newer)."
+                    "[Auth] Dedup cleanup prefers valid sessions, then the highest index per email; credential conflicts require explicit choices."
                 );
 
                 const currentAuthIndex = requestHandler.currentAuthIndex;
@@ -565,7 +576,7 @@ class StatusRoutes {
 
                     for (const index of removed) {
                         try {
-                            authSource.removeAuth(index);
+                            await authSource.removeAuth(index, { dedup: true });
                             removedIndices.push(index);
                         } catch (error) {
                             failed.push({ error: error.message, index });
@@ -615,6 +626,8 @@ class StatusRoutes {
             } catch (error) {
                 this.logger.error(`[Auth] Dedup cleanup failed: ${error.message}`);
                 return res.status(500).json({ error: error.message, message: "accountDedupFailed" });
+            } finally {
+                if (this.serverSystem.accountLoginService) this.serverSystem.accountLoginService.deduplicating = false;
             }
         });
 
@@ -676,7 +689,7 @@ class StatusRoutes {
             // Delete auth files
             for (const targetIndex of validIndices) {
                 try {
-                    authSource.removeAuth(targetIndex);
+                    await authSource.removeAuth(targetIndex);
                     successIndices.push(targetIndex);
                     this.logger.warn(`[WebUI] Account #${targetIndex} deleted via batch delete.`);
                 } catch (error) {
@@ -876,7 +889,7 @@ class StatusRoutes {
 
             try {
                 // Delete auth file
-                authSource.removeAuth(targetIndex);
+                await authSource.removeAuth(targetIndex);
 
                 // Reload auth sources to update internal state immediately
                 authSource.reloadAuthSources();
@@ -1068,12 +1081,18 @@ class StatusRoutes {
                 // Always use max index + 1 to ensure new auth is always the latest
                 // This simplifies dedup logic assumption: higher index = newer auth
                 const existingIndices = this.serverSystem.authSource.availableIndices || [];
-                const nextAuthIndex = existingIndices.length > 0 ? Math.max(...existingIndices) + 1 : 0;
+                let nextAuthIndex = existingIndices.length > 0 ? Math.max(...existingIndices) + 1 : 0;
+
+                if (this.serverSystem.accountLoginService?.state) {
+                    nextAuthIndex = await this.serverSystem.accountLoginService.exclusive(() =>
+                        this.serverSystem.accountLoginService.upload(content)
+                    );
+                }
 
                 const newFilename = `auth-${nextAuthIndex}.json`;
                 const filePath = path.join(configDir, newFilename);
 
-                await fs.promises.writeFile(filePath, fileContent);
+                if (!this.serverSystem.accountLoginService?.state) await fs.promises.writeFile(filePath, fileContent);
 
                 // Reload auth sources to pick up changes
                 this.serverSystem.authSource.reloadAuthSources();
@@ -1132,10 +1151,16 @@ class StatusRoutes {
                         // If content is object, stringify it
                         const fileContent = typeof content === "object" ? JSON.stringify(content, null, 2) : content;
 
+                        if (this.serverSystem.accountLoginService?.state) {
+                            nextAuthIndex = await this.serverSystem.accountLoginService.exclusive(() =>
+                                this.serverSystem.accountLoginService.upload(content)
+                            );
+                        }
                         const newFilename = `auth-${nextAuthIndex}.json`;
                         const filePath = path.join(configDir, newFilename);
 
-                        await fs.promises.writeFile(filePath, fileContent);
+                        if (!this.serverSystem.accountLoginService?.state)
+                            await fs.promises.writeFile(filePath, fileContent);
 
                         results.push({ filename: newFilename, index: i, success: true });
                         this.logger.info(`[WebUI] Batch upload: generated ${newFilename}`);

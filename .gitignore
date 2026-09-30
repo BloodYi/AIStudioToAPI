@@ -34,6 +34,7 @@ data/
 tmp/
 temp/
 ui/dist/
+ui-public/dist/
 *.css
 test/
 debug_*.png

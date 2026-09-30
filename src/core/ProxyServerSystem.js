@@ -25,6 +25,7 @@ const ConfigLoader = require("../utils/ConfigLoader");
 const WebRoutes = require("../routes/WebRoutes");
 const PublicDashboardServer = require("../public/PublicDashboardServer");
 const ProxyPoolService = require("../proxy/ProxyPoolService");
+const AccountLoginService = require("../accounts/AccountLoginService");
 
 /**
  * Proxy Server System
@@ -125,6 +126,8 @@ class ProxyServerSystem extends EventEmitter {
         });
 
         this.httpServer = null;
+        this.accountLoginService = new AccountLoginService(this);
+        this.authSource.accountLoginService = this.accountLoginService;
         this.publicDashboardServer = null;
         this.wsServer = null;
         this.webRoutes = new WebRoutes(this);
@@ -133,6 +136,7 @@ class ProxyServerSystem extends EventEmitter {
     async start(initialAuthIndex = null) {
         this.logger.info("[System] Starting flexible startup process...");
         await this.proxyPoolService.initialize();
+        await this.accountLoginService.initialize();
         await this.usageStatsService.ready;
         await this._startHttpServer();
         try {
@@ -457,8 +461,22 @@ class ProxyServerSystem extends EventEmitter {
             }
 
             const chunks = [];
-            req.on("data", chunk => chunks.push(chunk));
+            const management = req.path.startsWith("/api/account-management");
+            let size = 0,
+                tooLarge = false;
+            req.on("data", chunk => {
+                size += chunk.length;
+                if (management && size > 2 * 1048576) {
+                    tooLarge = true;
+                    chunks.length = 0;
+                    if (!res.headersSent)
+                        res.status(413).json({
+                            error: "Account management request exceeds 2 MiB (import content limit: 1 MiB)",
+                        });
+                } else if (!tooLarge) chunks.push(chunk);
+            });
             req.on("end", () => {
+                if (tooLarge) return;
                 req.rawBody = Buffer.concat(chunks);
 
                 // Try to parse JSON for req.body compatibility
@@ -667,6 +685,7 @@ class ProxyServerSystem extends EventEmitter {
         }
 
         this.scheduler?.close();
+        await this.accountLoginService?.close();
 
         await this.proxyPoolService?.shutdown();
 

@@ -12,6 +12,14 @@
             <div class="sidebar-menu">
                 <button
                     class="menu-item"
+                    :class="{ active: activeTab === 'accounts' }"
+                    :title="t('accountManagement')"
+                    @click="switchTab('accounts')"
+                >
+                    <span style="font-size: 24px">♙</span>
+                </button>
+                <button
+                    class="menu-item"
                     :class="{ active: activeTab === 'home' }"
                     :title="t('statusHeading')"
                     @click="switchTab('home')"
@@ -662,6 +670,12 @@
                 </div>
 
                 <!-- Account Management Section (Full Width) -->
+            </div>
+            <div v-if="activeTab === 'accounts'" class="view-container">
+                <header class="page-header">
+                    <h1>{{ t("accountManagement") }}</h1>
+                </header>
+                <AccountsPage />
                 <div v-if="state.serviceConnected" class="full-width-section">
                     <div class="status-card">
                         <h3 class="card-title">
@@ -2852,7 +2866,7 @@
 
 <script setup>
 import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch, watchEffect } from "vue";
-import { useRouter } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox, ElNotification } from "element-plus";
 import { CircleClose } from "@element-plus/icons-vue";
 import JSZip from "jszip";
@@ -2863,12 +2877,20 @@ import EnvVarTooltip from "../components/EnvVarTooltip.vue";
 
 import SchedulerStatus from "../components/SchedulerStatus.vue";
 import ProxyPoolPanel from "../components/proxy/ProxyPoolPanel.vue";
+import AccountsPage from "./AccountsPage.vue";
 
 const schedulerData = ref(null);
 const router = useRouter();
 const fileInput = ref(null);
 const usageStatsImportInput = ref(null);
-const activeTab = ref("home");
+const route = useRoute();
+const activeTab = ref(route.path === "/accounts" ? "accounts" : "home");
+watch(
+    () => route.path,
+    path => {
+        activeTab.value = path === "/accounts" ? "accounts" : "home";
+    }
+);
 const isDownloadingUsageStats = ref(false);
 const isImportingUsageStats = ref(false);
 const isUsageStatsTransferBusy = computed(() => isDownloadingUsageStats.value || isImportingUsageStats.value);
@@ -3808,6 +3830,11 @@ const getApiErrorMessage = data => {
 };
 
 const switchTab = tabName => {
+    if (tabName === "accounts") router.push("/accounts");
+    else if (route.path === "/accounts")
+        router.push("/").then(() => {
+            activeTab.value = tabName;
+        });
     if (activeTab.value === "logs") {
         const logContainer = document.getElementById("log-container");
         if (logContainer) {
@@ -4313,8 +4340,36 @@ const deduplicateAuth = () => {
             });
             state.isSwitchingAccount = true;
             try {
-                const res = await fetch("/api/accounts/deduplicate", { method: "POST" });
-                const data = await res.json();
+                let res = await fetch("/api/accounts/deduplicate", { method: "POST" });
+                let data = await res.json();
+                if (data.conflicts?.length) {
+                    const credentialChoices = {};
+                    for (const conflict of data.conflicts) {
+                        const indices = conflict.candidates.map(account => account.authIndex);
+                        const { value } = await ElMessageBox.prompt(
+                            `${conflict.email}: ${t("accountCredentialConflict")} [${indices.join(", ")}]`,
+                            t("accountManagement"),
+                            {
+                                inputPlaceholder: t("accountCredentialChooseIndex"),
+                                inputValidator: value =>
+                                    indices.includes(Number(value)) || t("accountCredentialChooseIndex"),
+                            }
+                        );
+                        const chosen = conflict.candidates.find(account => account.authIndex === Number(value));
+                        credentialChoices[conflict.email] = {
+                            accountId: chosen.accountId,
+                            versions: Object.fromEntries(
+                                conflict.candidates.map(account => [account.accountId, account.credentialVersion])
+                            ),
+                        };
+                    }
+                    res = await fetch("/api/accounts/deduplicate", {
+                        body: JSON.stringify({ credentialChoices }),
+                        headers: { "Content-Type": "application/json" },
+                        method: "POST",
+                    });
+                    data = await res.json();
+                }
 
                 const removedIndicesText = Array.isArray(data.removedIndices)
                     ? `[${data.removedIndices.join(", ")}]`
