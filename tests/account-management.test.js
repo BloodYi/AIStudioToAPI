@@ -399,3 +399,142 @@ test("every management route shares existing console authentication and no-store
     assert.ok(registered.some(args => args[0] === "/accounts" && args[1] === guard));
     assert.ok(registered.length >= 14);
 });
+
+test("credential exports round-trip CSV and keep single Cookie downloads free of credentials", async t => {
+    const { credentialsCsv, accountBundle, cookieState } = require("../src/accounts/AccountExport");
+    const JSZip = require("jszip");
+    const { service, system } = await fixture(t, 1);
+    const account = service.state.accounts[0];
+    account.password = ' synthetic,p"ass\nword ';
+    account.totp = Totp.normalize(secret);
+    const missing = (await service.create({ email: "unbound@example.com", password: "synthetic" }, false)).account;
+    const exported = credentialsCsv(service.selectedAccounts({ all: true }));
+    const imported = parseImport("csv", exported);
+    assert.equal(imported.rows[0].password, account.password);
+    assert.equal(imported.rows[0].totp.secret, secret);
+    assert.equal(imported.rows[1].email, missing.email);
+    const state = { accountName: account.email, cookies: [], origins: [], password: "hidden", totpSecret: secret };
+    assert.deepEqual(cookieState(state), { accountName: account.email, cookies: [], origins: [] });
+    const zip = await JSZip.loadAsync(await accountBundle(service.selectedAccounts({ all: true }), () => state));
+    assert.deepEqual(Object.keys(zip.files).sort(), ["auth-0.json", "credentials.csv"]);
+    assert.equal(await zip.file("credentials.csv").async("string"), exported);
+    assert.deepEqual(JSON.parse(await zip.file("auth-0.json").async("string")), cookieState(state));
+    await assert.rejects(
+        accountBundle([account], () => null),
+        { status: 409 }
+    );
+    assert.throws(() => service.selectedAccounts({ accountIds: [] }), { status: 400 });
+    assert.equal(service.selectedAccounts({ accountIds: [account.accountId, account.accountId] }).length, 1);
+    const handlers = new Map(),
+        app = { use() {} };
+    for (const method of ["get", "post", "patch", "delete"])
+        app[method] = (endpoint, ...middleware) => handlers.set(`${method} ${endpoint}`, middleware.at(-1));
+    system.accountLoginService = service;
+    new AccountRoutes(system).setupRoutes(app, () => {});
+    const response = () => ({
+        attachment(value) {
+            this.filename = value;
+            return this;
+        },
+        headersSent: false,
+        json(value) {
+            this.body = value;
+            this.headersSent = true;
+            return this;
+        },
+        send(value) {
+            this.body = value;
+            this.headersSent = true;
+            return this;
+        },
+        status(value) {
+            this.code = value;
+            return this;
+        },
+        type(value) {
+            this.contentType = value;
+            return this;
+        },
+    });
+    const csvResponse = response();
+    await handlers.get("post /api/account-management/export/credentials")(
+        { body: { accountIds: [account.accountId] } },
+        csvResponse
+    );
+    assert.equal(csvResponse.filename, "credentials.csv");
+    assert.equal(parseImport("csv", csvResponse.body).rows[0].password, account.password);
+    const cookieResponse = response();
+    await handlers.get("get /api/account-management/accounts/:id/download")(
+        { params: { id: account.accountId } },
+        cookieResponse
+    );
+    assert.equal(cookieResponse.filename, "auth-0.json");
+    assert.ok(!cookieResponse.body.includes(account.password));
+    system.authSource.duplicateIndices = [0];
+    const listResponse = response();
+    await handlers.get("get /api/account-management/accounts")(
+        { query: { search: "#0", state: "duplicate" } },
+        listResponse
+    );
+    assert.equal(listResponse.body.total, 1);
+    assert.equal(listResponse.body.accounts[0].isDuplicate, true);
+    const invalidSwitch = response();
+    const originalConcurrency = service.state.config.concurrency;
+    await handlers.get("patch /api/account-management/login-queue")(
+        { body: { autoRecovery: "false", concurrency: 2 } },
+        invalidSwitch
+    );
+    assert.equal(invalidSwitch.code, 400);
+    assert.equal(service.state.config.concurrency, originalConcurrency);
+});
+
+test("batch recovery validates all credential versions before making changes", async t => {
+    const { service } = await fixture(t, 2);
+    const accounts = service.state.accounts;
+    const entries = accounts.map(account => ({
+        accountId: account.accountId,
+        credentialVersion: account.credentialVersion,
+    }));
+    await assert.rejects(
+        service.setRecovery({ accounts: [entries[0], { ...entries[1], credentialVersion: -1 }], autoRecovery: false }),
+        { status: 409 }
+    );
+    assert.ok(accounts.every(account => account.autoRecovery));
+    assert.equal((await service.setRecovery({ accounts: entries, autoRecovery: false })).updated, 2);
+    assert.ok(accounts.every(account => !account.autoRecovery));
+    await service.setRecovery({ accounts: entries, autoRecovery: true });
+    assert.ok(accounts.every(account => account.autoRecovery));
+});
+
+test("global automatic login switch persists and holds recovery without blocking manual login", async t => {
+    const { service, system, options, close } = await fixture(t, 1);
+    const account = service.state.accounts[0];
+    await service.edit(account.accountId, { credentialVersion: 1, password: "synthetic" });
+    account.sessionState = "expired";
+    const automatic = service.enqueue(account, "expired");
+    service.state.config.autoRecovery = false;
+    await service.queue.tick();
+    assert.equal(automatic.status, "queued");
+    assert.equal(automatic.attempts, 0);
+    const manualAccount = await service.create({ email: "manual@example.com", password: "synthetic" }, false);
+    await service.login(manualAccount.account.accountId);
+    await service.queue.tick();
+    await until(() => service.state.tasks.some(task => task.source === "manual" && task.status === "succeeded"));
+    assert.equal(automatic.status, "queued");
+    service.state.config.autoRecovery = true;
+    account.autoRecovery = false;
+    await service.queue.tick();
+    assert.equal(automatic.attempts, 0);
+    service.state.config.autoRecovery = false;
+    await service.save();
+    await close();
+    const resumed = new Service(system, options);
+    t.after(() => resumed.close());
+    await resumed.initialize({ startQueue: false });
+    assert.equal(resumed.state.config.autoRecovery, false);
+    resumed.state.config.autoRecovery = true;
+    resumed.state.accounts.find(item => item.accountId === account.accountId).autoRecovery = true;
+    await resumed.queue.tick();
+    await until(() => resumed.state.tasks.find(task => task.taskId === automatic.taskId).status === "succeeded");
+    await resumed.close();
+});

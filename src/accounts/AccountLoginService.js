@@ -52,6 +52,7 @@ class AccountLoginService {
         };
         this.state.config = {
             ...initialConfig,
+            autoRecovery: this.state.config.autoRecovery ?? initialConfig.autoRecovery,
             concurrency: this.state.config.concurrency,
             paused: this.state.config.paused,
         };
@@ -187,11 +188,34 @@ class AccountLoginService {
                 this.system.scheduler?.isAccountManuallyDisabled(account.authIndex) === true,
             hasPassword: !!password,
             hasTotpSecret: !!totp,
+            isDuplicate:
+                account.authIndex !== null &&
+                (this.system.authSource.duplicateIndices || []).includes(account.authIndex),
             nextAttemptAt: task?.nextAttemptAt || null,
         };
     }
     list() {
         return this.state.accounts.map(account => this.publicAccount(account));
+    }
+    selectedAccounts(input) {
+        if (input?.all === true) return this.state.accounts.slice();
+        if (!Array.isArray(input?.accountIds) || !input.accountIds.length || input.accountIds.length > 1000)
+            throw error("Select 1–1000 accounts");
+        return [...new Set(input.accountIds)].map(id => this.account(id));
+    }
+    async setRecovery(input) {
+        if (typeof input.autoRecovery !== "boolean") throw error("autoRecovery must be boolean");
+        if (!Array.isArray(input.accounts) || !input.accounts.length || input.accounts.length > 1000)
+            throw error("Select 1–1000 accounts");
+        const accounts = input.accounts.map(entry => {
+            const account = this.account(entry.accountId);
+            if (account.credentialVersion !== entry.credentialVersion)
+                throw error("Credentials changed; reload before saving", 409);
+            return account;
+        });
+        for (const account of accounts) account.autoRecovery = input.autoRecovery;
+        await this.save();
+        return { updated: accounts.length };
     }
     credentials(id) {
         const account = this.account(id);

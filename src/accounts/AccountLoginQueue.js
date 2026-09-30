@@ -81,6 +81,7 @@ class AccountLoginQueue {
                         task.status = "cancelled";
                         continue;
                     }
+                    if (task.source === "expired" && (!state.config.autoRecovery || !account.autoRecovery)) continue;
                     const config = { ...state.config };
                     const timeout = Math.min(
                         config.attemptTimeout,

@@ -1,23 +1,56 @@
 <template>
     <section class="accounts-panel">
-        <div class="account-toolbar">
+        <div class="account-toolbar page-actions">
             <ElButton type="primary" @click="openNew">{{ l("新增账号", "Add account") }}</ElButton>
+            <ElButton :disabled="isBusy" @click="legacyActions.uploadAuth?.()">{{
+                l("上传 Auth", "Upload Auth")
+            }}</ElButton>
             <ElButton @click="importVisible = true">{{
                 l("账密 / 验证器导入", "Import credentials / authenticator")
             }}</ElButton>
-            <RouterLink to="/auth">{{ l("VNC 人工登录", "Manual VNC login") }}</RouterLink>
-            <RouterLink to="/">{{ l("返回首页", "Home") }}</RouterLink>
+            <ElTooltip
+                :content="
+                    selected.length
+                        ? l('导出选中账号的 CSV', 'Export selected accounts as CSV')
+                        : l('导出全部账号的 CSV', 'Export all accounts as CSV')
+                "
+            >
+                <ElButton :disabled="!total" @click="exportCredentials">{{
+                    l("账密导出", "Export credentials")
+                }}</ElButton>
+            </ElTooltip>
+            <ElButton @click="router.push('/auth')">{{ l("VNC 人工登录", "Manual VNC login") }}</ElButton>
         </div>
         <ElCard class="queue-card">
             <div class="account-toolbar">
-                <span
-                    >{{ l("登录队列", "Login queue") }}: {{ queue.running || 0 }} {{ l("运行", "running") }} /
-                    {{ queue.queued || 0 }} {{ l("排队", "queued") }} / {{ queue.retryWait || 0 }}
-                    {{ l("退避", "retrying") }} / {{ queue.faultSlots || 0 }} {{ l("故障槽", "fault slots") }}</span
+                <strong>{{ l("登录队列", "Login queue") }}</strong>
+                <ElTooltip
+                    :content="
+                        l(
+                            '控制会话过期后的自动恢复；手动登录不受影响，运行中的任务会继续完成。',
+                            'Controls automatic session recovery. Manual logins and running tasks continue.'
+                        )
+                    "
                 >
-                <ElInputNumber v-model="concurrency" :min="1" :max="32" />
-                <ElButton @click="configure({ concurrency })">{{ l("设置并发", "Set concurrency") }}</ElButton>
-                <ElButton @click="configure({ paused: !queue.paused })">{{
+                    <label class="queue-toggle"
+                        >{{ l("全局自动登录", "Automatic login") }}
+                        <ElSwitch
+                            :model-value="queue.autoRecovery === true"
+                            :disabled="busy"
+                            @change="value => configure({ autoRecovery: value })"
+                        />
+                    </label>
+                </ElTooltip>
+                <span
+                    >{{ queue.running || 0 }} {{ l("运行", "running") }} / {{ queue.queued || 0 }}
+                    {{ l("排队", "queued") }} / {{ queue.retryWait || 0 }} {{ l("退避", "retrying") }} /
+                    {{ queue.faultSlots || 0 }} {{ l("故障槽", "fault slots") }}</span
+                >
+                <ElInputNumber v-model="concurrency" :min="1" :max="32" size="small" />
+                <ElButton size="small" @click="configure({ concurrency })">{{
+                    l("设置并发", "Set concurrency")
+                }}</ElButton>
+                <ElButton size="small" @click="configure({ paused: !queue.paused })">{{
                     queue.paused ? l("恢复队列", "Resume queue") : l("暂停队列", "Pause queue")
                 }}</ElButton>
             </div>
@@ -32,7 +65,7 @@
         <div class="account-toolbar">
             <ElInput
                 v-model="search"
-                :placeholder="l('搜索邮箱', 'Search email')"
+                :placeholder="l('搜索邮箱 / 账号编号', 'Search email / account index')"
                 clearable
                 @input="
                     page = 1;
@@ -50,61 +83,137 @@
             >
                 <ElOption
                     v-for="value in [
+                        'valid',
                         'credentials_missing',
                         'expired',
                         'queued',
                         'running',
                         'retry_wait',
                         'manual_required',
+                        'duplicate',
                     ]"
                     :key="value"
                     :value="value"
                     :label="stateLabel(value)"
                 />
             </ElSelect>
-            <ElButton :disabled="!selected.length" @click="batchLogin">{{
-                l("批量重新登录", "Log in selected")
+            <ElButton :disabled="isBusy" @click="legacyActions.deduplicate?.()">{{
+                l("去重清理", "Clean duplicates")
             }}</ElButton>
         </div>
-        <ElTable :data="accounts" row-key="accountId" @selection-change="selected = $event">
-            <ElTableColumn type="selection" width="45" />
-            <ElTableColumn :label="l('账号', 'Account')" min-width="200">
+        <div class="account-toolbar batch-toolbar">
+            <span>{{ l("已选", "Selected") }} {{ selected.length }}</span>
+            <ElButton size="small" :disabled="!selected.length || busy" @click="batchLogin">{{
+                l("批量重新登录", "Log in selected")
+            }}</ElButton>
+            <ElButton size="small" :disabled="!selected.length || busy" @click="batchRecovery(true)">{{
+                l("启用自动恢复", "Enable auto recovery")
+            }}</ElButton>
+            <ElButton size="small" :disabled="!selected.length || busy" @click="batchRecovery(false)">{{
+                l("取消自动恢复", "Disable auto recovery")
+            }}</ElButton>
+            <ElTooltip
+                :content="l('下载选中账号的 Cookie 和账密 CSV', 'Download selected Cookies and credentials CSV')"
+            >
+                <ElButton size="small" :disabled="!selected.length || busy" @click="downloadBundle">{{
+                    l("批量下载", "Download selected")
+                }}</ElButton>
+            </ElTooltip>
+            <ElButton
+                size="small"
+                type="danger"
+                plain
+                :disabled="!selected.length || isBusy || busy"
+                @click="deleteRows(selected)"
+                >{{ l("批量删除", "Delete selected") }}</ElButton
+            >
+        </div>
+        <ElTable ref="accountTable" :data="accounts" row-key="accountId" @selection-change="selected = $event">
+            <ElTableColumn type="selection" width="45" reserve-selection />
+            <ElTableColumn :label="l('账号', 'Account')" min-width="210">
+                <template #default="{ row }">
+                    <span class="account-name"
+                        >{{ row.authIndex === null ? "—" : `#${row.authIndex}` }}
+                        {{ row.email || row.displayName }}</span
+                    >
+                    <div class="account-badges">
+                        <ElTag v-if="row.authIndex !== null && row.authIndex === currentAuthIndex" size="small">{{
+                            l("当前", "Current")
+                        }}</ElTag>
+                        <ElTag v-if="row.isDuplicate" size="small" type="warning">{{ l("重复", "Duplicate") }}</ElTag>
+                        <ElTag v-if="row.disabled" size="small" type="danger">{{
+                            l("人工禁用", "Manually disabled")
+                        }}</ElTag>
+                    </div>
+                </template>
+            </ElTableColumn>
+            <ElTableColumn :label="l('会话 / 恢复', 'Session / recovery')" width="150">
+                <template #default="{ row }">
+                    <span :class="['state-text', 'state-' + row.sessionState]">{{ stateLabel(row.sessionState) }}</span
+                    ><br />
+                    <span :class="['state-text', 'state-' + row.recoveryState]">{{
+                        stateLabel(row.recoveryState)
+                    }}</span>
+                    <small v-if="row.lastFailure?.error" class="failure-reason">{{ row.lastFailure.error }}</small>
+                </template>
+            </ElTableColumn>
+            <ElTableColumn :label="l('凭据', 'Credentials')" width="95">
                 <template #default="{ row }"
-                    >{{ row.authIndex === null ? "—" : `#${row.authIndex}` }} {{ row.email || row.displayName
-                    }}<br /><small v-if="row.disabled">{{ l("人工禁用", "Manually disabled") }}</small></template
+                    >{{ row.hasPassword ? "✓" : "—" }} Password<br />{{ row.hasTotpSecret ? "✓" : "—" }} TOTP</template
                 >
             </ElTableColumn>
-            <ElTableColumn :label="l('会话 / 恢复', 'Session / recovery')" min-width="160"
-                ><template #default="{ row }"
-                    >{{ stateLabel(row.sessionState) }} / {{ stateLabel(row.recoveryState) }}<br /><small>{{
-                        row.lastFailure?.error
-                    }}</small></template
-                ></ElTableColumn
-            >
-            <ElTableColumn :label="l('凭据', 'Credentials')" width="110"
-                ><template #default="{ row }"
-                    >{{ row.hasPassword ? "✓" : "—" }} Password<br />{{ row.hasTotpSecret ? "✓" : "—" }} TOTP</template
-                ></ElTableColumn
-            >
-            <ElTableColumn :label="l('自动恢复', 'Auto recovery')" width="110"
-                ><template #default="{ row }"
+            <ElTableColumn :label="l('自动恢复', 'Auto recovery')" width="95">
+                <template #default="{ row }"
                     ><ElSwitch
                         :model-value="row.autoRecovery"
-                        @change="value => toggleRecovery(row, value)" /></template
-            ></ElTableColumn>
-            <ElTableColumn :label="l('操作', 'Actions')" min-width="360"
-                ><template #default="{ row }">
-                    <ElButton size="small" @click="openEdit(row)">{{ l("编辑凭据", "Edit credentials") }}</ElButton>
-                    <ElButton size="small" @click="login(row)">{{ l("重新登录", "Log in") }}</ElButton>
-                    <ElButton v-if="row.currentTaskId" size="small" @click="cancel(row.currentTaskId)">{{
-                        l("取消", "Cancel")
-                    }}</ElButton>
-                    <ElButton size="small" @click="viewHistory(row)">{{ l("任务 / 日志", "Tasks / logs") }}</ElButton>
-                    <ElButton v-if="row.authIndex === null" size="small" type="danger" @click="deleteMissing(row)">{{
-                        l("删除", "Delete")
-                    }}</ElButton>
-                </template></ElTableColumn
-            >
+                        :disabled="busy"
+                        @change="value => toggleRecovery(row, value)"
+                /></template>
+            </ElTableColumn>
+            <ElTableColumn :label="l('操作', 'Actions')" min-width="400">
+                <template #default="{ row }">
+                    <div class="row-actions">
+                        <ElButton size="small" @click="openEdit(row)">{{ l("编辑凭据", "Edit credentials") }}</ElButton>
+                        <ElButton size="small" @click="login(row)">{{ l("重新登录", "Log in") }}</ElButton>
+                        <ElButton
+                            v-if="row.authIndex !== null"
+                            size="small"
+                            :disabled="
+                                isBusy ||
+                                row.disabled ||
+                                row.sessionState !== 'valid' ||
+                                row.isDuplicate ||
+                                row.authIndex === currentAuthIndex
+                            "
+                            @click="legacyActions.switchAccount?.(row.authIndex)"
+                            >{{
+                                row.authIndex === currentAuthIndex
+                                    ? l("当前账号", "Current")
+                                    : accountDetails.find(item => item.index === row.authIndex)?.hasContext
+                                      ? l("快速切换", "Quick switch")
+                                      : l("切换", "Switch")
+                            }}</ElButton
+                        >
+                        <ElButton v-if="row.authIndex !== null" size="small" @click="downloadCookie(row)">{{
+                            l("下载", "Download")
+                        }}</ElButton>
+                        <ElButton v-if="row.currentTaskId" size="small" @click="cancel(row.currentTaskId)">{{
+                            l("取消", "Cancel")
+                        }}</ElButton>
+                        <ElButton size="small" @click="viewHistory(row)">{{
+                            l("任务 / 日志", "Tasks / logs")
+                        }}</ElButton>
+                        <ElButton
+                            size="small"
+                            type="danger"
+                            plain
+                            :disabled="isBusy || busy"
+                            @click="deleteRows([row])"
+                            >{{ l("删除", "Delete") }}</ElButton
+                        >
+                    </div>
+                </template>
+            </ElTableColumn>
         </ElTable>
         <ElPagination
             v-model:current-page="page"
@@ -247,12 +356,22 @@
 </template>
 <script setup>
 import { ref, reactive, onMounted, onBeforeUnmount } from "vue";
+import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import I18n from "../utils/i18n";
+const router = useRouter();
+defineProps({
+    accountDetails: { default: () => [], type: Array },
+    currentAuthIndex: { default: -1, type: Number },
+    isBusy: { default: false, type: Boolean },
+    legacyActions: { default: () => ({}), type: Object },
+});
+const accountTable = ref(null);
 const l = (zh, en) => (I18n.getLang() === "zh" ? zh : en);
 const labels = {
     cancelled: ["已取消", "Cancelled"],
     credentials_missing: ["缺少凭据", "Credentials missing"],
+    duplicate: ["重复", "Duplicate"],
     expired: ["已过期", "Expired"],
     failed: ["失败", "Failed"],
     idle: ["空闲", "Idle"],
@@ -319,7 +438,7 @@ async function action(work) {
     try {
         await work();
     } catch (cause) {
-        ElMessage.error(cause.message);
+        if (cause !== "cancel" && cause !== "close") ElMessage.error(cause.message);
     }
 }
 async function refresh() {
@@ -331,16 +450,20 @@ async function refresh() {
         ]);
         if (disposed || sequence !== refreshSequence) return;
         accounts.value = list.accounts;
+        const refreshed = new Map(list.accounts.map(account => [account.accountId, account]));
+        selected.value = selected.value.map(account => refreshed.get(account.accountId) || account);
         total.value = list.total;
         queue.value = status;
         if (!polling) concurrency.value = status.concurrency;
     });
 }
 async function configure(values) {
+    busy.value = true;
     await action(async () => {
         queue.value = await api("/login-queue", "PATCH", values);
         await refresh();
     });
+    busy.value = false;
 }
 function clearForm() {
     Object.assign(form, {
@@ -422,11 +545,98 @@ async function toggleRecovery(account, autoRecovery) {
         await refresh();
     });
 }
-async function deleteMissing(account) {
+async function batchRecovery(autoRecovery) {
+    const rows = selected.value.slice();
     await action(async () => {
-        await ElMessageBox.confirm(l("删除此账号记录？", "Delete this account?"));
-        await api(`/accounts/${account.accountId}`, "DELETE");
+        await api("/accounts/batch/recovery", "PATCH", {
+            accounts: rows.map(row => ({ accountId: row.accountId, credentialVersion: row.credentialVersion })),
+            autoRecovery,
+        });
         await refresh();
+        ElMessage.success(l("已更新自动恢复设置", "Auto recovery updated"));
+    });
+}
+async function saveDownload(endpoint, filename, body) {
+    const response = await fetch(`/api/account-management${endpoint}`, {
+        headers: { Accept: "application/json", ...(body ? { "Content-Type": "application/json" } : {}) },
+        method: body ? "POST" : "GET",
+        ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    if (!response.ok) throw new Error((await response.json()).error || String(response.status));
+    const url = URL.createObjectURL(await response.blob());
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+async function exportCredentials() {
+    await action(() =>
+        saveDownload(
+            "/export/credentials",
+            "credentials.csv",
+            selected.value.length ? { accountIds: selected.value.map(row => row.accountId) } : { all: true }
+        )
+    );
+}
+async function downloadBundle() {
+    await action(() =>
+        saveDownload("/export/bundle", "accounts.zip", { accountIds: selected.value.map(row => row.accountId) })
+    );
+}
+async function downloadCookie(row) {
+    await action(() => saveDownload(`/accounts/${row.accountId}/download`, `auth-${row.authIndex}.json`));
+}
+async function deleteRows(rows) {
+    const chosen = rows.slice();
+    await action(async () => {
+        await ElMessageBox.confirm(
+            l(
+                `删除选中的 ${chosen.length} 个账号及其已保存的会话和凭据？`,
+                `Delete ${chosen.length} selected accounts and their sessions and credentials?`
+            )
+        );
+        busy.value = true;
+        try {
+            const indices = chosen.filter(row => row.authIndex !== null).map(row => row.authIndex);
+            if (indices.length) {
+                const remove = force =>
+                    fetch("/api/accounts/batch", {
+                        body: JSON.stringify({ force, indices }),
+                        headers: { Accept: "application/json", "Content-Type": "application/json" },
+                        method: "DELETE",
+                    });
+                let response = await remove(false);
+                let result = await response.json();
+                if (response.status === 409 && result.requiresConfirmation) {
+                    await ElMessageBox.confirm(
+                        l(
+                            "包含当前使用中的账号，确认删除并关闭对应连接？",
+                            "Includes the active account. Delete it and close its connections?"
+                        )
+                    );
+                    response = await remove(true);
+                    result = await response.json();
+                }
+                if (!response.ok || response.status === 207)
+                    throw new Error(
+                        result.error ||
+                            l(
+                                "部分账号未能删除，请刷新后重试",
+                                "Some accounts could not be deleted. Refresh and retry."
+                            )
+                    );
+            }
+            for (const row of chosen.filter(row => row.authIndex === null))
+                await api(`/accounts/${row.accountId}`, "DELETE");
+            accountTable.value?.clearSelection();
+            ElMessage.success(l("已删除", "Deleted"));
+        } finally {
+            busy.value = false;
+            await refresh();
+        }
     });
 }
 async function readImportFile(event) {
@@ -545,6 +755,52 @@ onBeforeUnmount(() => {
 }
 .account-toolbar > .el-select {
     width: 200px;
+}
+.row-actions,
+.queue-toggle,
+.account-badges {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.row-actions :deep(.el-button) {
+    margin-left: 0;
+}
+.account-name {
+    overflow-wrap: anywhere;
+}
+.account-badges {
+    margin-top: 4px;
+}
+.failure-reason {
+    display: block;
+    overflow-wrap: anywhere;
+}
+.state-text {
+    font-weight: 600;
+}
+.state-valid,
+.state-succeeded {
+    color: var(--el-color-success);
+}
+.state-expired,
+.state-failed,
+.state-manual_required {
+    color: var(--el-color-danger);
+}
+.state-queued,
+.state-retry_wait,
+.state-credentials_missing {
+    color: var(--el-color-warning);
+}
+.state-running {
+    color: var(--el-color-primary);
+}
+.state-idle,
+.state-missing,
+.state-cancelled {
+    color: var(--el-text-color-secondary);
 }
 .queue-card {
     margin: 16px 0;
