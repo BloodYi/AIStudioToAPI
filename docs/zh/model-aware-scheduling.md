@@ -35,7 +35,7 @@ REQUEST_DISPATCH_TIMEOUT_MS=30000
 SCHEDULER_READY_CONTEXT_ONLY=true
 STREAM_EARLY_HEADERS=true
 STREAM_KEEPALIVE_INTERVAL_MS=10000
-RATE_LIMIT_COOLDOWN=3600
+RATE_LIMIT_COOLDOWN=86400
 RISK_CONTROL_COOLDOWN=600
 RISK_CONTROL_MAX_COOLDOWN=10800
 SCHEDULER_DAILY_RESET_ENABLED=true
@@ -64,7 +64,7 @@ SCHEDULER_STATE_PATH=data/scheduler-state.json
 | `REQUEST_DISPATCH_TIMEOUT_MS`      | ready context 调度超时；未设置时兼容 `MODEL_QUEUE_TIMEOUT_MS`                                       |
 | `STREAM_EARLY_HEADERS`             | 流式请求通过校验后立即发送 SSE headers 和 accepted 注释，默认开启                                   |
 | `STREAM_KEEPALIVE_INTERVAL_MS`     | 等待调度或上游首包期间的 SSE 注释心跳间隔，默认 10000 毫秒                                          |
-| `RATE_LIMIT_COOLDOWN`              | 429 冷却秒数，默认 3600，不猜测 Google 的日额度重置时刻                                             |
+| `RATE_LIMIT_COOLDOWN`              | 429 冷却秒数，默认 86400（24 小时），不猜测 Google 的日额度重置时刻                                  |
 | `RISK_CONTROL_COOLDOWN`            | HTTP 403 风控初始冷却秒数，默认 600，连续风控按 1、3、6、18 倍退避并带 ±10% 抖动                    |
 | `RISK_CONTROL_MAX_COOLDOWN`        | HTTP 403 风控最大冷却秒数，默认 10800                                                               |
 | `SCHEDULER_DAILY_RESET_ENABLED`    | 是否在每天太平洋时间自动清理可恢复冷却，默认 `true`；仅 `false` 关闭                                |
