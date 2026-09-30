@@ -116,6 +116,7 @@ class AccountLoginQueue {
                         const proxy = this.service.resolveProxy(account);
                         slot.child = fork(this.workerPath, [], {
                             detached: true,
+                            execArgv: [...process.execArgv, "--max-http-header-size=65536"],
                             serialization: "advanced",
                             stdio: ["ignore", "ignore", "ignore", "ipc"],
                         });
@@ -139,7 +140,13 @@ class AccountLoginQueue {
                             if (message.screenshot) slot.screenshot = message.screenshot;
                         });
                         slot.child.on("error", () => this.finish(slot, { error: "browser_exit", retryable: true }));
-                        slot.child.on("exit", () => this.finish(slot, { error: "browser_exit", retryable: true }));
+                        slot.child.on("exit", (code, signal) =>
+                            this.finish(slot, {
+                                error: "browser_exit",
+                                executorExit: { code, signal },
+                                retryable: true,
+                            })
+                        );
                         const stat = await fs.readFile(`/proc/${slot.child.pid}/stat`, "utf8");
                         task.executor = {
                             pid: slot.child.pid,

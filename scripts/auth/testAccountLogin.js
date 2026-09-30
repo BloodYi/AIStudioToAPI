@@ -33,6 +33,12 @@ async function main() {
         authDir: path.join(directory, "auth"),
         storePath: path.join(directory, "accounts.sqlite"),
     });
+    let targetInitialized = false;
+    const completeAttempt = service.completeAttempt.bind(service);
+    service.completeAttempt = async (slot, result) => {
+        targetInitialized = result.targetInitialized === true && !result.error;
+        return completeAttempt(slot, result);
+    };
     try {
         await service.initialize({ startQueue: false });
         const created = await service.create(credentials);
@@ -49,15 +55,25 @@ async function main() {
             }
             await new Promise(resolve => setTimeout(resolve, 500));
         }
+        const account = service.account(created.account.accountId);
+        const committed = task.status === "succeeded" ? await service.readAuth(account.authIndex) : null;
+        const sessionCommitted =
+            !!committed &&
+            committed._accountSessionVersion === account.sessionVersion &&
+            account.sessionState === "valid" &&
+            committed.cookies.length > 0 &&
+            Array.isArray(committed.origins);
         console.log(
             JSON.stringify({
                 attempts: task.attempts,
                 error: task.error || null,
                 history: task.history,
+                sessionCommitted,
                 status: task.status,
+                targetInitialized,
             })
         );
-        process.exitCode = task.status === "succeeded" ? 0 : 1;
+        process.exitCode = task.status === "succeeded" && sessionCommitted && targetInitialized ? 0 : 1;
         if (process.env.ACCOUNT_TEST_KEEP_ARTIFACTS === "true")
             console.log(`Private diagnostic directory: ${directory}`);
     } finally {

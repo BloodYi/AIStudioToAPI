@@ -502,6 +502,8 @@ class AccountLoginService {
             controls: result.controls || [],
             endedAt: Date.now(),
             error: result.error || null,
+            executorExit: result.executorExit,
+            frameKinds: result.frameKinds,
             phase: task.phase,
             screenshotReason,
             startedAt: slot.startedAt,

@@ -15,20 +15,22 @@ async function simulate(options = {}) {
         state = "email",
         url = "about:blank",
         rejected = 0,
-        websocket;
+        alternativeChecks = 0;
     const pins = [],
         phases = [],
         screenshots = [];
     const visible = selector =>
-        selector.includes('type="email"')
-            ? state === "email"
-            : selector.includes('type="password"')
-              ? state === "password"
-              : selector.includes("totpPin")
-                ? state === "totp"
-                : selector.includes("challengetype")
-                  ? state === "choose"
-                  : false;
+        selector.includes("textarea")
+            ? state === "studio"
+            : selector.includes('type="email"')
+              ? state === "email"
+              : selector.includes('type="password"')
+                ? state === "password"
+                : selector.includes("totpPin")
+                  ? state === "totp"
+                  : selector.includes("challengetype")
+                    ? state === "choose"
+                    : false;
     const text = () =>
         state === "email"
             ? "Sign in"
@@ -56,7 +58,7 @@ async function simulate(options = {}) {
                 return;
             }
             if (options.totp) {
-                state = options.choose ? "choose" : "totp";
+                state = options.alternative ? "alternative" : options.choose ? "choose" : "totp";
                 return;
             }
             state = "studio";
@@ -86,20 +88,29 @@ async function simulate(options = {}) {
                   },
         frames: () => [],
         getByRole: () => ({ first: () => ({ click: next, isVisible: async () => false }) }),
-        getByText: () => ({ first: () => ({ isVisible: async () => false }) }),
+        getByText: () => ({
+            first: () => ({
+                click: async () => {
+                    state = options.loadingAlternative ? "alternative_loading" : "totp";
+                },
+                isVisible: async () => state === "alternative",
+            }),
+        }),
         goto: async target => {
             if (target.includes("ServiceLogin")) url = "https://accounts.google.com/signin";
             else if (target.includes("/apps/")) {
                 url = target;
-                if (!options.initializationFailed) websocket?.();
             } else url = target;
         },
         isClosed: () => false,
         locator: selector => {
             const locator = {
                 click: async () => {
-                    if (state === "choose") state = "totp";
-                    else await next();
+                    if (state === "choose") {
+                        if (!options.choiceDoesNotNavigate) state = "totp";
+                        if (options.choiceTimeout)
+                            throw Object.assign(new Error("intercepts pointer events"), { name: "TimeoutError" });
+                    } else await next();
                 },
                 fill: async value => {
                     if (selector.includes("totpPin")) pins.push({ time: clock, value });
@@ -107,7 +118,13 @@ async function simulate(options = {}) {
                 filter: () => locator,
                 first: () => locator,
                 innerText: async () => text(),
-                isVisible: async () => visible(selector),
+                isVisible: async () => {
+                    if (state === "alternative_loading") {
+                        if (++alternativeChecks >= 4) state = "choose";
+                        return selector === "[data-challengetype]";
+                    }
+                    return visible(selector);
+                },
             };
             return locator;
         },
@@ -116,16 +133,15 @@ async function simulate(options = {}) {
             return Buffer.from("synthetic-screenshot");
         },
         url: () => url,
-        waitForFunction: async () => {},
+        waitForFunction: async () => {
+            throw new Error("Page-world polling is unavailable");
+        },
     };
     const context = {
         addInitScript: async () => {},
         close: async () => {},
         newPage: async () => page,
         route: async () => {},
-        routeWebSocket: async (match, callback) => {
-            websocket = callback;
-        },
         setDefaultNavigationTimeout() {},
         setDefaultTimeout() {},
         storageState: async () => ({ cookies: [], origins: [] }),
@@ -154,9 +170,26 @@ async function simulate(options = {}) {
             require: name =>
                 name === "playwright"
                     ? { firefox: { launch: async () => browser } }
-                    : name === "node:perf_hooks"
-                      ? { performance: { now: () => clock - 30000 } }
-                      : workerRequire(name),
+                    : name === "./TargetSessionValidator"
+                      ? class {
+                            async validate() {
+                                if (options.initializationFailed)
+                                    throw Object.assign(new Error("service_initialization_failed"), {
+                                        reason: "service_initialization_failed",
+                                        retryable: true,
+                                    });
+                                if (options.unverifiedSocket)
+                                    throw Object.assign(new Error("service_initialization_unverified"), {
+                                        reason: "service_initialization_unverified",
+                                        retryable: true,
+                                    });
+                                return { context, page };
+                            }
+                            async close() {}
+                        }
+                      : name === "node:perf_hooks"
+                        ? { performance: { now: () => clock - 30000 } }
+                        : workerRequire(name),
             setTimeout: (callback, ms) =>
                 setImmediate(() => {
                     clock += ms;
@@ -167,13 +200,13 @@ async function simulate(options = {}) {
         { filename: workerPath }
     );
     processMock.emit("message", {
-        config: { attemptTimeout: 180000, screenshotTimeout: 5000, stepTimeout: 30000 },
+        config: { attemptTimeout: 180000, humanize: false, screenshotTimeout: 5000, stepTimeout: 30000 },
         credentials: {
             email: "user@example.com",
             password: "synthetic-password",
             totp: options.missingSecret ? null : options.totp ? Totp.normalize(secret) : null,
         },
-        targetUrl: "https://ai.studio/apps/synthetic",
+        targetUrl: options.missingTarget ? null : "https://ai.studio/apps/synthetic",
         token: "synthetic-token",
     });
     return { phases, pins, result: await result, screenshots };
@@ -184,10 +217,26 @@ test("no two-step login verifies account and target app before saving complete s
     assert.equal(result.email, "user@example.com");
     assert.ok(phases.includes("target_service_initialization"));
 });
+test("choice click timeout is accepted only after TOTP readiness is confirmed", async () => {
+    const changed = await simulate({ choiceTimeout: true, choose: true, totp: true });
+    assert.ok(changed.result.storageState);
+    assert.equal(changed.pins.length, 1);
+    const unchanged = await simulate({ choiceDoesNotNavigate: true, choiceTimeout: true, choose: true, totp: true });
+    assert.equal(unchanged.result.error, "ui_click_timeout");
+    assert.ok(!unchanged.result.storageState);
+    assert.equal(unchanged.pins.length, 0);
+});
 test("TOTP challenge selection, fresh-window submission and one bounded code refresh", async () => {
     const successful = await simulate({ choose: true, totp: true });
     assert.ok(successful.result.storageState);
     assert.equal(successful.pins.length, 1);
+    const alternative = await simulate({ alternative: true, totp: true });
+    assert.ok(alternative.result.storageState);
+    assert.equal(alternative.pins.length, 1);
+    assert.ok(alternative.phases.includes("choose_authenticator"));
+    const loading = await simulate({ alternative: true, loadingAlternative: true, totp: true });
+    assert.ok(loading.result.storageState);
+    assert.equal(loading.pins.length, 1);
     const boundary = await simulate({ nearExpiry: true, totp: true });
     assert.ok(boundary.result.storageState);
     assert.ok(boundary.pins[0].time >= 60000);
@@ -218,9 +267,17 @@ test("Google login alone cannot commit mismatched, unidentified or unusable acco
         [{ noIdentity: true }, "account_identity_unverified"],
         [{ unavailable: true }, "service_region_restricted"],
         [{ initializationFailed: true }, "service_initialization_failed"],
+        [{ unverifiedSocket: true }, "service_initialization_unverified"],
     ]) {
         const { result } = await simulate(options);
         assert.equal(result.error, reason);
         assert.ok(!result.storageState);
     }
+});
+
+test("missing target configuration stops before submitting credentials", async () => {
+    const { result, phases } = await simulate({ missingTarget: true });
+    assert.equal(result.error, "service_target_missing");
+    assert.deepEqual(phases, []);
+    assert.ok(!result.storageState);
 });

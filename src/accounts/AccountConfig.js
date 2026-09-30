@@ -19,6 +19,12 @@ function config() {
         result[key] = value;
     }
     result.autoRecovery = process.env.ACCOUNT_AUTO_RELOGIN_ENABLED !== "false";
+    if (
+        process.env.ACCOUNT_LOGIN_HUMANIZE !== undefined &&
+        !["true", "false"].includes(process.env.ACCOUNT_LOGIN_HUMANIZE)
+    )
+        throw new Error("Invalid ACCOUNT_LOGIN_HUMANIZE");
+    result.humanize = process.env.ACCOUNT_LOGIN_HUMANIZE !== "false";
     result.paused = false;
     return result;
 }
