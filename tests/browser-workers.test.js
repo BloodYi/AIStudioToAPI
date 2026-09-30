@@ -2,6 +2,8 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const BrowserManager = require("../src/core/BrowserManager");
 const ConnectionRegistry = require("../src/core/ConnectionRegistry");
+const { ModelScheduler } = require("../src/core/ModelScheduler");
+const loadSchedulerConfig = require("../src/core/SchedulerConfig");
 const logger = { debug() {}, error() {}, info() {}, warn() {} };
 function browserFixture(limit) {
     const manager = Object.create(BrowserManager.prototype);
@@ -159,6 +161,71 @@ test("capacity blocking does not synchronously repump the context pool", async (
     assert.equal(manager._contextInitTasks.size, 0);
     assert.equal(manager.initializingContexts.size, 0);
     assert.deepEqual([...manager.contexts.keys()], [0]);
+});
+
+test("real scheduler waits for capacity release without an initialization microtask loop", async t => {
+    for (const stale of [false, true]) {
+        await t.test(stale ? "stale context still has inflight requests" : "full pool has no idle context", async t => {
+            const manager = browserFixture(1);
+            manager.authSource.accountNameMap = new Map();
+            manager.authSource.getRotationIndices = () => (stale ? [0] : [0, 1]);
+            const scheduler = new ModelScheduler(
+                {
+                    ...loadSchedulerConfig({ MAX_BROWSER_WORKERS: "1", SCHEDULER_DAILY_RESET_ENABLED: "false" }),
+                    contextPoolMinReady: 0,
+                    queueTimeoutMs: 2000,
+                    statePath: null,
+                },
+                manager.authSource,
+                logger
+            );
+            manager.scheduler = scheduler;
+            scheduler.browserManager = manager;
+            t.after(() => scheduler.close());
+            // Keep a regression bounded even when microtasks starve timers and setImmediate.
+            let attempts = 0;
+            manager.logger = {
+                ...logger,
+                info(message) {
+                    if (!message.includes(" init_started ")) return;
+                    attempts++;
+                    if (attempts >= 8) scheduler.paused = true;
+                },
+            };
+            let creations = 0;
+            const initialize = manager._initializeContext.bind(manager);
+            manager._initializeContext = async (...args) => {
+                creations++;
+                return initialize(...args);
+            };
+            manager.contexts.set(0, { page: { isClosed: () => false }, state: "READY" });
+            const busy = await scheduler.acquire("busy");
+            if (stale) manager.contexts.get(0).state = "RECONNECTING";
+            else scheduler.slot(scheduler.account(0), "waiting").unsupported = true;
+
+            const waiting = scheduler.acquire("waiting");
+            waiting.catch(() => {});
+            await new Promise(resolve => setImmediate(resolve));
+
+            assert.equal(attempts, 1);
+            assert.equal(creations, 0);
+            assert.equal(scheduler.pending.length, 1);
+            assert.equal(scheduler.account(0).inflight, 1);
+            assert.equal(manager.contexts.has(0), true);
+            assert.equal(manager._contextInitTasks.size, 0);
+            assert.equal(manager.initializingContexts.size, 0);
+            assert.equal(manager.contextDemand.has(stale ? 0 : 1), true);
+
+            scheduler.release(busy);
+            const next = await waiting;
+            assert.equal(next.account.index, stale ? 0 : 1);
+            assert.equal(creations, 1);
+            assert.equal(manager.isContextReady(next.account.index), true);
+            assert.equal(manager.contextDemand.size, 0);
+            assert.equal(scheduler.pending.length, 0);
+            scheduler.release(next);
+        });
+    }
 });
 
 test("release callback cannot restart the pool after scheduler shutdown", async () => {
@@ -435,6 +502,8 @@ test("single-flight publishes one exact Promise and result to 20 same-account ca
 test("single-flight settled callback runs only after ownership markers are released", async () => {
     const manager = singleFlightFixture();
     let releasedState = null;
+    let drains = 0;
+    manager.scheduler = { drain: () => drains++ };
 
     await manager._getOrStartContextInit(4, {
         onSettledAfterRelease: () => {
@@ -442,11 +511,30 @@ test("single-flight settled callback runs only after ownership markers are relea
                 initializing: manager.initializingContexts.has(4),
                 task: manager._contextInitTasks.has(4),
             };
+            manager.scheduler.drain();
         },
         runner: async () => "ready",
     });
 
     assert.deepEqual(releasedState, { initializing: false, task: false });
+    assert.equal(drains, 1);
+});
+
+test("initialization without a settled callback uses default drain on success and failure", async () => {
+    const manager = singleFlightFixture();
+    let drains = 0;
+    manager.scheduler = { drain: () => drains++ };
+    await manager._getOrStartContextInit(4, { runner: async () => "ready" });
+    assert.equal(drains, 1);
+    await assert.rejects(
+        manager._getOrStartContextInit(4, {
+            runner: async () => {
+                throw new Error("expected init failure");
+            },
+        }),
+        /expected init failure/
+    );
+    assert.equal(drains, 2);
 });
 
 test("pool warmup and foreground switch join the same account initialization", async () => {

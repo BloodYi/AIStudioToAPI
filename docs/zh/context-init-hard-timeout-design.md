@@ -32,7 +32,7 @@
 
 ```js
 while (Date.now() - startTime < timeout) {
-    await somePlaywrightOperation();
+  await somePlaywrightOperation();
 }
 ```
 
@@ -87,11 +87,11 @@ while (Date.now() - startTime < timeout) {
 
 采用三层保护：
 
-| 层级 | 作用 | 建议默认值 |
-| --- | --- | ---: |
-| 单操作硬超时 | 限制 locator、evaluate、mouse 等 RPC | 10 秒 |
-| 初始化总 watchdog | 限制一次 `_initializeContext()` 的完整生命周期 | 180 秒 |
-| 浏览器级 watchdog | 多个 context 连续协议超时后重启共享浏览器 | 60 秒观察窗口内 2 次 |
+| 层级              | 作用                                           |           建议默认值 |
+| ----------------- | ---------------------------------------------- | -------------------: |
+| 单操作硬超时      | 限制 locator、evaluate、mouse 等 RPC           |                10 秒 |
+| 初始化总 watchdog | 限制一次 `_initializeContext()` 的完整生命周期 |               180 秒 |
+| 浏览器级 watchdog | 多个 context 连续协议超时后重启共享浏览器      | 60 秒观察窗口内 2 次 |
 
 “硬超时”在本文中表示：超时 Promise 与业务 Promise 并行运行，不依赖业务 Promise 主动返回；触发后主动关闭本 attempt 的 BrowserContext，以中断底层 Playwright RPC。
 
@@ -103,7 +103,7 @@ while (Date.now() - startTime < timeout) {
 {
     id: "15:34",
     authIndex: 15,
-    startedAt: 179059..., 
+    startedAt: 179059...,
     deadlineAt: 179059...,
     phase: "ws_initialization",
     operation: "continue_button.locator.count",
@@ -134,29 +134,29 @@ while (Date.now() - startTime < timeout) {
 
 ```js
 class OperationTimeoutError extends Error {
-    constructor(message, details = {}) {
-        super(message);
-        this.name = "OperationTimeoutError";
-        this.code = details.code || "OPERATION_TIMEOUT";
-        this.reason = details.reason || "operation_timeout";
-        Object.assign(this, details);
-    }
+  constructor(message, details = {}) {
+    super(message);
+    this.name = "OperationTimeoutError";
+    this.code = details.code || "OPERATION_TIMEOUT";
+    this.reason = details.reason || "operation_timeout";
+    Object.assign(this, details);
+  }
 }
 
 function withHardTimeout(task, timeoutMs, details = {}) {
-    let timer;
-    const timeout = new Promise((_, reject) => {
-        timer = setTimeout(() => {
-            reject(
-                new OperationTimeoutError(
-                    `${details.operation || "Operation"} timed out after ${timeoutMs}ms`,
-                    { ...details, timeoutMs }
-                )
-            );
-        }, timeoutMs);
-    });
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        new OperationTimeoutError(`${details.operation || "Operation"} timed out after ${timeoutMs}ms`, {
+          ...details,
+          timeoutMs,
+        })
+      );
+    }, timeoutMs);
+  });
 
-    return Promise.race([Promise.resolve().then(task), timeout]).finally(() => clearTimeout(timer));
+  return Promise.race([Promise.resolve().then(task), timeout]).finally(() => clearTimeout(timer));
 }
 ```
 
@@ -216,10 +216,9 @@ async _runInitOperation(attempt, operation, task, timeoutMs = this.contextOperat
 const runnerTask = Promise.resolve().then(() => runner(attempt));
 runnerTask.catch(() => {});
 
-const task = Promise.race([
-    runnerTask,
-    this._createContextInitWatchdog(attempt),
-]).finally(() => this._releaseContextInitOwnership(attempt));
+const task = Promise.race([runnerTask, this._createContextInitWatchdog(attempt)]).finally(() =>
+  this._releaseContextInitOwnership(attempt)
+);
 ```
 
 这样所有初始化入口共享相同保护：
@@ -244,6 +243,28 @@ watchdog 到期后按以下顺序执行：
 8. 通知 context 池继续泵送下一个候选账号。
 
 注意：释放 owner 后，旧 runner 可能仍在后台执行。因此 `_initializeContext()` 内所有写入共享状态的步骤都必须进行 attempt owner 校验。
+
+### 8.3 释放后的调度只能由一个入口决定
+
+`_getOrStartContextInit()` 的公共 `finally` 负责清除 watchdog、释放当前 attempt 的 owner 和初始化名额。释放完成后，按以下规则通知调度器：
+
+```js
+if (released) {
+  if (options.onSettledAfterRelease) options.onSettledAfterRelease();
+  else this.scheduler?.drain?.();
+}
+```
+
+有 `onSettledAfterRelease` 时，由该回调决定是否继续调度；没有回调时，才执行默认 `drain()`。公共 `finally` 不得在回调执行后追加一次无条件 `drain()`。
+
+context 池的 runner 在以下两种情况下设置 `blockedByCapacity=true` 并返回：
+
+1. 目标账号已有旧 context，且该账号仍有 inflight 请求；
+2. context 容量已满，且没有可淘汰的空闲 context。
+
+这两种返回表示等待占用变化，并不表示需要立即重试。回调检查 `blockedByCapacity` 后停止泵送，保留 `contextDemand`；已有请求通过 `ModelScheduler.release()` 释放占用时，再由 `drain()` 重新发出 context demand。正常初始化完成或其他失败仍由池回调执行 `drain()` 和 `_pumpContextPool()`。
+
+总 watchdog 只能限制一次 attempt 的等待时间。对于立即返回、持续重建 attempt 的 Promise 微任务循环，每次完成都会清除自己的 watchdog，而且循环会阻止定时器获得执行机会。因此 watchdog 不能替代容量阻塞保护。
 
 ## 9. 所有权隔离与晚到任务处理
 
@@ -280,7 +301,7 @@ this.contexts.set(authIndex, {
 ```js
 const current = this.contexts.get(authIndex);
 if (current?.attemptId === attempt.id) {
-    this.contexts.delete(authIndex);
+  this.contexts.delete(authIndex);
 }
 ```
 
@@ -386,16 +407,16 @@ browser_connected=true
 
 统一错误结构：
 
-| code | reason | 含义 |
-| --- | --- | --- |
-| `CONTEXT_CREATION_TIMEOUT` | `context_creation_timeout` | BrowserContext 创建超时 |
-| `NAVIGATION_TIMEOUT` | `navigation_timeout` | 目标页导航超时 |
-| `PLAYWRIGHT_RPC_TIMEOUT` | `playwright_rpc_timeout` | 单个 Playwright RPC 不返回 |
-| `CONSENT_DIALOG_TIMEOUT` | `consent_dialog_timeout` | Continue 弹窗无法关闭 |
-| `WS_CONNECTION_TIMEOUT` | `ws_connection_timeout` | 内部 WebSocket 未建立 |
-| `CONTEXT_INIT_TOTAL_TIMEOUT` | `context_init_total_timeout` | 初始化总时限耗尽 |
-| `CONTEXT_CLEANUP_TIMEOUT` | `context_cleanup_timeout` | context 清理不返回 |
-| `BROWSER_TRANSPORT_UNRESPONSIVE` | `browser_transport_unresponsive` | 共享浏览器协议通道失效 |
+| code                             | reason                           | 含义                       |
+| -------------------------------- | -------------------------------- | -------------------------- |
+| `CONTEXT_CREATION_TIMEOUT`       | `context_creation_timeout`       | BrowserContext 创建超时    |
+| `NAVIGATION_TIMEOUT`             | `navigation_timeout`             | 目标页导航超时             |
+| `PLAYWRIGHT_RPC_TIMEOUT`         | `playwright_rpc_timeout`         | 单个 Playwright RPC 不返回 |
+| `CONSENT_DIALOG_TIMEOUT`         | `consent_dialog_timeout`         | Continue 弹窗无法关闭      |
+| `WS_CONNECTION_TIMEOUT`          | `ws_connection_timeout`          | 内部 WebSocket 未建立      |
+| `CONTEXT_INIT_TOTAL_TIMEOUT`     | `context_init_total_timeout`     | 初始化总时限耗尽           |
+| `CONTEXT_CLEANUP_TIMEOUT`        | `context_cleanup_timeout`        | context 清理不返回         |
+| `BROWSER_TRANSPORT_UNRESPONSIVE` | `browser_transport_unresponsive` | 共享浏览器协议通道失效     |
 
 错误对象应包含：
 
@@ -529,6 +550,19 @@ stale_initializing_contexts
 
 不得只使用 `setTimeout` 模拟正常慢请求；必须包含永不 settle 的 Promise，才能验证真正的硬超时。
 
+### 17.4 容量阻塞与真实调度器回归测试
+
+在 `tests/browser-workers.test.js` 中使用真实 `ModelScheduler`，保留 `drain → _signalContextDemand → requestContext → _pumpContextPool` 调用链，仅替换浏览器创建和页面操作：
+
+1. 容量已满且没有空闲 context 时，只启动一次 attempt，不执行浏览器初始化；
+2. 旧 context 仍有 inflight 请求时，只启动一次 attempt，不关闭在途请求的 context；
+3. 两种阻塞情况下都释放初始化跟踪状态，保留 demand 和排队请求，并让 `setImmediate` 获得执行机会；
+4. 调用真实 `scheduler.release()` 后，排队请求完成 context 初始化并取得 lease；
+5. 自定义完成回调在 owner 释放后执行，回调主动 drain 时公共 `finally` 不重复 drain；
+6. 没有完成回调时，成功和失败都仍执行默认 drain。
+
+测试设置同步的尝试次数上限：达到 8 次时暂停调度器，使错误实现也能有界退出并报告断言失败。不能只依赖测试 timeout 截断循环，因为定时器本身可能被微任务饿死。原有空 `drain()` fixture 无法覆盖这条反馈路径，仍可用于其他浏览器单元测试。
+
 ## 18. 实施顺序
 
 ### P0
@@ -591,3 +625,36 @@ stale_initializing_contexts
 5. 所有晚到结果必须经过 attempt owner 校验；
 6. 日志必须记录“卡在哪一步”，不能只记录笼统的初始化失败；
 7. 单页面故障先局部恢复，浏览器级故障才执行全局恢复。
+
+## 21. 2026-09-30 容量阻塞重试循环复盘
+
+### 21.1 生产核实
+
+通过 `ssh meow_us` 对生产容器进行只读核查，确认：
+
+- 镜像为 `aistudio-to-api:us-4f44576`；
+- 容器内 `BrowserManager.js`、`ModelScheduler.js` 的 SHA256 与提交 `4f44576` 中对应文件完全一致；
+- `Context#0` 和 `Context#32` 持续输出 `init_started / init_finished`，最近约 1.15 秒的 1000 行日志全部属于这两类事件，约每秒 436 次初始化尝试，全局 attempt 序号已超过 217 万；
+- 直连 `127.0.0.1:7860/health` 的 TCP 连接成功，但 5 秒内收到 0 字节；Docker 健康检查连续超时，容器处于 `unhealthy`；
+- 保留日志最早已处于约第 197 万次尝试，无法据此确定最初触发的是哪条容量阻塞分支。
+
+### 21.2 故障机制与修复
+
+提交 `4f44576` 在 `_getOrStartContextInit()` 的公共 `finally` 中新增了回调之后的无条件 `scheduler.drain()`。池回调虽然根据 `blockedByCapacity` 停止调度，公共 `finally` 仍沿以下路径重新创建同一账号的初始化任务：
+
+```text
+runner 遇到容量阻塞并返回
+  → finally 释放初始化 owner 和名额
+  → onSettledAfterRelease 因 blockedByCapacity 返回
+  → 公共 finally 无条件 scheduler.drain()
+  → _signalContextDemand()
+  → requestContext()
+  → _pumpContextPool()
+  → 新 runner 再次遇到相同容量阻塞
+```
+
+容量没有变化时，这条路径形成持续执行的 Promise 微任务循环，导致 HTTP、WebSocket 和定时器无法获得执行机会。快速完成的 attempt 不会触发初始化总 watchdog。
+
+本次源码修复采用第 8.3 节的互斥通知规则，不增加轮询或重试定时器。新增真实调度器回归测试在修复前的两条阻塞分支均达到 8 次上限并失败；修复后均只尝试一次，实际浏览器初始化次数为 0，释放占用后均可完成一次初始化并处理排队请求。
+
+生产核查未修改源码或重启容器；本次修改属于本机源码修复，生产发布另行进行。

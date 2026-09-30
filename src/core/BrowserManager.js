@@ -2889,8 +2889,9 @@ class BrowserManager {
                 `[Context#${authIndex}] init_finished attempt=${attempt.id} released=${released} initializing_count=${this.initializingContexts.size} pending_init=${this._contextInitTasks.size}`
             );
             if (released) {
-                options.onSettledAfterRelease?.();
-                this.scheduler?.drain?.();
+                // Pool callbacks decide whether capacity permits another scheduling pass.
+                if (options.onSettledAfterRelease) options.onSettledAfterRelease();
+                else this.scheduler?.drain?.();
             }
         });
         this._contextInitTasks.set(authIndex, task);
