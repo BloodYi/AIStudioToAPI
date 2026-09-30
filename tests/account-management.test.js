@@ -8,6 +8,8 @@ const Service = require("../src/accounts/AccountLoginService");
 const Totp = require("../src/accounts/TotpService");
 const { parseImport, Payload } = require("../src/accounts/AuthenticatorImportService");
 const AccountRoutes = require("../src/routes/AccountRoutes");
+const { ModelScheduler } = require("../src/core/ModelScheduler");
+const schedulerConfig = require("../src/core/SchedulerConfig");
 const logger = { debug() {}, error() {}, info() {}, warn() {} };
 const secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -30,7 +32,7 @@ async function fixture(t, count = 0) {
     const system = {
         authSource: { availableIndices: Array.from({ length: count }, (_, index) => index), reloadAuthSources() {} },
         logger,
-        scheduler: { isAccountDisabled: () => false },
+        scheduler: { isAccountManuallyDisabled: () => false },
     };
     const options = {
         artifactDir: path.join(directory, "artifacts"),
@@ -161,7 +163,7 @@ test("same-account deduplication, queue capacity, pause and disabled auto recove
     const account = service.state.accounts[0];
     await service.edit(account.accountId, { credentialVersion: 1, password: "synthetic" });
     account.sessionState = "expired";
-    system.scheduler.isAccountDisabled = () => true;
+    system.scheduler.isAccountManuallyDisabled = () => true;
     await service.scanRecovery();
     assert.equal(service.state.tasks.length, 0);
     const first = await service.login(account.accountId),
@@ -243,7 +245,7 @@ test("late success after credential mutation or cancellation cannot write auth f
 });
 test("old Context refresh and expiration cannot overwrite new Cookie; disabled state survives", async t => {
     const { service, system } = await fixture(t, 1);
-    system.scheduler.isAccountDisabled = () => true;
+    system.scheduler.isAccountManuallyDisabled = () => true;
     await service.upload({
         accountName: "user0@example.com",
         cookies: [{ name: "fresh", value: "synthetic-cookie" }],
@@ -260,6 +262,31 @@ test("old Context refresh and expiration cannot overwrite new Cookie; disabled s
     await service.upload({ accountName: "replacement@example.com", cookies: [], origins: [] });
     assert.notEqual(service.state.accounts[0].accountId, account.accountId);
     assert.equal(await service.refreshSession(0, version, { cookies: [], origins: [] }), false);
+});
+test("account list and recovery use the real scheduler's administrative disable method", async t => {
+    const { service, system } = await fixture(t, 1);
+    system.authSource.accountNameMap = new Map();
+    const scheduler = new ModelScheduler(
+        { ...schedulerConfig({ SCHEDULER_DAILY_RESET_ENABLED: "false" }), statePath: null },
+        system.authSource,
+        logger
+    );
+    system.scheduler = scheduler;
+    t.after(() => scheduler.close());
+    assert.equal(service.list()[0].disabled, false);
+    scheduler.disable(0);
+    assert.equal(service.list()[0].disabled, true);
+    const account = service.state.accounts[0];
+    await service.edit(account.accountId, { credentialVersion: 1, password: "synthetic" });
+    account.sessionState = "expired";
+    account.recoveryState = "idle";
+    await service.scanRecovery();
+    assert.equal(service.state.tasks.length, 0);
+    const task = service.enqueue(account, "expired");
+    await service.queue.tick();
+    assert.equal(task.status, "cancelled");
+    assert.equal(service.queue.running.size, 0);
+    assert.equal(service.list()[0].disabled, true);
 });
 test("import preview is secret-free, session-bound, versioned and idempotent", async t => {
     const { service } = await fixture(t, 1);

@@ -65,7 +65,7 @@ class AccountLoginQueue {
                         account &&
                         task.source === "expired" &&
                         account.authIndex !== null &&
-                        this.service.system.scheduler?.isAccountDisabled(account.authIndex)
+                        this.service.system.scheduler?.isAccountManuallyDisabled(account.authIndex)
                     ) {
                         task.status = "cancelled";
                         task.finishedAt = Date.now();

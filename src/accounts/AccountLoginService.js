@@ -183,7 +183,8 @@ class AccountLoginService {
         return {
             ...metadata,
             disabled:
-                account.authIndex !== null && this.system.scheduler?.isAccountDisabled(account.authIndex) === true,
+                account.authIndex !== null &&
+                this.system.scheduler?.isAccountManuallyDisabled(account.authIndex) === true,
             hasPassword: !!password,
             hasTotpSecret: !!totp,
             nextAttemptAt: task?.nextAttemptAt || null,
@@ -349,7 +350,8 @@ class AccountLoginService {
                 account.autoRecovery &&
                 ["idle", "queued", "credentials_missing"].includes(account.recoveryState)
             ) {
-                if (account.authIndex !== null && this.system.scheduler?.isAccountDisabled(account.authIndex)) continue;
+                if (account.authIndex !== null && this.system.scheduler?.isAccountManuallyDisabled(account.authIndex))
+                    continue;
                 if (!account.password || !account.email) {
                     account.recoveryState = "credentials_missing";
                     continue;

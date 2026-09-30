@@ -12,6 +12,9 @@ camoufox/
 # Temporary files
 tmp/
 
+# Runtime data and local deployment copies
+data/
+
 # Config files
 configs/
 
