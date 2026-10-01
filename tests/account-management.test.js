@@ -92,7 +92,7 @@ test("CSV preserves BOM, quoted commas, quotes, newlines and password whitespace
     assert.match(parsed.rows[1].error, /Duplicate/);
     assert.ok(parsed.rows[2].error);
 });
-function migration(batchIndex = 0, batchSize = 1, overrides = {}) {
+function migration(batchIndex = 0, batchSize = 1, overrides = {}, version = 1) {
     const bytes = Payload.encode(
         Payload.create({
             batchId: 9,
@@ -108,7 +108,7 @@ function migration(batchIndex = 0, batchSize = 1, overrides = {}) {
                     ...overrides,
                 },
             ],
-            version: 1,
+            version,
         })
     ).finish();
     return `otpauth-migration://offline?data=${Buffer.from(bytes).toString("base64")}`;
@@ -129,6 +129,31 @@ test("migration schema handles complete, missing, duplicate and unsupported batc
         "user@example.com"
     );
     assert.ok(parseImport("authenticator", "otpauth-migration://offline?data=%%%bad").rows[0].error);
+});
+test("migration version 2 accepts URL-encoded exports with an unknown entry ID field", () => {
+    // Independently encoded synthetic export, including entry field 8 (unique ID).
+    const uri =
+        "otpauth-migration://offline?data=ClEKFDEyMzQ1Njc4OTAxMjM0NTY3ODkwEhdHb29nbGU6dXNlckBleGFtcGxlLmNvbRoGR29vZ2xlIAEoATACQhJzeW50aGV0aWMtZW50cnktaWQQAhgBIAA%3D";
+    const parsed = parseImport("authenticator", uri);
+    assert.equal(parsed.complete, true);
+    assert.deepEqual(parsed.batches, [{ id: "0", received: [0], size: 1 }]);
+    assert.deepEqual(parsed.rows, [
+        { email: "user@example.com", name: "Google:user@example.com", totp: Totp.normalize(secret) },
+    ]);
+    assert.equal(parseImport("authenticator", migration(0, 2, {}, 2)).complete, false);
+    const complete = parseImport(
+        "authenticator",
+        `${migration(0, 2, {}, 2)}\n${migration(1, 2, { name: "other@example.com" }, 2)}`
+    );
+    assert.equal(complete.complete, true);
+    assert.equal(complete.rows.length, 2);
+    assert.ok(complete.rows.every(row => !row.error));
+    assert.ok(parseImport("authenticator", migration(0, 1, { type: 1 }, 2)).rows[0].error);
+    for (const version of [0, 3])
+        assert.equal(
+            parseImport("authenticator", migration(0, 1, {}, version)).rows[0].error,
+            "Damaged migration link or invalid OTP"
+        );
 });
 test("150 existing Cookie accounts migrate without rewriting cookies or exposing secrets", async t => {
     const { service, directory } = await fixture(t, 150);

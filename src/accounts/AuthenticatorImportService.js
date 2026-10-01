@@ -50,7 +50,7 @@ function parseImport(kind, content) {
                     if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(data) || data.length % 4 === 1) throw new Error();
                     const payload = Payload.decode(Buffer.from(data, "base64"));
                     if (
-                        payload.version !== 1 ||
+                        ![1, 2].includes(payload.version) ||
                         payload.batchSize < 1 ||
                         payload.batchSize > 1000 ||
                         payload.batchIndex < 0 ||
