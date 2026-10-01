@@ -184,7 +184,16 @@
                     <h1>{{ t("statusHeading") }}</h1>
                 </header>
 
-                <SchedulerStatus :data="schedulerData" :t="t" @refresh="updateContent" />
+                <p v-if="!schedulingMode" class="storage-retention-note">{{ t(modeNotice) }}</p>
+                <p v-if="isModelAware && !schedulerData" class="storage-retention-note">
+                    {{ t(schedulerError ? "schedulerLoadFailed" : "loading") }}
+                </p>
+                <SchedulerStatus
+                    v-if="isModelAware && schedulerData"
+                    :data="schedulerData"
+                    :t="t"
+                    @refresh="updateContent"
+                />
 
                 <div class="dashboard-grid">
                     <!-- Service Status Card -->
@@ -285,7 +294,7 @@
                             {{ t("accountStatus") }}
                         </h3>
                         <div class="status-list">
-                            <div class="status-item">
+                            <div v-if="isLegacy" class="status-item">
                                 <span class="label">
                                     <svg
                                         xmlns="http://www.w3.org/2000/svg"
@@ -311,7 +320,7 @@
                                     </span>
                                 </span>
                             </div>
-                            <div class="status-item">
+                            <div v-if="isLegacy" class="status-item">
                                 <span class="label">
                                     <svg
                                         xmlns="http://www.w3.org/2000/svg"
@@ -336,7 +345,7 @@
                                 </span>
                                 <span class="value">{{ state.usageCount }}</span>
                             </div>
-                            <div class="status-item">
+                            <div v-if="isLegacy" class="status-item">
                                 <span class="label">
                                     <svg
                                         xmlns="http://www.w3.org/2000/svg"
@@ -405,7 +414,7 @@
                                 </span>
                                 <span class="value">{{ dedupedAvailableCount }}</span>
                             </div>
-                            <div class="status-item">
+                            <div v-if="schedulingMode" class="status-item">
                                 <span class="label">
                                     <svg
                                         xmlns="http://www.w3.org/2000/svg"
@@ -423,8 +432,11 @@
                                         <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path>
                                     </svg>
                                     <span>
-                                        {{ t("activeContexts") }}
-                                        <EnvVarTooltip env-var="MAX_CONTEXTS" doc-section="proxy-config" />
+                                        {{ t(isModelAware ? "browserContexts" : "activeContexts") }}
+                                        <EnvVarTooltip
+                                            :env-var="isModelAware ? 'MAX_BROWSER_WORKERS' : 'MAX_CONTEXTS'"
+                                            doc-section="proxy-config"
+                                        />
                                     </span>
                                 </span>
                                 <span class="value">{{ activeContextsDisplay }}</span>
@@ -607,7 +619,7 @@
                                     >{{ state.forceCodeExecutionEnabled ? t("enabled") : t("disabled") }}</span
                                 >
                             </div>
-                            <div class="status-item">
+                            <div v-if="schedulingMode" class="status-item">
                                 <span class="label">
                                     <svg
                                         xmlns="http://www.w3.org/2000/svg"
@@ -625,8 +637,9 @@
                                         <path d="M21 3v5h-5"></path>
                                     </svg>
                                     <span>
-                                        {{ t("maxRetries") }}
+                                        {{ t(isModelAware ? "maxRetriesPerRequest" : "maxRetries") }}
                                         <span
+                                            v-if="isLegacy"
                                             style="
                                                 font-size: 0.8em;
                                                 color: var(--text-secondary);
@@ -635,10 +648,13 @@
                                             "
                                             >({{ t("onlyAppliesWhenFakeStreaming") }})</span
                                         >
-                                        <EnvVarTooltip env-var="MAX_RETRIES" doc-section="proxy-config" />
+                                        <EnvVarTooltip
+                                            :env-var="isModelAware ? 'MAX_RETRIES_PER_REQUEST' : 'MAX_RETRIES'"
+                                            doc-section="proxy-config"
+                                        />
                                     </span>
                                 </span>
-                                <span class="value">{{ state.maxRetries }}</span>
+                                <span class="value">{{ retriesDisplay }}</span>
                             </div>
                             <div class="status-item">
                                 <span class="label">
@@ -675,14 +691,16 @@
                 <header class="page-header">
                     <h1>{{ t("accountManagement") }}</h1>
                 </header>
+                <p v-if="!schedulingMode" class="storage-retention-note">{{ t(modeNotice) }}</p>
                 <AccountsPage
+                    :scheduling-mode="schedulingMode"
                     :current-auth-index="state.currentAuthIndex"
                     :account-details="state.accountDetails"
                     :is-busy="isBusy"
                     :legacy-actions="{
                         uploadAuth: triggerFileUpload,
                         deduplicate: deduplicateAuth,
-                        switchAccount: switchAccountByIndex,
+                        ...(isLegacy ? { switchAccount: switchAccountByIndex } : {}),
                     }"
                 />
                 <input
@@ -974,7 +992,7 @@
                     </div>
 
                     <!-- Log Settings Card -->
-                    <div class="status-card">
+                    <div id="settings-logs" class="status-card">
                         <h3 class="card-title">
                             <svg
                                 xmlns="http://www.w3.org/2000/svg"
@@ -996,6 +1014,7 @@
                             </svg>
                             {{ t("log") }}
                         </h3>
+                        <h4>{{ t("runtimeLogs") }}</h4>
                         <div class="status-list">
                             <div class="status-item">
                                 <span class="label">
@@ -1061,6 +1080,32 @@
                                 />
                             </div>
                         </div>
+                        <div v-if="storageError" class="storage-error">{{ t("storageLoadFailed") }}</div>
+                        <div v-if="!storageLoaded && !storageError" class="empty-state">{{ t("loading") }}</div>
+                        <div v-else-if="storageLoaded && !storageState.enabled" class="empty-state">
+                            {{ t("usageStatsDisabled") }}
+                        </div>
+                        <template v-else-if="storageLoaded">
+                            <h4>{{ t("requestDetailsRetention") }}</h4>
+                            <div class="storage-retention-grid">
+                                <span>{{ t("requestDetails") }}</span
+                                ><strong>{{ storageRetentionText }}</strong> <span>{{ t("automaticCleanup") }}</span
+                                ><strong>{{ storageCleanupIntervalText }}</strong>
+                            </div>
+                            <h4>{{ t("requestDetailsCleanupStatus") }}</h4>
+                            <div class="storage-retention-grid">
+                                <span>{{ t("lastCleanup") }}</span
+                                ><strong>{{ storageLastCleanupText }}</strong> <span>{{ t("nextCleanup") }}</span
+                                ><strong>{{ storageNextCleanupText }}</strong>
+                            </div>
+                            <p v-if="storageState.cleanup_status === 'error'" class="storage-error">
+                                {{ t("cleanupFailedRetry") }} {{ storageState.cleanup_error || "" }}
+                            </p>
+                            <p v-if="storageState.retention_mode !== 'forever'" class="storage-retention-note">
+                                {{ t("retentionExplanation", { days: storageState.retention_days }) }}
+                            </p>
+                            <p class="storage-retention-note">{{ t("retentionConfigNotice") }}</p>
+                        </template>
                     </div>
 
                     <!-- Appearance Card -->
@@ -2256,26 +2301,8 @@
 
                 <div class="full-width-section">
                     <section class="status-card storage-retention-card">
-                        <div class="card-header-v2">
-                            <h3 class="card-title-usage">{{ t("logRetention") }}</h3>
-                        </div>
-                        <div v-if="!storageState.enabled" class="empty-state">{{ t("usageStatsDisabled") }}</div>
-                        <template v-else>
-                            <div class="storage-retention-grid">
-                                <span>{{ t("requestDetails") }}</span
-                                ><strong>{{ storageRetentionText }}</strong> <span>{{ t("automaticCleanup") }}</span
-                                ><strong>{{ storageCleanupIntervalText }}</strong> <span>{{ t("lastCleanup") }}</span
-                                ><strong>{{ storageLastCleanupText }}</strong> <span>{{ t("nextCleanup") }}</span
-                                ><strong>{{ storageNextCleanupText }}</strong>
-                            </div>
-                            <p v-if="storageState.cleanup_status === 'error'" class="storage-error">
-                                {{ t("cleanupFailedRetry") }} {{ storageState.cleanup_error || "" }}
-                            </p>
-                            <p v-if="storageState.retention_mode !== 'forever'" class="storage-retention-note">
-                                {{ t("retentionExplanation", { days: storageState.retention_days }) }}
-                            </p>
-                            <p class="storage-retention-note">{{ t("retentionConfigNotice") }}</p>
-                        </template>
+                        <p :class="{ 'storage-error': storageError }">{{ storageSummary }}</p>
+                        <el-button link type="primary" @click="openLogSettings">{{ t("openLogSettings") }}</el-button>
                     </section>
                 </div>
 
@@ -2590,6 +2617,8 @@ import ProxyPoolPanel from "../components/proxy/ProxyPoolPanel.vue";
 import AccountsPage from "./AccountsPage.vue";
 
 const schedulerData = ref(null);
+const schedulerError = ref(false);
+const modeNotice = ref("loading");
 const router = useRouter();
 const fileInput = ref(null);
 const usageStatsImportInput = ref(null);
@@ -2605,6 +2634,8 @@ const isDownloadingUsageStats = ref(false);
 const isImportingUsageStats = ref(false);
 const isUsageStatsTransferBusy = computed(() => isDownloadingUsageStats.value || isImportingUsageStats.value);
 const storageState = reactive({ enabled: false });
+const storageLoaded = ref(false);
+const storageError = ref(false);
 let storageFetchedAt = 0;
 
 // Create reactive version counter
@@ -3254,6 +3285,31 @@ const formatRecordExpiration = record => {
     if (record.expired) return t("expiredPendingCleanup");
     return formatStorageTime(record.expires_at);
 };
+const storageSummary = computed(() => {
+    if (storageError.value) return t("storageLoadFailed");
+    if (!storageLoaded.value) return t("loading");
+    if (!storageState.enabled) return t("usageStatsDisabled");
+    if (storageState.retention_mode === "forever") return t("retentionSummaryForever");
+    return t("retentionSummary", { days: storageState.retention_days, minutes: storageState.cleanup_interval_minutes });
+});
+const fetchStorageState = async signal => {
+    if (Date.now() - storageFetchedAt < 30000) return;
+    try {
+        const res = await fetch("/api/usage-stats/storage", { signal });
+        if (res.status === 304) return;
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        Object.keys(storageState).forEach(key => delete storageState[key]);
+        Object.assign(storageState, data);
+        storageLoaded.value = true;
+        storageError.value = false;
+        storageFetchedAt = Date.now();
+    } catch (error) {
+        if (error.name === "AbortError") throw error;
+        storageError.value = true;
+    }
+};
+
 const storageRetentionText = computed(() =>
     storageState.retention_mode === "forever"
         ? t("retainedForever")
@@ -3290,9 +3346,7 @@ const fetchUsageStats = async (signal, includeRecords = true) => {
                 : `&after_sequence=${latestUsageSequence}&dataset_revision=${usageDatasetRevision}`;
         recordsPromise = fetch(`/api/usage-stats/records?limit=100${after}`, { signal });
     }
-    const shouldFetchStorage = Date.now() - storageFetchedAt >= 30000;
-    const storagePromise = shouldFetchStorage ? fetch("/api/usage-stats/storage", { signal }) : null;
-    const [summaryRes, recordsRes, storageRes] = await Promise.all([summaryPromise, recordsPromise, storagePromise]);
+    const [summaryRes, recordsRes] = await Promise.all([summaryPromise, recordsPromise, fetchStorageState(signal)]);
     const res = summaryRes;
     if (res.redirected) {
         window.location.href = res.url;
@@ -3309,11 +3363,6 @@ const fetchUsageStats = async (signal, includeRecords = true) => {
     if (recordsRes && !recordsRes.ok) throw new Error(`HTTP ${recordsRes.status}`);
     const data = await res.json();
     const recordsData = recordsRes ? await recordsRes.json() : null;
-    if (storageRes) {
-        if (!storageRes.ok) throw new Error(`HTTP ${storageRes.status}`);
-        Object.assign(storageState, await storageRes.json());
-        storageFetchedAt = Date.now();
-    }
     statsState.accounts = data.accounts || [];
     statsState.models = data.models || [];
     if (recordsData) {
@@ -3537,6 +3586,13 @@ const getApiErrorMessage = data => {
     return t("unknownError");
 };
 
+const openLogSettings = async () => {
+    if (route.path === "/accounts") await router.push("/");
+    switchTab("settings");
+    await nextTick();
+    document.getElementById("settings-logs")?.scrollIntoView({ behavior: "smooth", block: "start" });
+};
+
 const switchTab = tabName => {
     if (tabName === "accounts") router.push("/accounts");
     else if (route.path === "/accounts")
@@ -3551,6 +3607,7 @@ const switchTab = tabName => {
     }
 
     activeTab.value = tabName;
+    if (tabName === "settings" || tabName === "stats") storageFetchedAt = 0;
     immediateRefreshRequested = true;
     pollController?.abort();
     scheduleUpdate(0);
@@ -3596,6 +3653,9 @@ const state = reactive({
     maxRetries: 3,
     releaseUrl: null,
     safetySettingsThreshold: "OFF",
+    schedulerMaxBrowserWorkers: null,
+    schedulerMaxRetriesPerRequest: null,
+    schedulingMode: null,
     selectedAccounts: new Set(), // Selected account indices
     serviceConnected: false,
     streamingModeReal: false,
@@ -3637,10 +3697,20 @@ const dedupedAvailableCount = computed(() => {
     return state.accountDetails.filter(acc => !acc.isDuplicate && !acc.isInvalid).length;
 });
 
+const schedulingMode = computed(() => state.schedulingMode);
+const isLegacy = computed(() => schedulingMode.value === "legacy");
+const isModelAware = computed(() => schedulingMode.value === "model-aware");
+const retriesDisplay = computed(() => {
+    if (isLegacy.value) return state.maxRetries;
+    const retries = state.schedulerMaxRetriesPerRequest;
+    return Number.isInteger(retries) && retries >= 0 ? t("retryAttempts", { attempts: retries + 1, retries }) : "—";
+});
+
 // Active contexts display (e.g., "1 / 3" or "1 / ∞")
 const activeContextsDisplay = computed(() => {
     const active = state.activeContextsCount;
-    const max = state.maxContexts;
+    const max = isModelAware.value ? state.schedulerMaxBrowserWorkers : state.maxContexts;
+    if (isModelAware.value) return `${active} / ${Number.isInteger(max) && max > 0 ? max : "—"}`;
     return max === 0 ? `${active} / ∞` : `${active} / ${max}`;
 });
 
@@ -3979,6 +4049,7 @@ const handleStreamingModeBeforeChange = async () => {
 
 // Switch account by index
 const switchAccountByIndex = targetIndex => {
+    if (!isLegacy.value) return;
     if (state.currentAuthIndex === targetIndex) {
         ElMessage.warning(t("alreadyCurrentAccount"));
         return;
@@ -4043,6 +4114,20 @@ const copyAppVersion = () => copyText(appVersion.value);
 
 const updateStatus = data => {
     state.serviceConnected = true;
+    const mode = data.status.schedulingMode;
+    if (mode === "legacy" || mode === "model-aware") {
+        if (state.schedulingMode !== mode) {
+            schedulerData.value = null;
+            schedulerError.value = false;
+        }
+        state.schedulingMode = mode;
+        state.schedulerMaxBrowserWorkers =
+            mode === "model-aware" ? (data.status.schedulerMaxBrowserWorkers ?? null) : null;
+        state.schedulerMaxRetriesPerRequest =
+            mode === "model-aware" ? (data.status.schedulerMaxRetriesPerRequest ?? null) : null;
+    } else {
+        modeNotice.value = "schedulingModeUnavailable";
+    }
 
     const isEnabled = val => {
         if (val === true) return true;
@@ -4107,10 +4192,7 @@ const fetchIncrementalLogs = async signal => {
 const updateContent = async signal => {
     const dot = document.querySelector(".dot");
     try {
-        const requests = [fetch("/api/status/core", { signal })];
-        if (activeTab.value === "home") requests.push(fetch("/api/dashboard/realtime", { signal }));
-        const responses = await Promise.all(requests);
-        const res = responses[0];
+        const res = await fetch("/api/status/core", { signal });
         if (res.redirected) {
             window.location.href = res.url;
             return;
@@ -4119,23 +4201,38 @@ const updateContent = async signal => {
             window.location.href = "/login";
             return;
         }
-        if (!res.ok) {
-            throw new Error(`HTTP error! status: ${res.status}`);
+        if (res.status !== 304) {
+            if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+            updateStatus(await res.json());
         }
-        const data = await res.json();
 
         if (dot) {
             if (state.serviceConnected) dot.classList.add("status-running");
             else dot.classList.remove("status-running");
         }
-        updateStatus(data);
-        if (activeTab.value === "home") {
-            if (responses[1].status === 304) return;
-            if (!responses[1].ok) throw new Error(`HTTP ${responses[1].status}`);
-            const dashboard = await responses[1].json();
-            schedulerData.value = dashboard.scheduler || null;
+        if (activeTab.value === "home" && isModelAware.value) {
+            try {
+                const response = await fetch("/api/dashboard/realtime", { signal });
+                if (response.status === 304) return;
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const dashboard = await response.json();
+                if (
+                    !dashboard.scheduler ||
+                    dashboard.scheduler.enabled === false ||
+                    !Array.isArray(dashboard.scheduler.models) ||
+                    !dashboard.scheduler.contexts_summary
+                )
+                    throw new Error("Scheduler data unavailable");
+                schedulerData.value = dashboard.scheduler;
+                schedulerError.value = false;
+            } catch (error) {
+                if (error.name === "AbortError") throw error;
+                schedulerError.value = true;
+            }
         } else if (activeTab.value === "stats") {
             await fetchUsageStats(signal, recordsCurrentPage.value === 1);
+        } else if (activeTab.value === "settings") {
+            await fetchStorageState(signal);
         } else if (activeTab.value === "logs") {
             await fetchIncrementalLogs(signal);
         }
@@ -4143,6 +4240,7 @@ const updateContent = async signal => {
         if (err.name === "AbortError") throw err;
         console.error("Error fetching status:", err.message || err);
         state.serviceConnected = false;
+        modeNotice.value = "schedulingModeLoadFailed";
     }
 };
 
@@ -4805,8 +4903,19 @@ watchEffect(() => {
 
 .storage-retention-grid {
     display: grid;
-    grid-template-columns: minmax(140px, 220px) 1fr;
+    grid-template-columns: minmax(100px, 140px) minmax(0, 1fr);
     gap: 10px 20px;
+}
+
+.storage-retention-grid strong {
+    overflow-wrap: anywhere;
+}
+
+@media (max-width: 599px) {
+    .storage-retention-grid {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 6px;
+    }
 }
 
 .storage-retention-note,

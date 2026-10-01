@@ -105,6 +105,7 @@ test("dashboard and scheduler detail routes keep heavy fields out of realtime re
             })),
             revision: "accounts:1",
         }),
+        config: { maxRetries: 2, maxWorkers: 12 },
         contextsSnapshot: () => ({ contexts: [], revision: "contexts:1" }),
         sequence: 1,
         summarySnapshot: () => ({
@@ -149,13 +150,13 @@ test("dashboard and scheduler detail routes keep heavy fields out of realtime re
             forceUrlContext: false,
             forceWebSearch: false,
             immediateSwitchStatusCodes: [],
-            maxContexts: 1,
-            maxRetries: 1,
+            maxContexts: 3,
+            maxRetries: 5,
             safetySettingsThreshold: "OFF",
             streamingMode: "real",
             switchOnUses: 0,
         },
-        connectionRegistry: { connectionsByAuth: new Map() },
+        connectionRegistry: { connectionsByAuth: new Map(), getConnectionByAuth: () => null },
         distIndexPath: "",
         logger: logService,
         requestHandler: { currentAuthIndex: 0, failureCount: 0, isSystemBusy: false, usageCount: 0 },
@@ -189,6 +190,36 @@ test("dashboard and scheduler detail routes keep heavy fields out of realtime re
         handlers[0]({ headers, query }, response, next);
         return response;
     };
+
+    // Display limits come from the live scheduler, while legacy fields retain their meaning.
+    const core = invoke("/api/status/core");
+    assert.equal(core.body.status.schedulingMode, "model-aware");
+    assert.equal(core.body.status.schedulerMaxBrowserWorkers, 12);
+    assert.equal(core.body.status.schedulerMaxRetriesPerRequest, 2);
+    assert.equal(core.body.status.maxContexts, 3);
+    assert.equal(core.body.status.maxRetries, 5);
+    assert.equal(core.body.status.currentAuthIndex, 0);
+
+    scheduler.paused = true;
+    scheduler.config.maxRetries = 0;
+    serverSystem.requestHandler.currentAuthIndex = -1;
+    const paused = invoke("/api/status/core");
+    assert.equal(paused.statusCode, 200);
+    assert.equal(paused.body.status.schedulingMode, "model-aware");
+    assert.equal(paused.body.status.schedulerMaxRetriesPerRequest, 0);
+    scheduler.paused = false;
+
+    serverSystem.scheduler = null;
+    const legacy = invoke("/api/status/core");
+    assert.equal(legacy.statusCode, 200);
+    assert.equal(legacy.body.status.schedulingMode, "legacy");
+    assert.equal(legacy.body.status.schedulerMaxBrowserWorkers, null);
+    assert.equal(legacy.body.status.schedulerMaxRetriesPerRequest, null);
+    assert.equal(legacy.body.status.maxContexts, 3);
+    assert.equal(legacy.body.status.maxRetries, 5);
+    assert.equal(legacy.body.status.currentAuthIndex, -1);
+    assert.deepEqual(invoke("/api/dashboard/realtime").body.scheduler, { enabled: false });
+    serverSystem.scheduler = scheduler;
 
     const dashboard = invoke("/api/dashboard/realtime");
     assert.equal(dashboard.statusCode, 200);

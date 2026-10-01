@@ -137,9 +137,15 @@
                         {{ row.email || row.displayName }}</span
                     >
                     <div class="account-badges">
-                        <ElTag v-if="row.authIndex !== null && row.authIndex === currentAuthIndex" size="small">{{
-                            l("当前", "Current")
-                        }}</ElTag>
+                        <ElTag
+                            v-if="
+                                schedulingMode === 'legacy' &&
+                                row.authIndex !== null &&
+                                row.authIndex === currentAuthIndex
+                            "
+                            size="small"
+                            >{{ l("当前", "Current") }}</ElTag
+                        >
                         <ElTag v-if="row.isDuplicate" size="small" type="warning">{{ l("重复", "Duplicate") }}</ElTag>
                         <ElTag v-if="row.disabled" size="small" type="danger">{{
                             l("人工禁用", "Manually disabled")
@@ -176,7 +182,7 @@
                         <ElButton size="small" @click="openEdit(row)">{{ l("编辑凭据", "Edit credentials") }}</ElButton>
                         <ElButton size="small" @click="login(row)">{{ l("重新登录", "Log in") }}</ElButton>
                         <ElButton
-                            v-if="row.authIndex !== null"
+                            v-if="schedulingMode === 'legacy' && row.authIndex !== null"
                             size="small"
                             :disabled="
                                 isBusy ||
@@ -365,6 +371,7 @@ defineProps({
     currentAuthIndex: { default: -1, type: Number },
     isBusy: { default: false, type: Boolean },
     legacyActions: { default: () => ({}), type: Object },
+    schedulingMode: { default: null, type: String },
 });
 const accountTable = ref(null);
 const l = (zh, en) => (I18n.getLang() === "zh" ? zh : en);
