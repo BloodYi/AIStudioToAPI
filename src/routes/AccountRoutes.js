@@ -38,7 +38,9 @@ class AccountRoutes {
                         (!filter ||
                             (filter === "duplicate"
                                 ? account.isDuplicate
-                                : account.sessionState === filter || account.recoveryState === filter))
+                                : filter === "not_logged_in"
+                                  ? account.sessionState === "missing" && !!account.email && account.hasPassword
+                                  : account.sessionState === filter || account.recoveryState === filter))
                 );
             const page = Math.max(1, Number(req.query.page) || 1),
                 size = Math.min(100, Math.max(1, Number(req.query.pageSize) || 25));

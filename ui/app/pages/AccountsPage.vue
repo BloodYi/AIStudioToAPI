@@ -72,6 +72,7 @@
                 <ElOption
                     v-for="value in [
                         'valid',
+                        'not_logged_in',
                         'credentials_missing',
                         'expired',
                         'queued',
@@ -372,6 +373,7 @@ const labels = {
     idle: ["空闲", "Idle"],
     manual_required: ["需人工处理", "Manual required"],
     missing: ["无会话", "Missing"],
+    not_logged_in: ["未登录", "Not logged in"],
     queued: ["排队", "Queued"],
     retry_wait: ["等待重试", "Retry wait"],
     running: ["登录中", "Running"],

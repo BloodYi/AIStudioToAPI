@@ -43,6 +43,7 @@ test(
             sessionState: "missing",
         });
         const accounts = [account("first@example.com"), account("manual@example.com", "manual_required")];
+        accounts[1].lastFailure = { error: "manual_challenge" };
         const queries = [];
         const proxyNodes = [
             { enabled: true, id: "login-node", name: "Login node", type: "socks5" },
@@ -69,10 +70,30 @@ test(
                 const search = url.searchParams.get("search") || "";
                 const state = url.searchParams.get("state") || "";
                 const matches = accounts.filter(
-                    row => row.email.includes(search) && (!state || row.recoveryState === state)
+                    row =>
+                        row.email.includes(search) &&
+                        (!state ||
+                            (state === "not_logged_in"
+                                ? row.sessionState === "missing" && row.hasPassword
+                                : row.recoveryState === state || row.sessionState === state))
                 );
                 result = { accounts: matches, total: matches.length };
                 if (search === "first") await new Promise(resolve => (releaseOld = resolve));
+            } else if (
+                url.pathname.startsWith("/api/account-management/accounts/") &&
+                url.pathname.endsWith("/login")
+            ) {
+                const id = decodeURIComponent(url.pathname.split("/").at(-2));
+                Object.assign(
+                    accounts.find(row => row.accountId === id),
+                    {
+                        authIndex: 0,
+                        lastFailure: null,
+                        recoveryState: "idle",
+                        sessionState: "valid",
+                    }
+                );
+                result = { taskId: "synthetic-login-task" };
             } else if (url.pathname === "/api/files") {
                 accounts.push(account("uploaded@example.com"));
                 result = { filename: "auth-2.json" };
@@ -133,6 +154,24 @@ test(
         await filter.locator(".el-select__clear").click();
         await waitRows(2);
         assert.equal(queries.at(-1).get("state"), "");
+
+        await filter.click();
+        const notLoggedIn = page.waitForResponse(
+            response => new URL(response.url()).searchParams.get("state") === "not_logged_in"
+        );
+        await page.getByRole("option", { exact: true, name: "Not logged in" }).click();
+        await notLoggedIn;
+        assert.equal(await rows.count(), 2);
+        const manual = rows.filter({ hasText: "manual@example.com" });
+        assert.match(await manual.innerText(), /manual_challenge/);
+        await manual.getByRole("button", { exact: true, name: "Log in" }).click();
+        await waitRows(1);
+        assert.match(await rows.innerText(), /first@example.com/);
+        await filter.hover();
+        await filter.locator(".el-select__clear").click();
+        await waitRows(2);
+        assert.ok(!(await manual.innerText()).includes("manual_challenge"));
+        assert.match(await manual.innerText(), /Valid/);
 
         // A slow search response must not overwrite the newer cleared query.
         const oldRequest = page.waitForRequest(

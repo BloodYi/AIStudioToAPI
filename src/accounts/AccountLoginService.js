@@ -66,6 +66,7 @@ class AccountLoginService {
             if (account && file?._accountSessionVersion === commit.sessionVersion) {
                 Object.assign(account, {
                     authIndex: commit.authIndex,
+                    lastFailure: commit.expired ? account.lastFailure : null,
                     lastSuccessAt: Date.now(),
                     recoveryState: "idle",
                     sessionState: commit.expired ? "expired" : "valid",
@@ -109,6 +110,9 @@ class AccountLoginService {
                 }
             }
         }
+        // Older versions kept failure summaries after a successful session commit.
+        for (const account of this.state.accounts)
+            if (account.sessionState === "valid" && account.recoveryState === "idle") account.lastFailure = null;
         await this.cleanup();
         await this.save();
         this.cleanupTimer = setInterval(
@@ -489,6 +493,7 @@ class AccountLoginService {
         Object.assign(account, {
             authIndex: index,
             currentTaskId: null,
+            lastFailure: preserveExpired ? account.lastFailure : null,
             lastSuccessAt: Date.now(),
             recoveryState: "idle",
             sessionState: preserveExpired ? "expired" : "valid",
@@ -671,6 +676,10 @@ class AccountLoginService {
             account.sessionState = "valid";
         }
         await this.atomicAuth(index, data);
+        if (restore) {
+            account.lastFailure = null;
+            account.lastSuccessAt = Date.now();
+        }
         this.system.authSource.reloadAuthSources(true);
         await this.save();
         return true;

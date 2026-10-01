@@ -768,3 +768,101 @@ test("bulk proxy application skips accounts without Cookie indices", async () =>
         { accountKey: "logged@example.com", waitForIdle: true },
     ]);
 });
+
+test("successful relogin clears the current challenge while preserving failed attempt history", async t => {
+    const { service } = await fixture(t);
+    const { account: created } = await service.create({ email: "retry@example.com", password: "synthetic" }, false);
+    const account = service.account(created.accountId);
+    const failed = service.enqueue(account, "manual");
+    Object.assign(failed, { attempts: 1, deadline: Date.now() + 180000, status: "running" });
+    await service.completeAttempt(
+        { config: service.state.config, startedAt: Date.now(), taskId: failed.taskId },
+        { error: "manual_challenge", retryable: false }
+    );
+    assert.equal(account.lastFailure.error, "manual_challenge");
+    assert.equal(account.recoveryState, "manual_required");
+    const login = await service.login(account.accountId);
+    await service.queue.tick();
+    await until(() => service.state.tasks.find(task => task.taskId === login.taskId).status === "succeeded");
+    assert.equal(account.sessionState, "valid");
+    assert.equal(account.recoveryState, "idle");
+    assert.equal(service.publicAccount(account).lastFailure, null);
+    assert.equal(failed.history[0].error, "manual_challenge");
+});
+
+test("Cookie upload and manual session restoration clear stale challenge summaries", async t => {
+    const { service } = await fixture(t, 1);
+    const account = service.state.accounts[0];
+    await service.edit(account.accountId, { credentialVersion: 1, password: "synthetic" });
+    account.lastFailure = { error: "manual_challenge" };
+    account.recoveryState = "manual_required";
+    await service.upload({ accountName: account.email, cookies: [], origins: [] });
+    assert.equal(account.lastFailure, null);
+    account.sessionState = "expired";
+    account.lastFailure = { error: "manual_challenge" };
+    account.recoveryState = "manual_required";
+    assert.equal(await service.refreshSession(account.authIndex, account.sessionVersion, null, true), true);
+    assert.equal(account.sessionState, "valid");
+    assert.equal(account.recoveryState, "idle");
+    assert.equal(account.lastFailure, null);
+});
+
+test("startup cleans legacy failure summaries only for valid idle sessions", async t => {
+    const { service, system, options, close } = await fixture(t, 2);
+    const [valid, failed] = service.state.accounts;
+    valid.recoveryState = "idle";
+    valid.lastFailure = { error: "manual_challenge" };
+    failed.recoveryState = "manual_required";
+    failed.lastFailure = { error: "wrong_password" };
+    await service.save();
+    await close();
+    const resumed = new Service(system, options);
+    try {
+        await resumed.initialize({ startQueue: false });
+        assert.equal(resumed.account(valid.accountId).lastFailure, null);
+        assert.equal(resumed.account(failed.accountId).lastFailure.error, "wrong_password");
+    } finally {
+        await resumed.close();
+    }
+});
+
+test("not-logged-in filter selects saved credentials without a session and supports search and pagination", async t => {
+    const { service, system } = await fixture(t, 2);
+    service.state.accounts[0].password = "synthetic";
+    Object.assign(service.state.accounts[1], { password: "synthetic", sessionState: "expired" });
+    const ready = (await service.create({ email: "ready@example.com", password: "synthetic" }, false)).account;
+    const totp = (await service.create({ email: "totp@example.com", password: "synthetic", totpSecret: secret }, false))
+        .account;
+    const manual = (await service.create({ email: "manual@example.com", password: "synthetic" }, false)).account;
+    service.account(manual.accountId).recoveryState = "manual_required";
+    const missingPassword = (await service.create({ email: "missing@example.com", password: "synthetic" }, false))
+        .account;
+    await service.edit(missingPassword.accountId, { clearPassword: true, credentialVersion: 1 });
+    service.state.accounts.push(service.newAccount({ password: "synthetic" }));
+    const handlers = new Map();
+    const app = { use() {} };
+    for (const method of ["get", "post", "patch", "delete"])
+        app[method] = (endpoint, ...middleware) => handlers.set(`${method} ${endpoint}`, middleware.at(-1));
+    system.accountLoginService = service;
+    new AccountRoutes(system).setupRoutes(app, () => {});
+    const list = async query => {
+        let result;
+        await handlers.get("get /api/account-management/accounts")(
+            { query: { state: "not_logged_in", ...query } },
+            { status: () => ({ json: value => (result = value) }) }
+        );
+        return result;
+    };
+    const all = await list({});
+    assert.equal(all.total, 3);
+    assert.deepEqual(
+        all.accounts.map(account => account.accountId),
+        [ready.accountId, totp.accountId, manual.accountId]
+    );
+    const searched = await list({ search: "totp" });
+    assert.equal(searched.total, 1);
+    assert.equal(searched.accounts[0].hasTotpSecret, true);
+    const paged = await list({ page: 2, pageSize: 1 });
+    assert.equal(paged.total, 3);
+    assert.equal(paged.accounts[0].accountId, totp.accountId);
+});
