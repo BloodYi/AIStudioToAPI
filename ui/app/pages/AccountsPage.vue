@@ -27,8 +27,8 @@
                 <ElTooltip
                     :content="
                         l(
-                            '控制会话过期后的自动恢复；手动登录不受影响，运行中的任务会继续完成。',
-                            'Controls automatic session recovery. Manual logins and running tasks continue.'
+                            '控制新增账号自动登录及会话过期后的自动恢复；关闭后可先保存账密和验证器，再手动批量登录。运行中的任务会继续完成。',
+                            'Controls new-account login and expired-session recovery. Turn off to save credentials and authenticators before manual batch login. Running tasks continue.'
                         )
                     "
                 >
@@ -67,20 +67,8 @@
                 v-model="search"
                 :placeholder="l('搜索邮箱 / 账号编号', 'Search email / account index')"
                 clearable
-                @input="
-                    page = 1;
-                    refresh();
-                "
             />
-            <ElSelect
-                v-model="filter"
-                clearable
-                :placeholder="l('全部状态', 'All states')"
-                @change="
-                    page = 1;
-                    refresh();
-                "
-            >
+            <ElSelect v-model="filter" clearable :placeholder="l('全部状态', 'All states')">
                 <ElOption
                     v-for="value in [
                         'valid',
@@ -361,7 +349,7 @@
     </section>
 </template>
 <script setup>
-import { ref, reactive, onMounted, onBeforeUnmount } from "vue";
+import { ref, reactive, watch, onMounted, onBeforeUnmount } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import I18n from "../utils/i18n";
@@ -452,7 +440,9 @@ async function refresh() {
     const sequence = ++refreshSequence;
     await action(async () => {
         const [list, status] = await Promise.all([
-            api(`/accounts?page=${page.value}&search=${encodeURIComponent(search.value)}&state=${filter.value}`),
+            api(
+                `/accounts?page=${page.value}&search=${encodeURIComponent(search.value || "")}&state=${encodeURIComponent(filter.value || "")}`
+            ),
             api("/login-queue"),
         ]);
         if (disposed || sequence !== refreshSequence) return;
@@ -464,6 +454,11 @@ async function refresh() {
         if (!polling) concurrency.value = status.concurrency;
     });
 }
+watch([search, filter], () => {
+    page.value = 1;
+    refresh();
+});
+defineExpose({ refresh });
 async function configure(values) {
     busy.value = true;
     await action(async () => {

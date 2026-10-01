@@ -1,0 +1,136 @@
+/* eslint-env browser */
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const { chromium } = require("playwright");
+const { createServer } = require("vite");
+
+test(
+    "account page refreshes after upload, clearing search/filter, and out-of-order responses",
+    { skip: !fs.existsSync(chromium.executablePath()) },
+    async t => {
+        const server = await createServer({
+            configFile: path.resolve(__dirname, "../vite.config.js"),
+            logLevel: "error",
+            server: { host: "127.0.0.1", port: 0, strictPort: false },
+        });
+        t.after(() => server.close());
+        await server.listen();
+        const browser = await chromium.launch({ args: ["--no-sandbox"] });
+        t.after(() => browser.close());
+        const page = await browser.newPage();
+        await page.addInitScript(() => {
+            window.__accountTestIntervals = [];
+            const schedule = window.setInterval;
+            window.setInterval = (...args) => {
+                const id = schedule(...args);
+                window.__accountTestIntervals.push(id);
+                return id;
+            };
+        });
+        const errors = [];
+        page.on("pageerror", error => errors.push(error.message));
+        const account = (email, recoveryState = "idle") => ({
+            accountId: email,
+            authIndex: null,
+            autoRecovery: true,
+            credentialVersion: 1,
+            email,
+            hasPassword: true,
+            hasTotpSecret: false,
+            recoveryState,
+            sessionState: "missing",
+        });
+        const accounts = [account("first@example.com"), account("manual@example.com", "manual_required")];
+        const queries = [];
+        let releaseOld;
+        await page.route("**/locales/*.json", route =>
+            route.fulfill({
+                body: fs.readFileSync(path.resolve(__dirname, "../ui/locales/en.json"), "utf8"),
+                contentType: "application/json",
+            })
+        );
+        await page.route("**/api/**", async route => {
+            const url = new URL(route.request().url());
+            let result = {};
+            if (url.pathname === "/api/status" || url.pathname === "/api/status/core") {
+                result = { status: { accountDetails: [], currentAuthIndex: -1, schedulingMode: "legacy" } };
+            } else if (url.pathname === "/api/account-management/login-queue") {
+                result = { attemptTimeout: 180000, autoRecovery: false, concurrency: 1 };
+            } else if (url.pathname === "/api/account-management/accounts") {
+                queries.push(url.searchParams);
+                const search = url.searchParams.get("search") || "";
+                const state = url.searchParams.get("state") || "";
+                const matches = accounts.filter(
+                    row => row.email.includes(search) && (!state || row.recoveryState === state)
+                );
+                result = { accounts: matches, total: matches.length };
+                if (search === "first") await new Promise(resolve => (releaseOld = resolve));
+            } else if (url.pathname === "/api/files") {
+                accounts.push(account("uploaded@example.com"));
+                result = { filename: "auth-2.json" };
+            }
+            await route.fulfill({ json: result });
+        });
+        await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/accounts`);
+        const rows = page.locator(".accounts-panel .el-table__body-wrapper tbody tr");
+        const waitRows = count =>
+            page.waitForFunction(
+                expected =>
+                    document.querySelectorAll(".accounts-panel .el-table__body-wrapper tbody tr").length === expected,
+                count
+            );
+        await waitRows(2);
+        const search = page.getByPlaceholder("Search email / account index");
+        await search.fill("manual");
+        await waitRows(1);
+        assert.match(await rows.innerText(), /manual@example.com/);
+        await search.fill("");
+        await waitRows(2);
+
+        await search.fill("manual");
+        await waitRows(1);
+        await search.hover();
+        await page.locator(".accounts-panel .el-input__clear").click();
+        await waitRows(2);
+
+        const filter = page.locator(".accounts-panel > .account-toolbar .el-select");
+        await filter.click();
+        await page.getByRole("option", { exact: true, name: "Manual required" }).click();
+        await waitRows(1);
+        await filter.hover();
+        await filter.locator(".el-select__clear").click();
+        await waitRows(2);
+        assert.equal(queries.at(-1).get("state"), "");
+
+        // A slow search response must not overwrite the newer cleared query.
+        const oldRequest = page.waitForRequest(
+            request => new URL(request.url()).searchParams.get("search") === "first"
+        );
+        await search.fill("first");
+        await oldRequest;
+        await search.fill("");
+        await waitRows(2);
+        const oldResponse = page.waitForResponse(
+            response => new URL(response.url()).searchParams.get("search") === "first"
+        );
+        releaseOld();
+        await oldResponse;
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        assert.equal(await rows.count(), 2);
+
+        // Disable the child's interval so the upload must trigger its own immediate refresh.
+        await page.evaluate(() => {
+            for (const id of window.__accountTestIntervals) clearInterval(id);
+        });
+        await page.locator('input[type="file"][accept=".json,.zip"]').setInputFiles({
+            buffer: Buffer.from(JSON.stringify({ accountName: "uploaded@example.com", cookies: [], origins: [] })),
+            mimeType: "application/json",
+            name: "auth.json",
+        });
+        await waitRows(3);
+        assert.ok((await rows.allTextContents()).some(text => text.includes("uploaded@example.com")));
+        assert.deepEqual(errors, []);
+    }
+);

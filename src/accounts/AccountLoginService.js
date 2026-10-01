@@ -255,7 +255,7 @@ class AccountLoginService {
             }
         }
     }
-    async create(input, login = true) {
+    async create(input, login = this.state.config.autoRecovery && input.autoRecovery !== false) {
         if (this.deduplicating) throw error("Account deduplication is in progress", 409);
         const totp = this.validateCredentials(input, true);
         if (this.state.accounts.some(account => account.email === emailKey(input.email)))
@@ -267,6 +267,7 @@ class AccountLoginService {
             displayName: emailKey(input.email),
             email: emailKey(input.email),
             password: input.password,
+            recoveryState: "idle",
             totp: totp || null,
         });
         this.state.accounts.push(account);
@@ -307,7 +308,11 @@ class AccountLoginService {
     enqueue(account, source) {
         if (this.deduplicating) throw error("Account deduplication is in progress", 409);
         const existing = this.state.tasks.find(task => task.accountId === account.accountId && active(task));
-        if (existing) return existing;
+        if (existing) {
+            // An explicit login must also release an automatic task held by the global switch.
+            if (source === "manual") existing.source = "manual";
+            return existing;
+        }
         if (!account.email || !account.password) {
             account.recoveryState = "credentials_missing";
             throw error("Login credentials missing");
@@ -727,13 +732,13 @@ class AccountLoginService {
         for (const choice of input.rows) {
             const row = preview.rows[choice.index];
             try {
-                if (!row || seen.has(choice.index) || row.error)
-                    throw error(row?.error || "Invalid or duplicate import choice");
+                if (!row || seen.has(choice.index)) throw error("Invalid or duplicate import choice");
                 seen.add(choice.index);
                 if (choice.skip || row.unchanged) {
                     result.skipped++;
                     continue;
                 }
+                if (row.error) throw error(row.error);
                 const accountId = choice.accountId || row.accountId;
                 if (!accountId) {
                     if (preview.kind !== "csv" || !choice.create || !row.email) {

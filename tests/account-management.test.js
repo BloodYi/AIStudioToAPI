@@ -538,3 +538,99 @@ test("global automatic login switch persists and holds recovery without blocking
     await until(() => resumed.state.tasks.find(task => task.taskId === automatic.taskId).status === "succeeded");
     await resumed.close();
 });
+
+test("disabled automatic login saves new credentials and authenticator before manual batch login", async t => {
+    const { service } = await fixture(t);
+    service.state.config.autoRecovery = false;
+    service.state.config.queueLimit = 1;
+    const created = await service.create({ email: "first@example.com", password: "synthetic" });
+    const second = await service.create({ email: "second@example.com", password: "synthetic" });
+    assert.equal(created.taskId, undefined);
+    assert.equal(created.account.recoveryState, "idle");
+    assert.equal(service.state.tasks.length, 0);
+    const preview = service.preview(
+        "session",
+        "authenticator",
+        `otpauth://totp/first@example.com?secret=${secret}\notpauth://totp/second@example.com?secret=${secret}`
+    );
+    const result = await service.importCommit("session", {
+        previewId: preview.previewId,
+        rows: preview.rows.map(row => ({ index: row.index })),
+    });
+    assert.equal(result.updated, 2);
+    await service.queue.tick();
+    assert.equal(service.state.tasks.length, 0);
+    service.state.config.queueLimit = 2;
+    for (const { account } of [created, second]) await service.login(account.accountId);
+    await service.queue.tick();
+    await until(() => service.state.tasks.every(task => task.status === "succeeded"));
+    assert.equal(service.state.tasks.length, 2);
+    assert.ok(service.state.tasks.every(task => task.source === "manual"));
+});
+
+test("global switch holds already queued new logins and manual login releases held automatic tasks", async t => {
+    const { service } = await fixture(t);
+    const created = await service.create({ email: "held@example.com", password: "synthetic" });
+    service.state.config.autoRecovery = false;
+    await service.queue.tick();
+    const task = service.state.tasks[0];
+    assert.equal(task.status, "queued");
+    assert.equal(task.attempts, 0);
+    assert.equal((await service.login(created.account.accountId)).taskId, task.taskId);
+    await service.queue.tick();
+    await until(() => task.status === "succeeded");
+
+    const account = service.account(created.account.accountId);
+    account.sessionState = "expired";
+    const recovery = service.enqueue(account, "expired");
+    await service.login(account.accountId);
+    await service.queue.tick();
+    await until(() => recovery.status === "succeeded");
+});
+
+test("authenticator imports match existing emails, skip unknown and duplicate entries, and require overwrite", async t => {
+    const { service } = await fixture(t);
+    const { account } = await service.create({ email: "known@example.com", password: "synthetic" }, false);
+    const uri = email => `otpauth://totp/${email}?secret=${secret}`;
+    const preview = service.preview(
+        "session",
+        "authenticator",
+        [uri("known@example.com"), uri("unknown@example.com"), uri("known@example.com")].join("\n")
+    );
+    assert.equal(preview.rows[0].accountId, account.accountId);
+    assert.equal(preview.rows[1].accountId, null);
+    assert.match(preview.rows[2].error, /Duplicate/);
+    const result = await service.importCommit("session", {
+        previewId: preview.previewId,
+        rows: [{ index: 0 }, { index: 1 }, { index: 2, skip: true }],
+    });
+    assert.deepEqual(result, { created: 0, errors: [], failed: 0, skipped: 2, updated: 1 });
+    assert.equal(service.state.accounts.length, 1);
+    const unchanged = service.preview("session", "authenticator", uri("known@example.com"));
+    assert.equal(unchanged.rows[0].unchanged, true);
+    assert.equal(
+        (await service.importCommit("session", { previewId: unchanged.previewId, rows: [{ index: 0 }] })).skipped,
+        1
+    );
+    const otherSecret = Totp.encode(Buffer.from("different-secret"));
+    const content = `otpauth://totp/known@example.com?secret=${otherSecret}`;
+    const conflict = service.preview("session", "authenticator", content);
+    assert.equal(conflict.rows[0].conflict, true);
+    assert.equal(
+        (await service.importCommit("session", { previewId: conflict.previewId, rows: [{ index: 0 }] })).failed,
+        1
+    );
+    assert.equal(service.credentials(account.accountId).totpSecret, secret);
+    const overwrite = service.preview("session", "authenticator", content);
+    assert.equal(
+        (
+            await service.importCommit("session", {
+                previewId: overwrite.previewId,
+                rows: [{ index: 0, overwrite: true }],
+            })
+        ).updated,
+        1
+    );
+    assert.equal(service.credentials(account.accountId).totpSecret, otherSecret);
+    assert.equal(service.state.tasks.length, 0);
+});

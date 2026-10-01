@@ -693,6 +693,7 @@
                 </header>
                 <p v-if="!schedulingMode" class="storage-retention-note">{{ t(modeNotice) }}</p>
                 <AccountsPage
+                    ref="accountsPage"
                     :scheduling-mode="schedulingMode"
                     :current-auth-index="state.currentAuthIndex"
                     :account-details="state.accountDetails"
@@ -2621,6 +2622,7 @@ const schedulerError = ref(false);
 const modeNotice = ref("loading");
 const router = useRouter();
 const fileInput = ref(null);
+const accountsPage = ref(null);
 const usageStatsImportInput = ref(null);
 const route = useRoute();
 const activeTab = ref(route.path === "/accounts" ? "accounts" : "home");
@@ -3867,6 +3869,7 @@ const deduplicateAuth = () => {
             } finally {
                 state.isSwitchingAccount = false;
                 notification.close();
+                await accountsPage.value?.refresh();
                 updateContent();
             }
         })
@@ -4535,6 +4538,7 @@ const handleFileUpload = async event => {
         // Always close notification and reset busy flag
         notification.close();
         state.isSwitchingAccount = false;
+        await accountsPage.value?.refresh();
     }
 };
 
