@@ -394,8 +394,7 @@ class AccountLoginService {
             }
     }
     resolveProxy(account) {
-        if (account.authIndex !== null)
-            return this.system.proxyPoolService?.bindings.resolve(account.authIndex)?.proxy || null;
+        if (this.system.proxyPoolService) return this.system.proxyPoolService.bindings.resolveAccount(account).proxy;
         const { parseProxyFromEnv } = require("../utils/ProxyUtils");
         return parseProxyFromEnv();
     }

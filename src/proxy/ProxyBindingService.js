@@ -14,8 +14,16 @@ class ProxyBindingService {
     }
 
     resolve(authIndex) {
+        return this.resolveKey(this.accountKey(authIndex), authIndex);
+    }
+
+    resolveAccount(account) {
+        if (account.authIndex !== null) return this.resolve(account.authIndex);
+        return this.resolveKey(account.email?.trim().toLowerCase() || account.accountId, null);
+    }
+
+    resolveKey(accountKey, authIndex) {
         const snapshot = this.store.snapshot();
-        const accountKey = this.accountKey(authIndex);
         const desiredNodeId = snapshot.bindings[accountKey]?.desiredNodeId || null;
         if (desiredNodeId) {
             const node = snapshot.nodes.find(entry => entry.id === desiredNodeId);
@@ -55,7 +63,7 @@ class ProxyBindingService {
                 source: "mihomo_pool",
             };
         }
-        const sticky = this.browserManager.stickyProxyManager.getProxyForAuth(authIndex);
+        const sticky = authIndex === null ? null : this.browserManager.stickyProxyManager.getProxyForAuth(authIndex);
         if (sticky) return { ...sticky, appliedNodeId: null, source: "sticky_proxy_file" };
         const environment = parseProxyFromEnv();
         if (environment)
@@ -70,8 +78,20 @@ class ProxyBindingService {
 
     list() {
         const snapshot = this.store.snapshot();
-        return this.authSource.availableIndices.map(authIndex => {
-            const accountKey = this.accountKey(authIndex);
+        const accounts = this.authSource.availableIndices.map(authIndex => ({
+            accountKey: this.accountKey(authIndex),
+            accountName: this.authSource.accountNameMap.get(authIndex) || `auth-${authIndex}`,
+            authIndex,
+        }));
+        for (const account of this.authSource.accountLoginService?.state?.accounts || []) {
+            if (account.authIndex !== null) continue;
+            accounts.push({
+                accountKey: account.email?.trim().toLowerCase() || account.accountId,
+                accountName: account.email || account.displayName || account.accountId,
+                authIndex: null,
+            });
+        }
+        return accounts.map(({ accountKey, accountName, authIndex }) => {
             const desiredNodeId = snapshot.bindings[accountKey]?.desiredNodeId || null;
             const data = this.browserManager.contexts.get(authIndex);
             const appliedNodeId = data?.proxyInfo?.appliedNodeId || null;
@@ -79,14 +99,14 @@ class ProxyBindingService {
             let error = this.browserManager.contextUnavailable.get(authIndex)?.error?.message || null;
             if (!source && !data) {
                 try {
-                    source = this.resolve(authIndex).source;
+                    source = this.resolveKey(accountKey, authIndex).source;
                 } catch (cause) {
                     const desired = snapshot.nodes.find(node => node.id === desiredNodeId);
                     source = desired?.type === "direct" ? "direct_node" : "mihomo_pool";
                     error ||= cause.message;
                 }
             }
-            const inflight = this.browserManager.scheduler?.account(authIndex).inflight || 0;
+            const inflight = authIndex === null ? 0 : this.browserManager.scheduler?.account(authIndex).inflight || 0;
             let state = desiredNodeId
                 ? data
                     ? desiredNodeId === appliedNodeId
@@ -101,11 +121,14 @@ class ProxyBindingService {
             if (error && desiredNodeId) state = "error";
             return {
                 accountKey,
-                accountName: this.authSource.accountNameMap.get(authIndex) || `auth-${authIndex}`,
+                accountName,
                 appliedNodeId,
                 authIndex,
                 contextState:
-                    data?.state || (this.browserManager.initializingContexts.has(authIndex) ? "INITIALIZING" : "COLD"),
+                    authIndex === null
+                        ? "NOT_LOGGED_IN"
+                        : data?.state ||
+                          (this.browserManager.initializingContexts.has(authIndex) ? "INITIALIZING" : "COLD"),
                 desiredNodeId,
                 error,
                 inflight,

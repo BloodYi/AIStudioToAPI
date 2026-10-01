@@ -7,7 +7,7 @@ const { chromium } = require("playwright");
 const { createServer } = require("vite");
 
 test(
-    "account page refreshes after upload, clearing search/filter, and out-of-order responses",
+    "account page refreshes after upload and filter changes; unlogged accounts support proxy binding",
     { skip: !fs.existsSync(chromium.executablePath()) },
     async t => {
         const server = await createServer({
@@ -44,6 +44,12 @@ test(
         });
         const accounts = [account("first@example.com"), account("manual@example.com", "manual_required")];
         const queries = [];
+        const proxyNodes = [
+            { enabled: true, id: "login-node", name: "Login node", type: "socks5" },
+            { enabled: true, id: "direct-node", name: "VPS Direct", type: "direct" },
+        ];
+        const proxyBindings = new Map();
+        const bindingWrites = [];
         let releaseOld;
         await page.route("**/locales/*.json", route =>
             route.fulfill({
@@ -70,6 +76,30 @@ test(
             } else if (url.pathname === "/api/files") {
                 accounts.push(account("uploaded@example.com"));
                 result = { filename: "auth-2.json" };
+            } else if (url.pathname === "/api/proxy-pool/nodes") {
+                result = { nodes: proxyNodes };
+            } else if (url.pathname === "/api/proxy-pool/status") {
+                result = { enabled: true, mihomo: { ready: true } };
+            } else if (url.pathname === "/api/proxy-pool/subscriptions") {
+                result = { subscriptions: [] };
+            } else if (url.pathname === "/api/proxy-pool/bindings") {
+                result = {
+                    bindings: accounts.map(row => ({
+                        accountKey: row.email,
+                        accountName: row.email,
+                        authIndex: null,
+                        desiredNodeId: proxyBindings.get(row.email) || null,
+                        inflight: 0,
+                        state: proxyBindings.has(row.email) ? "offline" : "unbound",
+                    })),
+                };
+            } else if (url.pathname.startsWith("/api/proxy-pool/bindings/")) {
+                const body = route.request().postDataJSON();
+                const entries = body.bindings || [
+                    { accountKey: decodeURIComponent(url.pathname.split("/").at(-1)), ...body },
+                ];
+                bindingWrites.push(...entries);
+                for (const entry of entries) proxyBindings.set(entry.accountKey, entry.desiredNodeId);
             }
             await route.fulfill({ json: result });
         });
@@ -131,6 +161,47 @@ test(
         });
         await waitRows(3);
         assert.ok((await rows.allTextContents()).some(text => text.includes("uploaded@example.com")));
+
+        await page.locator('button[title="节点池"]').click();
+        const proxySection = page
+            .locator(".pool-card")
+            .filter({ has: page.getByRole("heading", { name: "账号出口" }) });
+        const uploaded = proxySection.locator("tbody tr").filter({ hasText: "uploaded@example.com" });
+        await uploaded.waitFor();
+        assert.match(await uploaded.innerText(), /未登录/);
+        assert.equal(await uploaded.getByRole("button", { exact: true, name: "应用" }).isDisabled(), true);
+        await uploaded.locator(".el-select").click();
+        const saved = page.waitForResponse(
+            response => response.request().method() === "PUT" && response.url().includes("/api/proxy-pool/bindings/")
+        );
+        const bindingsRefreshed = page.waitForResponse(
+            response => response.request().method() === "GET" && response.url().endsWith("/api/proxy-pool/bindings")
+        );
+        await page.getByRole("option", { exact: true, name: "Login node" }).click();
+        await saved;
+        await bindingsRefreshed;
+        assert.deepEqual(bindingWrites.at(-1), { accountKey: "uploaded@example.com", desiredNodeId: "login-node" });
+        await page.waitForFunction(() => document.querySelector(".proxy-pool")?.textContent.includes("Login node"));
+
+        await uploaded.locator(".el-checkbox").click();
+        const first = proxySection.locator("tbody tr").filter({ hasText: "first@example.com" });
+        await first.locator(".el-checkbox").click();
+        const batchSelect = proxySection.locator(".actions .el-select").last();
+        await batchSelect.click();
+        const dropdownId = await batchSelect.getByRole("combobox").getAttribute("aria-controls");
+        await page.locator(`#${dropdownId}`).getByRole("option", { exact: true, name: "VPS Direct" }).click();
+        const batchSaved = page.waitForResponse(
+            response => response.request().method() === "POST" && response.url().endsWith("/bindings/batch")
+        );
+        await proxySection.getByRole("button", { name: "保存选中绑定" }).click();
+        await batchSaved;
+        assert.deepEqual(
+            bindingWrites.slice(-2).sort((a, b) => a.accountKey.localeCompare(b.accountKey)),
+            [
+                { accountKey: "first@example.com", desiredNodeId: "direct-node" },
+                { accountKey: "uploaded@example.com", desiredNodeId: "direct-node" },
+            ]
+        );
         assert.deepEqual(errors, []);
     }
 );

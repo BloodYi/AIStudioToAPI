@@ -146,9 +146,12 @@
                 </el-select>
                 <el-button :disabled="!selectedBindings.length" @click="saveBatchBinding">保存选中绑定</el-button>
             </div>
+            <p>未登录账号可先保存出口绑定，首次登录及后续请求会沿用该节点，无需点击「应用」。</p>
             <el-table :data="pagedBindings" empty-text="暂无账号" @selection-change="selectedBindings = $event">
                 <el-table-column type="selection" width="45" />
-                <el-table-column prop="authIndex" label="#" width="55" />
+                <el-table-column label="#" width="85"
+                    ><template #default="{ row }">{{ row.authIndex === null ? "未登录" : row.authIndex }}</template>
+                </el-table-column>
                 <el-table-column prop="accountName" label="账号" min-width="180" />
                 <el-table-column prop="proxySource" label="当前来源" width="145" />
                 <el-table-column label="期望节点" min-width="170"
@@ -172,7 +175,10 @@
                 <el-table-column prop="inflight" label="在途" width="70" />
                 <el-table-column label="操作" width="90"
                     ><template #default="{ row }"
-                        ><el-button link :disabled="row.state === 'applied'" @click="applyOne(row)"
+                        ><el-button
+                            link
+                            :disabled="row.authIndex === null || row.state === 'applied'"
+                            @click="applyOne(row)"
                             >应用</el-button
                         ></template
                     ></el-table-column

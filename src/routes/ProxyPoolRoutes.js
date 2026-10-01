@@ -112,7 +112,7 @@ class ProxyPoolRoutes {
             route(async (_req, res) => {
                 const tasks = this.service.bindings
                     .list()
-                    .filter(item => ["pending", "offline"].includes(item.state))
+                    .filter(item => item.authIndex !== null && ["pending", "offline"].includes(item.state))
                     .map(item => this.service.apply(item.accountKey, false));
                 res.status(202).json({ tasks });
             })
@@ -122,7 +122,7 @@ class ProxyPoolRoutes {
             route(async (_req, res) => {
                 const tasks = this.service.bindings
                     .list()
-                    .filter(item => ["pending", "offline"].includes(item.state))
+                    .filter(item => item.authIndex !== null && ["pending", "offline"].includes(item.state))
                     .map(item => this.service.apply(item.accountKey, true));
                 res.status(202).json({ tasks });
             })

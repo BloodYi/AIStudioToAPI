@@ -8,6 +8,10 @@ const Service = require("../src/accounts/AccountLoginService");
 const Totp = require("../src/accounts/TotpService");
 const { parseImport, Payload } = require("../src/accounts/AuthenticatorImportService");
 const AccountRoutes = require("../src/routes/AccountRoutes");
+const ProxyBindingService = require("../src/proxy/ProxyBindingService");
+const ProxyPoolService = require("../src/proxy/ProxyPoolService");
+const ProxyPoolStore = require("../src/proxy/ProxyPoolStore");
+const ProxyPoolRoutes = require("../src/routes/ProxyPoolRoutes");
 const { ModelScheduler } = require("../src/core/ModelScheduler");
 const schedulerConfig = require("../src/core/SchedulerConfig");
 const logger = { debug() {}, error() {}, info() {}, warn() {} };
@@ -633,4 +637,109 @@ test("authenticator imports match existing emails, skip unknown and duplicate en
     );
     assert.equal(service.credentials(account.accountId).totpSecret, otherSecret);
     assert.equal(service.state.tasks.length, 0);
+});
+
+test("unlogged accounts keep persisted proxy bindings across first login and service restart", async t => {
+    const { service, system, options, directory, close } = await fixture(t);
+    system.authSource.accountLoginService = service;
+    system.authSource.accountNameMap = new Map();
+    const browser = {
+        contexts: new Map(),
+        contextUnavailable: new Map(),
+        initializingContexts: new Set(),
+        stickyProxyManager: {
+            getProxyForAuth(index) {
+                assert.notEqual(index, null);
+                return null;
+            },
+        },
+    };
+    const storePath = path.join(directory, "proxy-pool.json");
+    let store = new ProxyPoolStore(logger, storePath);
+    const data = store.snapshot();
+    data.settings.enabled = true;
+    data.nodes.push({
+        enabled: true,
+        host: "127.0.0.1",
+        id: "node-login",
+        localPort: 10801,
+        name: "Login",
+        port: 1080,
+        type: "socks5",
+    });
+    await store.replace(data);
+    const manager = { status: { ready: true } };
+    let bindings = new ProxyBindingService(store, manager, browser, system.authSource);
+    const pool = Object.assign(Object.create(ProxyPoolService.prototype), { bindings, store });
+    system.proxyPoolService = pool;
+    const { account: created } = await service.create({ email: "Proxy@Example.com", password: "synthetic" }, false);
+    const account = service.account(created.accountId);
+    assert.equal(bindings.list()[0].authIndex, null);
+    assert.equal(bindings.list()[0].contextState, "NOT_LOGGED_IN");
+    await pool.setBinding("proxy@example.com", "node-login");
+    const before = service.resolveProxy(account);
+    assert.equal(before.server, "socks5://127.0.0.1:10801");
+    assert.throws(() => pool.apply(account.email), { status: 409 });
+    manager.status.ready = false;
+    assert.throws(() => service.resolveProxy(account), { code: "MIHOMO_NOT_READY" });
+    manager.status.ready = true;
+
+    // Both stores survive restart before the account has a Cookie index.
+    await close();
+    const resumed = new Service(system, options);
+    t.after(() => resumed.close());
+    system.authSource.accountLoginService = resumed;
+    await resumed.initialize({ startQueue: false });
+    store = new ProxyPoolStore(logger, storePath);
+    bindings = new ProxyBindingService(store, manager, browser, system.authSource);
+    Object.assign(pool, { bindings, store });
+    const restored = resumed.account(account.accountId);
+    assert.deepEqual(resumed.resolveProxy(restored), before);
+    await resumed.login(restored.accountId);
+    await resumed.queue.tick();
+    await until(() => resumed.state.tasks[0].status === "succeeded");
+    const auth = await resumed.readAuth(restored.authIndex);
+    system.authSource.availableIndices = [restored.authIndex];
+    system.authSource.accountNameMap.set(restored.authIndex, auth.accountName);
+    assert.deepEqual(resumed.resolveProxy(restored), before);
+    assert.deepEqual(bindings.resolve(restored.authIndex).proxy, before);
+    assert.equal(bindings.list().length, 1);
+    assert.equal(bindings.list()[0].accountKey, "proxy@example.com");
+    browser.contexts.set(restored.authIndex, { proxyInfo: bindings.resolve(restored.authIndex), state: "READY" });
+    assert.equal(bindings.list()[0].state, "applied");
+    await resumed.close();
+});
+
+test("bulk proxy application skips accounts without Cookie indices", async () => {
+    const handlers = new Map();
+    const applied = [];
+    const service = {
+        apply(accountKey, waitForIdle) {
+            applied.push({ accountKey, waitForIdle });
+            return { accountKey };
+        },
+        bindings: {
+            list: () => [
+                { accountKey: "unlogged@example.com", authIndex: null, state: "offline" },
+                { accountKey: "logged@example.com", authIndex: 0, state: "offline" },
+            ],
+        },
+    };
+    const app = { use() {} };
+    for (const method of ["get", "post", "put", "delete"])
+        app[method] = (endpoint, handler) => handlers.set(`${method} ${endpoint}`, handler);
+    new ProxyPoolRoutes({ proxyPoolService: service }).setupRoutes(app, () => {});
+    const res = {
+        json() {},
+        status(code) {
+            assert.equal(code, 202);
+            return this;
+        },
+    };
+    await handlers.get("post /api/proxy-pool/bindings/apply-idle")({}, res);
+    await handlers.get("post /api/proxy-pool/bindings/apply-pending")({}, res);
+    assert.deepEqual(applied, [
+        { accountKey: "logged@example.com", waitForIdle: false },
+        { accountKey: "logged@example.com", waitForIdle: true },
+    ]);
 });

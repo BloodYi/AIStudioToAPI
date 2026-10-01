@@ -407,6 +407,10 @@ class ProxyPoolService {
     apply(accountKey, waitForIdle = true) {
         const account = this.bindings.list().find(item => item.accountKey === String(accountKey).toLowerCase());
         if (!account) throw Object.assign(new Error("Account not found"), { status: 404 });
+        if (account.authIndex === null)
+            throw Object.assign(new Error("Account is not logged in; saved binding applies on its next login"), {
+                status: 409,
+            });
         const id = `task-${crypto.randomBytes(8).toString("hex")}`;
         const task = { accountKey: account.accountKey, createdAt: new Date().toISOString(), id, state: "queued" };
         this.tasks.set(id, task);
