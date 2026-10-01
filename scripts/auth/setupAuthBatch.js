@@ -194,30 +194,6 @@ const buildRuntimeOptions = cliOptions => {
     };
 };
 
-const parseCSVLine = line => {
-    const parts = [];
-    let current = "";
-    let inQuotes = false;
-    for (let i = 0; i < line.length; i++) {
-        const char = line[i];
-        if (char === '"') {
-            if (inQuotes && line[i + 1] === '"') {
-                current += '"';
-                i++;
-            } else {
-                inQuotes = !inQuotes;
-            }
-        } else if (char === "," && !inQuotes) {
-            parts.push(current.trim());
-            current = "";
-        } else {
-            current += char;
-        }
-    }
-    parts.push(current.trim());
-    return parts;
-};
-
 const getHeaderIndex = (header, patterns) =>
     header.findIndex(column => patterns.some(pattern => pattern.test(String(column || "").trim())));
 
@@ -271,10 +247,7 @@ const getAccountsFromCSV = csvPath => {
     }
 
     const content = fs.readFileSync(csvPath, "utf-8");
-    const rows = content
-        .split(/\r?\n/)
-        .filter(line => line.trim() !== "")
-        .map(line => parseCSVLine(line));
+    const rows = require("csv-parse/sync").parse(content, { bom: true, skip_empty_lines: true });
 
     if (rows.length === 0) {
         throw new Error(getText(`CSV 文件为空: ${csvPath}`, `CSV file is empty: ${csvPath}`));

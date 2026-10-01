@@ -154,7 +154,10 @@
             </ElTableColumn>
             <ElTableColumn :label="l('凭据', 'Credentials')" width="95">
                 <template #default="{ row }"
-                    >{{ row.hasPassword ? "✓" : "—" }} Password<br />{{ row.hasTotpSecret ? "✓" : "—" }} TOTP</template
+                    >{{ row.hasPassword ? "✓" : "—" }} Password<br />{{ row.hasTotpSecret ? "✓" : "—" }} TOTP<br />{{
+                        row.hasRecoveryEmail ? "✓" : "—"
+                    }}
+                    {{ l("恢复邮箱", "Recovery email") }}</template
                 >
             </ElTableColumn>
             <ElTableColumn :label="l('自动恢复', 'Auto recovery')" width="95">
@@ -232,6 +235,12 @@
                         autocomplete="new-password"
                         :placeholder="editing ? l('留空不修改', 'Leave empty to preserve') : ''"
                 /></ElFormItem>
+                <ElFormItem :label="l('恢复邮箱（可选）', 'Recovery email (optional)')"
+                    ><ElInput
+                        v-model="form.recoveryEmail"
+                        autocomplete="off"
+                        :placeholder="l('留空不修改', 'Empty preserves existing')"
+                /></ElFormItem>
                 <ElFormItem label="TOTP / otpauth://"
                     ><ElInput
                         v-model="form.totpSecret"
@@ -245,6 +254,9 @@
                 }}</ElButton>
                 <template v-if="editing"
                     ><ElCheckbox v-model="form.clearPassword">{{ l("清除密码", "Clear password") }}</ElCheckbox
+                    ><ElCheckbox v-model="form.clearRecoveryEmail">{{
+                        l("清除恢复邮箱", "Clear recovery email")
+                    }}</ElCheckbox
                     ><ElCheckbox v-model="form.clearTotpSecret">{{
                         l("清除验证器密钥", "Clear TOTP secret")
                     }}</ElCheckbox
@@ -259,9 +271,9 @@
         </ElDialog>
         <ElDialog v-model="importVisible" :title="l('导入预览', 'Import preview')" width="85%" @closed="clearImport">
             <ElSelect v-model="importKind"
-                ><ElOption label="CSV: email,password,totpSecret" value="csv" /><ElOption
-                    label="Authenticator / otpauth-migration / Base32"
-                    value="authenticator"
+                ><ElOption
+                    label="CSV: email,password,recovery_email,totp_secret (兼容 totpSecret)"
+                    value="csv" /><ElOption label="Authenticator / otpauth-migration / Base32" value="authenticator"
             /></ElSelect>
             <input type="file" accept=".csv,.txt" @change="readImportFile" />
             <ElInput
@@ -305,7 +317,15 @@
                     ><template #default="{ row }"
                         ><ElCheckbox v-model="choices[row.index].overwrite">{{ l("覆盖", "Overwrite") }}</ElCheckbox
                         ><ElCheckbox v-model="choices[row.index].skip">{{ l("跳过", "Skip") }}</ElCheckbox
-                        ><span v-if="row.conflict">⚠ {{ l("密钥冲突", "Secret conflict") }}</span></template
+                        ><span v-if="row.hasRecoveryEmail">{{ l("恢复邮箱已配置", "Recovery email configured") }} </span
+                        ><span v-if="row.conflict"
+                            >⚠
+                            {{
+                                row.recoveryEmailConflict
+                                    ? l("恢复邮箱冲突", "Recovery email conflict")
+                                    : l("凭据冲突", "Credential conflict")
+                            }}</span
+                        ></template
                     ></ElTableColumn
                 >
             </ElTable>
@@ -395,10 +415,12 @@ const editVisible = ref(false),
     busy = ref(false),
     form = reactive({
         clearPassword: false,
+        clearRecoveryEmail: false,
         clearTotpSecret: false,
         email: "",
         loginNow: false,
         password: "",
+        recoveryEmail: "",
         totpSecret: "",
     });
 const importVisible = ref(false),
@@ -472,10 +494,12 @@ async function configure(values) {
 function clearForm() {
     Object.assign(form, {
         clearPassword: false,
+        clearRecoveryEmail: false,
         clearTotpSecret: false,
         email: "",
         loginNow: false,
         password: "",
+        recoveryEmail: "",
         totpSecret: "",
     });
     editing.value = null;
@@ -495,6 +519,7 @@ async function reveal() {
     await action(async () => {
         const result = await api(`/accounts/${editing.value.accountId}/credentials`);
         form.password = result.password || "";
+        form.recoveryEmail = result.recoveryEmail || "";
         form.totpSecret = result.totpSecret || "";
         editing.value = { ...editing.value, credentialVersion: result.credentialVersion };
     });
@@ -504,15 +529,18 @@ async function save() {
     await action(async () => {
         const body = {
             email: form.email,
+            ...(form.recoveryEmail ? { recoveryEmail: form.recoveryEmail } : {}),
             ...(form.password ? { password: form.password } : {}),
             ...(form.totpSecret ? { totpSecret: form.totpSecret } : {}),
         };
         if (editing.value) {
             if (form.clearPassword) delete body.password;
+            if (form.clearRecoveryEmail) delete body.recoveryEmail;
             if (form.clearTotpSecret) delete body.totpSecret;
             await api(`/accounts/${editing.value.accountId}/credentials`, "PATCH", {
                 ...body,
                 clearPassword: form.clearPassword,
+                clearRecoveryEmail: form.clearRecoveryEmail,
                 clearTotpSecret: form.clearTotpSecret,
                 credentialVersion: editing.value.credentialVersion,
             });

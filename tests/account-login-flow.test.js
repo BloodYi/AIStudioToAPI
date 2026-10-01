@@ -112,12 +112,14 @@ async function simulate(options = {}) {
                             throw Object.assign(new Error("intercepts pointer events"), { name: "TimeoutError" });
                     } else await next();
                 },
+                count: async () => (visible(selector) ? 1 : 0),
                 fill: async value => {
                     if (selector.includes("totpPin")) pins.push({ time: clock, value });
                 },
                 filter: () => locator,
                 first: () => locator,
                 innerText: async () => text(),
+                isEditable: async () => true,
                 isVisible: async () => {
                     if (state === "alternative_loading") {
                         if (++alternativeChecks >= 4) state = "choose";
@@ -125,6 +127,7 @@ async function simulate(options = {}) {
                     }
                     return visible(selector);
                 },
+                nth: () => locator,
             };
             return locator;
         },

@@ -153,7 +153,7 @@ If you prefer to build the Docker image yourself, you can use the following comm
 
 #### 🔑 Step 2: Account Management
 
-The console now has a dedicated `/accounts` page for password/TOTP login, background session recovery, imports and failure diagnostics. See the [deployment and operations guide](docs/zh/account-auto-login-operations.md) (Chinese).
+The console now has a dedicated `/accounts` page for password/TOTP login, optional recovery email confirmation, background session recovery, imports and failure diagnostics. Recognized AI Studio first-run terms are accepted automatically; optional subscriptions and unknown permissions remain manual. CSV requires a header: legacy `email,password,totpSecret` and new `email,password,recovery_email,totp_secret` are supported. Empty optional columns preserve saved credentials; conflicting alias columns fail per row. Recovery email confirms an address only, without retrieving mail codes. Authenticator challenges support one field or six explicit digit fields. Failure control summaries contain only control categories and approved button labels. Consent and identity are checked again in the final session context after native connection validation. The observed optional API cost hint may be dismissed using its explicit close button, without opening spending-cap settings. See the [deployment and operations guide](docs/zh/account-auto-login-operations.md) (Chinese).
 
 After deployment, you need to add Google accounts using one of these methods:
 

@@ -1,9 +1,11 @@
 const { firefox } = require("playwright");
 const Totp = require("./TotpService");
+const LoginPageHandlers = require("./LoginPageHandlers");
 const LoginInteraction = require("./LoginInteraction");
 const TargetSessionValidator = require("./TargetSessionValidator");
 const { performance } = require("node:perf_hooks");
 /* eslint-env browser */
+const privateValues = new Set();
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const totpSelector =
     'input[name="totpPin"], input[id="totpPin"], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[type="tel"], input[type="text"], input[type="number"], input:not([type])';
@@ -14,6 +16,7 @@ let page,
     config,
     interaction,
     validator,
+    handlers,
     attemptDeadline,
     stopped = false,
     diagnosing = false;
@@ -36,7 +39,11 @@ async function screenshot() {
     }
     try {
         const buffer = await page.screenshot({
-            mask: [page.locator('input, textarea, [contenteditable="true"]')],
+            mask: [
+                page.locator('input, textarea, [contenteditable="true"]'),
+                page.getByText(/[^\s@]+@[^\s@]+\.[^\s@]+/),
+                ...[...privateValues].map(value => page.getByText(value, { exact: false })),
+            ],
             maskColor: "#333333",
             timeout: config.screenshotTimeout,
         });
@@ -63,7 +70,7 @@ async function waitForPage(predicate) {
     const deadline = Math.min(attemptDeadline, performance.now() + config.stepTimeout);
     while (performance.now() < deadline) {
         guard();
-        if (await predicate()) return;
+        if (await predicate(deadline)) return;
         await wait(250);
     }
     fail("page_transition_timeout", true);
@@ -92,17 +99,76 @@ async function nextButton() {
     const button = page.getByRole("button", { name: /^(Next|下一步|继续|Continue|Verify|验证)$/i }).first();
     await interaction.click(button);
 }
+async function validateStudio(credentials) {
+    if (!page.url().includes("/prompts/new_chat"))
+        await page.goto("https://aistudio.google.com/u/0/prompts/new_chat", { waitUntil: "domcontentloaded" });
+    let readySince = null;
+    await waitForPage(async stepDeadline => {
+        const body = await page.locator("body").innerText();
+        if (
+            !/Failed to initialize applet|Available regions|not available in your country|地区.*不支持|Allow Drive access/i.test(
+                body
+            )
+        ) {
+            const accepted = await handlers.terms(stepDeadline);
+            const knownHint = await handlers.transition(stepDeadline);
+            if (accepted) readySince = null;
+            if (!accepted && !knownHint && (await visible('[role="dialog"], dialog, mat-dialog-container')))
+                fail("manual_challenge");
+        }
+        const ready =
+            /Failed to initialize applet|Available regions|not available in your country|地区.*不支持|Allow Drive access/i.test(
+                await page.locator("body").innerText()
+            ) || (await visible('textarea, [contenteditable="true"][role="textbox"]'));
+        if (!ready) {
+            readySince = null;
+            return false;
+        }
+        // App controls can render before the first-run modal. Require a settled
+        // interval and recheck in the context that will actually be committed.
+        readySince ??= performance.now();
+        return performance.now() - readySince >= 1500;
+    });
+    const validation = await page.evaluate(() => {
+        const body = document.body.innerText;
+        const accountLabel = [...document.querySelectorAll("[aria-label]")]
+            .map(node => node.getAttribute("aria-label"))
+            .find(label => /Google Account:|Google 账号：|Google 帐号：/i.test(label));
+        const email =
+            accountLabel?.match(/[^\s()<>]+@[^\s()<>]+\.[^\s()<>]+/)?.[0] ||
+            globalThis.WIZ_global_data?.oPEP7c ||
+            [...document.scripts]
+                .filter(script => script.textContent.includes("WIZ_global_data"))
+                .map(script => script.textContent.match(/["']oPEP7c["']\s*:\s*"([^"\\]+)"/)?.[1])
+                .find(Boolean);
+        return {
+            email: typeof email === "string" ? email.trim().toLowerCase() : null,
+            initializationFailed: /Failed to initialize applet|snapshot.*failed|concurrent updates/i.test(body),
+            permissionRequired: /Allow Drive access/i.test(body),
+            unavailable: /Available regions|not available in your country|地区.*不支持/i.test(body),
+        };
+    });
+    if (validation.unavailable) fail("service_region_restricted");
+    if (validation.permissionRequired) fail("service_permission_required");
+    if (validation.initializationFailed) fail("service_initialization_failed", true);
+    if (validation.email !== credentials.email)
+        fail(validation.email ? "account_mismatch" : "account_identity_unverified");
+    return validation;
+}
 async function run(input) {
     token = input.token;
     config = input.config;
     const deadline = performance.now() + config.attemptTimeout;
     attemptDeadline = deadline;
-    interaction = new LoginInteraction({ config, guard });
+    interaction = new LoginInteraction({ config, deadline, guard });
     const phase = name => {
         guard();
         send({ phase: name });
     };
+    handlers = new LoginPageHandlers({ deadline, guard, interaction, page, phase, stepTimeout: config.stepTimeout });
     const credentials = input.credentials;
+    for (const value of [credentials.email, credentials.password, credentials.recoveryEmail, credentials.totp?.secret])
+        if (value) privateValues.add(value);
     if (!input.targetUrl) fail("service_target_missing");
     phase("browser_launch");
     browser = await firefox.launch({
@@ -125,6 +191,7 @@ async function run(input) {
     context.setDefaultTimeout(config.stepTimeout);
     context.setDefaultNavigationTimeout(config.stepTimeout);
     page = await context.newPage();
+    handlers.page = page;
     phase("email");
     await page.goto(
         "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Faistudio.google.com%2Fu%2F0%2Fprompts%2Fnew_chat",
@@ -134,8 +201,11 @@ async function run(input) {
     let emailSubmitted = false,
         passwordSubmitted = false,
         alternativeAttempted = false,
+        authenticatorSelected = false,
         totpSubmissions = 0,
-        lastTotpWindow = -1;
+        lastTotpWindow = -1,
+        recoverySubmitted = false,
+        recoverySelected = false;
     let transitionUntil = performance.now() + config.stepTimeout;
     while (performance.now() < deadline) {
         guard();
@@ -150,8 +220,9 @@ async function run(input) {
             fail("login_rejected");
         if (/change your password|更改密码|修改密码/i.test(text)) fail("password_change_required");
         const codeReady = await totpReady();
-        if (credentials.totp && !codeReady && (await visible('[data-challengetype="6"]'))) {
+        if (credentials.totp && !authenticatorSelected && !codeReady && (await visible('[data-challengetype="6"]'))) {
             phase("choose_authenticator");
+            authenticatorSelected = true;
             await clickForState(page.locator('[data-challengetype="6"]').filter({ visible: true }).first(), totpReady);
             transitionUntil = performance.now() + config.stepTimeout;
             continue;
@@ -174,10 +245,46 @@ async function run(input) {
                 continue;
             }
         }
+        const recoveryInput = page
+            .locator('input[name="knowledgePreregisteredEmailResponse"]')
+            .filter({ visible: true })
+            .first();
+        if (await recoveryInput.isVisible()) {
+            phase("recovery_email");
+            if (!credentials.recoveryEmail) fail("recovery_email_missing");
+            if (recoverySubmitted) {
+                if (/incorrect|doesn.t match|wrong|不正确|不匹配|错误/i.test(text)) fail("recovery_email_rejected");
+                if (performance.now() > transitionUntil) fail("manual_challenge");
+                await wait(250);
+                continue;
+            }
+            await interaction.type(recoveryInput, credentials.recoveryEmail);
+            await nextButton();
+            recoverySubmitted = true;
+            transitionUntil = performance.now() + config.stepTimeout;
+            continue;
+        }
         if (
-            (await visible(
-                'input[type="tel"][name="phoneNumber"], input[name="knowledgePreregisteredEmailResponse"], input[name="ca"], input[name="captcha"]'
-            )) ||
+            !codeReady &&
+            !recoverySelected &&
+            credentials.recoveryEmail &&
+            (!credentials.totp || alternativeAttempted)
+        ) {
+            const choice = page
+                .locator('[data-challengetype="12"]')
+                .filter({ visible: true })
+                .filter({ hasText: /recovery email|辅助邮箱|恢复邮箱|備援電子郵件/i })
+                .first();
+            if (await choice.isVisible()) {
+                phase("recovery_email");
+                recoverySelected = true;
+                await clickForState(choice, () => recoveryInput.isVisible());
+                transitionUntil = performance.now() + config.stepTimeout;
+                continue;
+            }
+        }
+        if (
+            (await visible('input[type="tel"][name="phoneNumber"], input[name="ca"], input[name="captcha"]')) ||
             /g\.co\/sc|check your phone|tap yes|确认.*设备|查看.*手机|enter.*recovery email|输入.*辅助邮箱|verify.*phone number|验证.*手机号/i.test(
                 text
             )
@@ -217,15 +324,27 @@ async function run(input) {
                 continue;
             }
             if (totpSubmissions >= 2) fail("totp_rejected");
-            await interaction.type(page.locator(totpSelector).filter({ visible: true }).first(), async () => {
+            const inputs = await handlers.totpInputs(totpSelector);
+            let code;
+            const generate = async () => {
                 const period = credentials.totp.period * 1000;
-                if (Math.floor(Date.now() / period) === lastTotpWindow || period - (Date.now() % period) < 5000)
+                if (
+                    Math.floor(Date.now() / period) === lastTotpWindow ||
+                    period - (Date.now() % period) < (inputs.length === 6 ? 10000 : 5000)
+                )
                     await wait(period - (Date.now() % period) + 100);
                 guard();
                 lastTotpWindow = Math.floor(Date.now() / period);
-                return Totp.code(credentials.totp);
-            });
-            await nextButton();
+                code = Totp.code(credentials.totp);
+                privateValues.add(code);
+                return inputs.length === 1 ? code : code[0];
+            };
+            await interaction.type(inputs[0], generate);
+            for (let index = 1; index < inputs.length; index++) await interaction.type(inputs[index], code[index]);
+            // Last digit may submit automatically; let navigation settle before checking.
+            await wait(250);
+            guard();
+            if (new URL(page.url()).hostname === "accounts.google.com" && (await totpReady())) await nextButton();
             totpSubmissions++;
             transitionUntil = performance.now() + config.stepTimeout;
         } else if (/choose how.*sign in|选择.*验证|2-step verification|两步验证/i.test(text) && !credentials.totp)
@@ -242,38 +361,7 @@ async function run(input) {
     guard();
     phase("aistudio_validation");
     if (new URL(page.url()).hostname !== "aistudio.google.com") fail("attempt_timeout", true);
-    if (!page.url().includes("/prompts/new_chat"))
-        await page.goto("https://aistudio.google.com/u/0/prompts/new_chat", { waitUntil: "domcontentloaded" });
-    await waitForPage(
-        async () =>
-            /Failed to initialize applet|Available regions|not available in your country|地区.*不支持|Allow Drive access/i.test(
-                await page.locator("body").innerText()
-            ) || (await visible('textarea, [contenteditable="true"][role="textbox"]'))
-    );
-    const validation = await page.evaluate(() => {
-        const body = document.body.innerText;
-        const accountLabel = [...document.querySelectorAll("[aria-label]")]
-            .map(node => node.getAttribute("aria-label"))
-            .find(label => /Google Account:|Google 账号：|Google 帐号：/i.test(label));
-        const email =
-            accountLabel?.match(/[^\s()<>]+@[^\s()<>]+\.[^\s()<>]+/)?.[0] ||
-            globalThis.WIZ_global_data?.oPEP7c ||
-            [...document.scripts]
-                .filter(script => script.textContent.includes("WIZ_global_data"))
-                .map(script => script.textContent.match(/["']oPEP7c["']\s*:\s*"([^"\\]+)"/)?.[1])
-                .find(Boolean);
-        return {
-            email: typeof email === "string" ? email.trim().toLowerCase() : null,
-            initializationFailed: /Failed to initialize applet|snapshot.*failed|concurrent updates/i.test(body),
-            permissionRequired: /Allow Drive access/i.test(body),
-            unavailable: /Available regions|not available in your country|地区.*不支持/i.test(body),
-        };
-    });
-    if (validation.unavailable) fail("service_region_restricted");
-    if (validation.permissionRequired) fail("service_permission_required");
-    if (validation.initializationFailed) fail("service_initialization_failed", true);
-    if (validation.email !== credentials.email)
-        fail(validation.email ? "account_mismatch" : "account_identity_unverified");
+    const validation = await validateStudio(credentials);
     // Reuse the request browser's initialization in this disposable executor.
     // No API pool contexts, registry or fixed-port listener are shared.
     if (input.targetUrl) {
@@ -299,12 +387,17 @@ async function run(input) {
         context = result.context;
         page = result.page;
         send({ validationSignal: "native_connection_verified" });
+        phase("aistudio_revalidation");
+        page = await context.newPage();
+        handlers.page = page;
+        await page.goto("https://aistudio.google.com/u/0/prompts/new_chat", { waitUntil: "domcontentloaded" });
+        await validateStudio(credentials);
     }
     guard();
     phase("storage_state");
     const storageState = await context.storageState();
     guard();
-    send({ result: { email: validation.email, storageState, targetInitialized: !!validator } });
+    send({ result: { email: validation.email, storageState, targetInitialized: !!validator, termsVerified: true } });
     await close();
 }
 process.on("disconnect", () => {
@@ -350,7 +443,10 @@ process.on("message", input => {
                             .map(async frame => {
                                 let protocol = "unknown";
                                 try {
-                                    protocol = new URL(frame.url()).protocol;
+                                    const scheme = new URL(frame.url()).protocol;
+                                    protocol = ["https:", "http:", "about:", "blob:", "data:"].includes(scheme)
+                                        ? scheme
+                                        : "unknown";
                                 } catch {
                                     /* No URL disclosure. */
                                 }
@@ -376,18 +472,7 @@ process.on("message", input => {
             }
             try {
                 controls = await Promise.race([
-                    page.evaluate(() =>
-                        [...document.querySelectorAll("input")]
-                            .filter(element => element.getClientRects().length > 0)
-                            .slice(0, 10)
-                            .map(element => ({
-                                autocomplete: element.autocomplete,
-                                id: /^[\w-]{0,64}$/.test(element.id) ? element.id : "redacted",
-                                inputMode: element.inputMode,
-                                name: /^[\w-]{0,64}$/.test(element.name) ? element.name : "redacted",
-                                type: element.type,
-                            }))
-                    ),
+                    ((handlers.page = page), handlers.structure()),
                     wait(1000).then(() => []),
                 ]);
             } catch {
@@ -401,6 +486,7 @@ process.on("message", input => {
                 frameKinds,
                 retryable:
                     cause.retryable ?? ["network_timeout", "ui_operation_timeout", "browser_failure"].includes(reason),
+                termsOutcome: handlers?.termsOutcome,
             },
         });
         await close();

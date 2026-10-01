@@ -20,20 +20,38 @@ function parseImport(kind, content) {
     let rows = [];
     const batches = new Map();
     if (kind === "csv") {
-        rows = parse(content, { bom: true, columns: true, max_record_size: 1048576, skip_empty_lines: true }).map(
-            row => {
-                try {
-                    if (!emailKey(row.email) || !row.password) throw new Error("Invalid email or empty password");
-                    return {
-                        email: emailKey(row.email),
-                        password: row.password,
-                        ...(row.totpSecret ? { totp: Totp.normalize(row.totpSecret) } : {}),
-                    };
-                } catch {
-                    return { email: emailKey(row.email), error: "Invalid email, empty password or unsupported OTP" };
-                }
+        const records = parse(content, { bom: true, max_record_size: 1048576, skip_empty_lines: true });
+        const header = (records.shift() || []).map(value => value.trim());
+        if (!header.includes("email") || !header.includes("password"))
+            throw new Error("CSV requires an email,password header; add a header before importing");
+        rows = records.map(values => {
+            const row = Object.fromEntries(header.map((key, index) => [key, values[index] || ""]));
+            try {
+                const alias = names => {
+                    const present = names.filter(name => header.includes(name)).map(name => row[name].trim());
+                    if (new Set(present).size > 1) throw new Error("Conflicting alias columns");
+                    return present[0] || "";
+                };
+                if (!emailKey(row.email) || !row.password) throw new Error("Invalid email or empty password");
+                const secret = alias(["totpSecret", "totp_secret"]);
+                const recovery = alias(["recoveryEmail", "recovery_email"]);
+                if (recovery && !emailKey(recovery)) throw new Error("Invalid recovery email");
+                return {
+                    email: emailKey(row.email),
+                    password: row.password,
+                    ...(secret ? { totp: Totp.normalize(secret) } : {}),
+                    ...(recovery ? { recoveryEmail: emailKey(recovery) } : {}),
+                };
+            } catch (cause) {
+                return {
+                    email: emailKey(row.email),
+                    error:
+                        cause.message === "Conflicting alias columns"
+                            ? cause.message
+                            : "Invalid email, password, recovery email or OTP",
+                };
             }
-        );
+        });
     } else if (kind === "authenticator") {
         for (const line of content.split(/\r?\n/).filter(line => line.trim())) {
             try {

@@ -32,17 +32,23 @@ async function main() {
         artifactDir: path.join(directory, "artifacts"),
         authDir: path.join(directory, "auth"),
         storePath: path.join(directory, "accounts.sqlite"),
+        ...(process.env.ACCOUNT_TEST_WORKER_PATH ? { workerPath: process.env.ACCOUNT_TEST_WORKER_PATH } : {}),
     });
-    let targetInitialized = false;
+    let targetInitialized = false,
+        termsVerified = false,
+        identityMatched = false;
     const completeAttempt = service.completeAttempt.bind(service);
     service.completeAttempt = async (slot, result) => {
         targetInitialized = result.targetInitialized === true && !result.error;
+        termsVerified = result.termsVerified === true && !result.error;
+        identityMatched = result.email === service.state.accounts[0]?.email && !result.error;
         return completeAttempt(slot, result);
     };
     try {
         await service.initialize({ startQueue: false });
         const created = await service.create(credentials);
         delete credentials.password;
+        delete credentials.recoveryEmail;
         delete credentials.totpSecret;
         const task = service.state.tasks.find(entry => entry.taskId === created.taskId);
         await service.queue.start();
@@ -66,14 +72,25 @@ async function main() {
         console.log(
             JSON.stringify({
                 attempts: task.attempts,
+                credentialFreeAuth:
+                    !!committed &&
+                    !["password", "totp", "totpSecret", "recoveryEmail", "recovery_email"].some(
+                        key => key in committed
+                    ),
                 error: task.error || null,
                 history: task.history,
+                identityMatched,
+                sessionBindingCount: service.state.accounts.filter(entry => entry.authIndex !== null).length,
                 sessionCommitted,
                 status: task.status,
                 targetInitialized,
+                termsVerified,
             })
         );
-        process.exitCode = task.status === "succeeded" && sessionCommitted && targetInitialized ? 0 : 1;
+        process.exitCode =
+            task.status === "succeeded" && sessionCommitted && targetInitialized && identityMatched && termsVerified
+                ? 0
+                : 1;
         if (process.env.ACCOUNT_TEST_KEEP_ARTIFACTS === "true")
             console.log(`Private diagnostic directory: ${directory}`);
     } finally {

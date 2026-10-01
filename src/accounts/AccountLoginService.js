@@ -56,6 +56,7 @@ class AccountLoginService {
             concurrency: this.state.config.concurrency,
             paused: this.state.config.paused,
         };
+        for (const account of this.state.accounts) account.recoveryEmail ??= null;
         await this.artifacts.initialize();
         await fs.mkdir(this.authDir, { mode: 0o700, recursive: true });
         for (const task of this.state.tasks) await this.queue.recover(task);
@@ -170,6 +171,7 @@ class AccountLoginService {
             lastFailure: null,
             lastSuccessAt: null,
             password: null,
+            recoveryEmail: null,
             recoveryState: "credentials_missing",
             sessionState: "missing",
             sessionVersion: 0,
@@ -183,7 +185,7 @@ class AccountLoginService {
         return account;
     }
     publicAccount(account) {
-        const { password, totp, ...metadata } = account;
+        const { password, totp, recoveryEmail, ...metadata } = account;
         const task = this.state.tasks.find(item => item.taskId === account.currentTaskId);
         return {
             ...metadata,
@@ -191,6 +193,7 @@ class AccountLoginService {
                 account.authIndex !== null &&
                 this.system.scheduler?.isAccountManuallyDisabled(account.authIndex) === true,
             hasPassword: !!password,
+            hasRecoveryEmail: !!recoveryEmail,
             hasTotpSecret: !!totp,
             isDuplicate:
                 account.authIndex !== null &&
@@ -228,6 +231,7 @@ class AccountLoginService {
             credentialVersion: account.credentialVersion,
             email: account.email,
             password: account.password,
+            recoveryEmail: account.recoveryEmail,
             totpSecret: account.totp?.secret || null,
         };
     }
@@ -249,6 +253,8 @@ class AccountLoginService {
             (typeof input.password !== "string" || !input.password || input.password.length > 4096)
         )
             throw error("Password must be nonempty; use clearPassword to remove it");
+        if (input.recoveryEmail !== undefined && !emailKey(input.recoveryEmail))
+            throw error("Invalid recovery email; use clearRecoveryEmail to remove it");
         if (input.totpSecret !== undefined && !input.totpSecret)
             throw error("Use clearTotpSecret to remove the authenticator");
         if (input.totpSecret !== undefined) {
@@ -271,6 +277,7 @@ class AccountLoginService {
             displayName: emailKey(input.email),
             email: emailKey(input.email),
             password: input.password,
+            recoveryEmail: emailKey(input.recoveryEmail),
             recoveryState: "idle",
             totp: totp || null,
         });
@@ -292,9 +299,15 @@ class AccountLoginService {
             throw error("Email conflict", 409);
         if (input.autoRecovery !== undefined && typeof input.autoRecovery !== "boolean")
             throw error("autoRecovery must be boolean");
-        const changes = ["email", "password", "totpSecret", "clearPassword", "clearTotpSecret"].some(
-            key => input[key] !== undefined
-        );
+        const changes = [
+            "email",
+            "password",
+            "totpSecret",
+            "recoveryEmail",
+            "clearRecoveryEmail",
+            "clearPassword",
+            "clearTotpSecret",
+        ].some(key => input[key] !== undefined);
         if (changes) {
             this.invalidate(account);
             account.credentialVersion++;
@@ -302,6 +315,8 @@ class AccountLoginService {
         if (input.email !== undefined) account.email = emailKey(input.email);
         if (input.password !== undefined) account.password = input.password;
         if (totp) account.totp = totp;
+        if (input.recoveryEmail !== undefined) account.recoveryEmail = emailKey(input.recoveryEmail);
+        if (input.clearRecoveryEmail === true) account.recoveryEmail = null;
         if (input.clearPassword === true) account.password = null;
         if (input.clearTotpSecret === true) account.totp = null;
         if (input.autoRecovery !== undefined) account.autoRecovery = input.autoRecovery;
@@ -488,6 +503,8 @@ class AccountLoginService {
         delete merged.password;
         delete merged.totpSecret;
         delete merged.totp;
+        delete merged.recoveryEmail;
+        delete merged.recovery_email;
         await this.atomicAuth(index, merged, validate);
         this.system.authSource.reloadAuthSources(true);
         Object.assign(account, {
@@ -542,6 +559,7 @@ class AccountLoginService {
             phase: task.phase,
             screenshotReason,
             startedAt: slot.startedAt,
+            termsOutcome: result.termsOutcome,
         });
         if (result.storageState && !result.error && result.email === account.email && task.deadline > Date.now()) {
             try {
@@ -617,7 +635,8 @@ class AccountLoginService {
             const keep = candidates.find(account => account.authIndex === group.keptIndex);
             const conflict =
                 new Set(candidates.map(account => account.password).filter(Boolean)).size > 1 ||
-                new Set(candidates.map(account => account.totp?.secret).filter(Boolean)).size > 1;
+                new Set(candidates.map(account => account.totp?.secret).filter(Boolean)).size > 1 ||
+                new Set(candidates.map(account => account.recoveryEmail).filter(Boolean)).size > 1;
             const choice = choices[group.email];
             let source = null;
             if (conflict) {
@@ -640,6 +659,9 @@ class AccountLoginService {
             if (!keep) continue;
             for (const account of candidates) this.invalidate(account);
             keep.password = conflict ? source.password : candidates.find(account => account.password)?.password || null;
+            keep.recoveryEmail = conflict
+                ? source.recoveryEmail
+                : candidates.find(account => account.recoveryEmail)?.recoveryEmail || null;
             keep.totp = conflict ? source.totp : candidates.find(account => account.totp)?.totp || null;
             keep.credentialVersion++;
         }
@@ -691,7 +713,11 @@ class AccountLoginService {
         try {
             parsed = parseImport(kind, content);
         } catch {
-            throw error("Invalid import format or size");
+            throw error(
+                kind === "csv"
+                    ? "Invalid CSV: provide an email,password header and valid quoted fields (maximum 1 MiB)"
+                    : "Invalid import format or size"
+            );
         }
         const rows = parsed.rows.map((row, index) => {
             const matches = this.state.accounts.filter(account => account.email && account.email === row.email);
@@ -699,11 +725,28 @@ class AccountLoginService {
             return {
                 ...row,
                 accountId: account?.accountId || null,
-                conflict: !!(account && row.totp && account.totp && row.totp.secret !== account.totp.secret),
+                conflict: !!(
+                    account &&
+                    ((row.totp && account.totp && row.totp.secret !== account.totp.secret) ||
+                        (row.recoveryEmail && account.recoveryEmail && row.recoveryEmail !== account.recoveryEmail) ||
+                        (row.password && account.password && row.password !== account.password))
+                ),
                 credentialVersion: account?.credentialVersion,
                 index,
                 matches: matches.length,
-                unchanged: !!(account && row.totp && account.totp?.secret === row.totp.secret && !row.password),
+                recoveryEmailConflict: !!(
+                    account &&
+                    row.recoveryEmail &&
+                    account.recoveryEmail &&
+                    row.recoveryEmail !== account.recoveryEmail
+                ),
+                unchanged: !!(
+                    account &&
+                    row.totp &&
+                    account.totp?.secret === row.totp.secret &&
+                    !row.password &&
+                    !row.recoveryEmail
+                ),
             };
         });
         const id = randomUUID();
@@ -721,9 +764,10 @@ class AccountLoginService {
             batches: parsed.batches,
             complete: parsed.complete,
             previewId: id,
-            rows: rows.map(({ password, totp, ...row }) => ({
+            rows: rows.map(({ password, totp, recoveryEmail, ...row }) => ({
                 ...row,
                 hasPassword: !!password,
+                hasRecoveryEmail: !!recoveryEmail,
                 hasTotpSecret: !!totp,
             })),
         };
@@ -758,6 +802,7 @@ class AccountLoginService {
                             email: row.email,
                             password: row.password,
                             ...(row.totp ? { totpSecret: row.totp.secret } : {}),
+                            ...(row.recoveryEmail ? { recoveryEmail: row.recoveryEmail } : {}),
                         },
                         false
                     );
@@ -771,7 +816,8 @@ class AccountLoginService {
                     throw error("CSV requires exact email matching");
                 if (
                     ((row.password && account.password && row.password !== account.password) ||
-                        (row.totp && account.totp && row.totp.secret !== account.totp.secret)) &&
+                        (row.totp && account.totp && row.totp.secret !== account.totp.secret) ||
+                        (row.recoveryEmail && account.recoveryEmail && row.recoveryEmail !== account.recoveryEmail)) &&
                     !choice.overwrite
                 )
                     throw error("Explicit overwrite required", 409);
@@ -779,6 +825,7 @@ class AccountLoginService {
                     credentialVersion: account.credentialVersion,
                     ...(row.password ? { password: row.password } : {}),
                     ...(row.totp ? { totpSecret: row.totp.secret } : {}),
+                    ...(row.recoveryEmail ? { recoveryEmail: row.recoveryEmail } : {}),
                 });
                 result.updated++;
             } catch (cause) {

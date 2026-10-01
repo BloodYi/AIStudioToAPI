@@ -866,3 +866,116 @@ test("not-logged-in filter selects saved credentials without a session and suppo
     assert.equal(paged.total, 3);
     assert.equal(paged.accounts[0].accountId, totp.accountId);
 });
+
+test("recovery credentials remain private, versioned and preserve empty imports", async t => {
+    const { service } = await fixture(t);
+    const created = await service.create(
+        { email: "new@example.com", password: "synthetic", recoveryEmail: " RECOVERY@example.com " },
+        false
+    );
+    const id = created.account.accountId;
+    assert.equal(created.account.hasRecoveryEmail, true);
+    assert.equal(created.account.recoveryEmail, undefined);
+    assert.equal(service.credentials(id).recoveryEmail, "recovery@example.com");
+    const preview = service.preview(
+        "session",
+        "csv",
+        "email,password,recovery_email,totp_secret\nnew@example.com,synthetic,other@example.com,\n"
+    );
+    assert.equal(preview.rows[0].recoveryEmailConflict, true);
+    assert.equal(preview.rows[0].recoveryEmail, undefined);
+    assert.equal(
+        (await service.importCommit("session", { previewId: preview.previewId, rows: [{ index: 0 }] })).failed,
+        1
+    );
+    const blank = service.preview(
+        "session",
+        "csv",
+        "email,password,recovery_email,totp_secret\nnew@example.com,synthetic,,\n"
+    );
+    await service.importCommit("session", { previewId: blank.previewId, rows: [{ index: 0 }] });
+    assert.equal(service.credentials(id).recoveryEmail, "recovery@example.com");
+    const version = service.credentials(id).credentialVersion;
+    await service.edit(id, { clearRecoveryEmail: true, credentialVersion: version });
+    assert.equal(service.credentials(id).recoveryEmail, null);
+    assert.equal(service.credentials(id).credentialVersion, version + 1);
+    await assert.rejects(service.edit(id, { credentialVersion: version, recoveryEmail: "stale@example.com" }), {
+        status: 409,
+    });
+});
+test("CSV aliases, BOM, whitespace headers and recovery export round trip", () => {
+    const { credentialsCsv } = require("../src/accounts/AccountExport");
+    const account = {
+        email: "user@example.com",
+        password: ' p,a"ss\nword ',
+        recoveryEmail: "recover@example.com",
+        totp: Totp.normalize(secret),
+    };
+    assert.deepEqual(parseImport("csv", credentialsCsv([account])).rows[0], {
+        email: account.email,
+        password: account.password,
+        recoveryEmail: account.recoveryEmail,
+        totp: account.totp,
+    });
+    assert.equal(
+        parseImport("csv", "\uFEFF email , password , totpSecret\nuser@example.com, pw ," + secret).rows[0].password,
+        " pw "
+    );
+    for (const columns of ["totpSecret,totp_secret", "recoveryEmail,recovery_email"]) {
+        assert.equal(
+            parseImport("csv", `email,password,${columns}\nuser@example.com,pw,first,second`).rows[0].error,
+            "Conflicting alias columns"
+        );
+    }
+    assert.throws(() => parseImport("csv", "user@example.com,password,SECRET"), /header/);
+});
+
+test("legacy recovery default and explicit duplicate credential choice survive storage", async t => {
+    const fixtureData = await fixture(t, 2);
+    const { service, options, system } = fixtureData;
+    const [first, second] = service.state.accounts;
+    delete first.recoveryEmail;
+    second.recoveryEmail = "second@example.com";
+    await service.save();
+    await fixtureData.close();
+    const reopened = new Service(system, options);
+    try {
+        await reopened.initialize({ startQueue: false });
+        const [keep, remove] = reopened.state.accounts;
+        assert.equal(keep.recoveryEmail, null);
+        keep.recoveryEmail = "first@example.com";
+        const group = { email: "duplicate@example.com", keptIndex: 0, removedIndices: [1] };
+        const conflict = await reopened.prepareDeduplicate([group]);
+        assert.equal(conflict.conflicts.length, 1);
+        assert.equal(JSON.stringify(conflict).includes("first@example.com"), false);
+        const versions = Object.fromEntries(
+            reopened.state.accounts.map(account => [account.accountId, account.credentialVersion])
+        );
+        const version = keep.credentialVersion;
+        await reopened.prepareDeduplicate([group], { [group.email]: { accountId: remove.accountId, versions } });
+        assert.equal(keep.recoveryEmail, "second@example.com");
+        assert.equal(keep.credentialVersion, version + 1);
+    } finally {
+        await reopened.close();
+    }
+});
+
+test("session commit removes legacy recovery credentials from auth JSON", async t => {
+    const { service } = await fixture(t, 1);
+    const account = service.state.accounts[0];
+    account.recoveryEmail = "private-recovery@example.com";
+    await fs.writeFile(
+        path.join(service.authDir, "auth-0.json"),
+        JSON.stringify({
+            cookies: [],
+            origins: [],
+            recovery_email: account.recoveryEmail,
+            recoveryEmail: account.recoveryEmail,
+        })
+    );
+    await service.commitSession(account, { accountName: account.email, cookies: [], origins: [] });
+    const saved = await service.readAuth(0);
+    assert.equal(saved.recoveryEmail, undefined);
+    assert.equal(saved.recovery_email, undefined);
+    assert.equal(account.recoveryEmail, "private-recovery@example.com");
+});

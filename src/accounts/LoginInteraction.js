@@ -9,8 +9,10 @@ class LoginInteraction {
         sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
         random = Math.random,
         now = () => performance.now(),
+        deadline = Infinity,
     }) {
         this.config = config;
+        this.deadline = deadline;
         this.guard = guard;
         this.sleep = sleep;
         this.random = random;
@@ -24,9 +26,13 @@ class LoginInteraction {
         if (this.config.humanize !== false) await this.sleep(this.number(min, max));
         this.guard();
     }
+    timeout(budget = this.config.stepTimeout) {
+        this.guard();
+        return Math.max(1, Math.floor(Math.min(budget, this.config.stepTimeout, this.deadline - this.now())));
+    }
     async click(locator, { timeout = this.config.stepTimeout } = {}) {
         await this.pause(180, 450);
-        const options = { timeout: Math.min(timeout, this.config.stepTimeout) };
+        const options = { timeout: this.timeout(timeout) };
         if (this.config.humanize !== false) {
             const box = await locator.boundingBox({ timeout: options.timeout });
             this.guard();
@@ -50,18 +56,22 @@ class LoginInteraction {
         this.guard();
     }
     async type(locator, value) {
+        this.guard();
         if (this.config.humanize === false) {
-            await locator.fill(typeof value === "function" ? await value() : value);
+            const text = typeof value === "function" ? await value() : value;
+            this.guard();
+            await locator.fill(text, { timeout: this.timeout() });
             this.guard();
             return;
         }
         await this.click(locator);
-        await locator.press("ControlOrMeta+A");
-        await locator.press("Backspace");
+        await locator.press("ControlOrMeta+A", { timeout: this.timeout() });
+        this.guard();
+        await locator.press("Backspace", { timeout: this.timeout() });
         await this.pause(100, 280);
         // Generate short-lived codes after focusing/clearing the field, not before.
         const text = typeof value === "function" ? await value() : value;
-        const deadline = this.now() + this.config.stepTimeout;
+        const deadline = Math.min(this.deadline, this.now() + this.config.stepTimeout);
         for (const character of text) {
             this.guard();
             const remaining = deadline - this.now();

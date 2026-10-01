@@ -3,9 +3,11 @@ const JSZip = require("jszip");
 function credentialsCsv(accounts) {
     const quote = value => `"${String(value ?? "").replaceAll('"', '""')}"`;
     return (
-        "\uFEFFemail,password,totpSecret\r\n" +
+        "\uFEFFemail,password,recovery_email,totp_secret\r\n" +
         accounts
-            .map(account => [account.email, account.password, account.totp?.secret].map(quote).join(","))
+            .map(account =>
+                [account.email, account.password, account.recoveryEmail, account.totp?.secret].map(quote).join(",")
+            )
             .join("\r\n") +
         "\r\n"
     );

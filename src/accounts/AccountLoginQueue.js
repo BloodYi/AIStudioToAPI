@@ -161,7 +161,12 @@ class AccountLoginQueue {
                         if (slot.finishing || this.stopped || !slot.child.connected) continue;
                         slot.child.send({
                             config,
-                            credentials: { email: account.email, password: account.password, totp: account.totp },
+                            credentials: {
+                                email: account.email,
+                                password: account.password,
+                                recoveryEmail: account.recoveryEmail,
+                                totp: account.totp,
+                            },
                             executablePath: this.service.system.browserManager?._getBrowserExecutablePath(),
                             proxy,
                             targetUrl: this.service.system.browserManager?.targetUrl,
