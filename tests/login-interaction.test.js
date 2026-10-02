@@ -93,3 +93,26 @@ test("pacing is enabled by default and its environment switch is strict", () => 
         else process.env.ACCOUNT_LOGIN_HUMANIZE = previous;
     }
 });
+
+test("click preparation timeouts carry safe sub-operation diagnostics", async () => {
+    const { interaction, locator } = setup();
+    locator.boundingBox = async () => {
+        throw Object.assign(new Error("private page fragment"), { name: "TimeoutError" });
+    };
+    await assert.rejects(
+        interaction.click(locator),
+        error => error.reason === "ui_click_timeout" && error.operationPart === "bounding_box" && error.retryable
+    );
+    assert.equal(interaction.diagnostics.operationPart, "bounding_box");
+    assert.ok(!JSON.stringify(interaction.diagnostics).includes("private"));
+});
+test("challenge checks stop typing between keys when the page changes", async () => {
+    const { interaction, locator, text } = setup();
+    await assert.rejects(
+        interaction.type(locator, "123456", async () => {
+            if (text() === "1") throw Object.assign(new Error("challenge_changed"), { reason: "challenge_changed" });
+        }),
+        error => error.reason === "challenge_changed"
+    );
+    assert.equal(text(), "1");
+});

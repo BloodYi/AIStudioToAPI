@@ -350,6 +350,12 @@
                 </p>
                 <p v-for="(attempt, index) in task.history" :key="index">
                     {{ attempt.phase }} · {{ attempt.error || "OK" }} · {{ new Date(attempt.endedAt).toISOString() }}
+                    <span v-if="attempt.diagnostics">
+                        · {{ l("操作诊断", "Operation diagnostics") }}: {{ JSON.stringify(attempt.diagnostics) }}</span
+                    >
+                    <span v-if="attempt.termsOutcome">
+                        · {{ l("协议状态", "Terms outcome") }}: {{ attempt.termsOutcome }}</span
+                    >
                     <ElButton v-if="attempt.artifactId" @click="showArtifact(attempt.artifactId)">{{
                         l("查看失败截图", "View failure screenshot")
                     }}</ElButton

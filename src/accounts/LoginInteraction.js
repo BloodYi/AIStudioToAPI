@@ -30,22 +30,37 @@ class LoginInteraction {
         this.guard();
         return Math.max(1, Math.floor(Math.min(budget, this.config.stepTimeout, this.deadline - this.now())));
     }
-    async click(locator, { timeout = this.config.stepTimeout } = {}) {
-        await this.pause(180, 450);
-        const options = { timeout: this.timeout(timeout) };
-        if (this.config.humanize !== false) {
-            const box = await locator.boundingBox({ timeout: options.timeout });
-            this.guard();
-            if (box && box.width > 0 && box.height > 0)
-                options.position = {
-                    x: (box.width * this.number(35, 65)) / 100,
-                    y: (box.height * this.number(35, 65)) / 100,
-                };
-            options.delay = this.number(60, 140);
-            options.steps = this.number(4, 10);
-        }
+    async operation(part, action) {
+        this.diagnostics = { operationPart: part, remainingMs: Math.max(0, Math.floor(this.deadline - this.now())) };
+        const started = this.now();
         try {
-            await locator.click(options);
+            return await action();
+        } catch (cause) {
+            cause.operationPart = part;
+            throw cause;
+        } finally {
+            this.diagnostics.operationElapsedMs = Math.max(0, Math.floor(this.now() - started));
+        }
+    }
+    async click(locator, { timeout = this.config.stepTimeout, check = async () => {} } = {}) {
+        try {
+            await this.pause(180, 450);
+            await check();
+            const options = { timeout: this.timeout(timeout) };
+            if (this.config.humanize !== false) {
+                const box = await this.operation("bounding_box", () => locator.boundingBox(options));
+                this.guard();
+                if (box && box.width > 0 && box.height > 0)
+                    options.position = {
+                        x: (box.width * this.number(35, 65)) / 100,
+                        y: (box.height * this.number(35, 65)) / 100,
+                    };
+                options.delay = this.number(60, 140);
+                options.steps = this.number(4, 10);
+            }
+            await check();
+            options.timeout = this.timeout(timeout);
+            await this.operation("click", () => locator.click(options));
         } catch (cause) {
             if (cause.name === "TimeoutError") {
                 cause.reason = "ui_click_timeout";
@@ -55,19 +70,23 @@ class LoginInteraction {
         }
         this.guard();
     }
-    async type(locator, value) {
+    async type(locator, value, check = async () => {}) {
         this.guard();
+        await check();
         if (this.config.humanize === false) {
             const text = typeof value === "function" ? await value() : value;
             this.guard();
-            await locator.fill(text, { timeout: this.timeout() });
+            await check();
+            await this.operation("fill", () => locator.fill(text, { timeout: this.timeout() }));
             this.guard();
             return;
         }
-        await this.click(locator);
-        await locator.press("ControlOrMeta+A", { timeout: this.timeout() });
+        await this.click(locator, { check });
+        await check();
+        await this.operation("keypress", () => locator.press("ControlOrMeta+A", { timeout: this.timeout() }));
         this.guard();
-        await locator.press("Backspace", { timeout: this.timeout() });
+        await check();
+        await this.operation("keypress", () => locator.press("Backspace", { timeout: this.timeout() }));
         await this.pause(100, 280);
         // Generate short-lived codes after focusing/clearing the field, not before.
         const text = typeof value === "function" ? await value() : value;
@@ -77,10 +96,13 @@ class LoginInteraction {
             const remaining = deadline - this.now();
             if (remaining <= 0)
                 throw Object.assign(new Error("input_timeout"), { reason: "input_timeout", retryable: true });
-            await locator.pressSequentially(character, {
-                delay: this.number(45, 125),
-                timeout: Math.max(1, Math.floor(remaining)),
-            });
+            await check();
+            await this.operation("keypress", () =>
+                locator.pressSequentially(character, {
+                    delay: this.number(45, 125),
+                    timeout: Math.max(1, Math.floor(remaining)),
+                })
+            );
         }
         this.guard();
     }

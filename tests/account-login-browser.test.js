@@ -39,7 +39,9 @@ async function run(options = {}) {
                             html =
                                 "<input id=\"identifierId\" type=\"text\"><button onclick=\"if(document.querySelector('input').value==='user@example.com')location.href='/password'\">Next</button>";
                         else if (url.pathname === "/password")
-                            html = `<input type="password"><button onclick="if(document.querySelector('input').value==='synthetic')location.href='${options.recovery ? "/recovery" : options.noTotp ? "https://aistudio.google.com/prompts/new" : "/security"}'">Next</button>`;
+                            html = `<input type="password"><button onclick="if(document.querySelector('input').value==='synthetic')location.href='${options.directAfterEmail ? "/totp" : options.recovery ? "/recovery" : options.noTotp ? "https://aistudio.google.com/prompts/new" : options.directTotp ? "/totp" : "/security"}'">Next</button>`;
+                        else if (url.pathname === "/choice")
+                            html = `<p>Choose how to sign in: Google Authenticator</p><input type="text" oninput="location.href='https://untrusted.example/'"><button role="link" data-challengetype="6" onclick="location.href='/totp'">Authenticator</button>`;
                         else if (url.pathname === "/recovery")
                             html = `<p>Confirm your recovery email</p><input name="knowledgePreregisteredEmailResponse"><button onclick="${options.wrongRecovery ? "document.querySelector('p').textContent='Incorrect recovery email'" : "if(document.querySelector('input').value==='recover@example.com')location.href='https://aistudio.google.com/prompts/new'"}">Next</button>`;
                         else if (url.pathname === "/security")
@@ -84,7 +86,29 @@ async function run(options = {}) {
                                     '<div role="dialog" style="display:none" id="late-terms">'
                                 ) +
                                 '<script>setTimeout(()=>document.getElementById("late-terms").style.display="block",700)</script>';
-                        return `<!doctype html><html><head><meta charset="utf-8"></head><body>${html}</body></html>`;
+                        if (url.pathname === "/totp" && (options.bounceSubmit || options.bounceInput)) {
+                            const bounce =
+                                "if(!document.cookie.includes('bounced=1')){document.cookie='bounced=1;path=/';location.href='/choice'}";
+                            if (options.bounceSubmit) html = html.replace('onclick="if(', `onclick="${bounce}else if(`);
+                            else
+                                html = html.replace(
+                                    'id="newAuthenticatorCode"',
+                                    `id="newAuthenticatorCode" oninput="${bounce}"`
+                                );
+                        }
+                        if (url.pathname === "/totp" && options.autoSubmitDelayed)
+                            html = html.replace(
+                                'id="newAuthenticatorCode"',
+                                'id="newAuthenticatorCode" oninput="if(this.value.length===6)setTimeout(()=>location.href=\'https://aistudio.google.com/prompts/new\',300)"'
+                            );
+                        if (options.directAfterEmail && url.pathname.includes("ServiceLogin"))
+                            html = html.replace("/password", "/totp");
+                        if (options.upgrade && url.hostname === "aistudio.google.com")
+                            html = html.replace(
+                                '<textarea aria-label="Prompt"></textarea>',
+                                "<p>Upgrade to unlock Gemini 3 Flash Preview</p>"
+                            );
+                        return `<!doctype html><html><head><meta charset="utf-8"></head><body><main>${html}</main></body></html>`;
                     };
                     const originalRoute = context.route.bind(context);
                     await originalRoute("**/*", async route => {
@@ -299,3 +323,62 @@ test("real browser: observed optional cost hint never opens spending settings", 
     assert.equal(await page.locator('[role="dialog"]').count(), 0);
     assert.equal(handler.transitionClicks, 1);
 });
+
+test(
+    "real browser: direct TOTP after email/password and signed-in upgrade panel",
+    { skip: !executablePath },
+    async () => {
+        for (const options of [{ directAfterEmail: true }, { directTotp: true }, { noTotp: true, upgrade: true }]) {
+            const result = await run({ ...options, fast: true });
+            assert.ok(result.storageState, JSON.stringify(result));
+            assert.equal(result.targetInitialized, true);
+        }
+    }
+);
+test(
+    "real browser: consent observation is atomic and click timeout needs a changed container",
+    { skip: !executablePath },
+    async t => {
+        const html =
+            '<div role="dialog"><h2>AI Studio Terms of service</h2><button onclick="this.parentNode.remove()">Accept</button></div>';
+        const { handler, interaction, page } = await handlerFixture(t, html);
+        const original = interaction.click.bind(interaction);
+        interaction.click = async (...args) => {
+            await original(...args);
+            throw Object.assign(new Error("synthetic timeout"), { name: "TimeoutError" });
+        };
+        assert.equal(await handler.terms(), true);
+        assert.equal(handler.termsOutcome, "completed");
+        assert.equal(await handler.snapshot(page.locator('[role="dialog"]')), null);
+        await page.goto("https://aistudio.google.com/again");
+        interaction.click = async () => {
+            throw Object.assign(new Error("synthetic timeout"), { name: "TimeoutError" });
+        };
+        await assert.rejects(handler.terms(), error => error.name === "TimeoutError");
+        assert.equal(await page.locator('[role="dialog"]').count(), 1);
+        // Container disappears after it was identified, before control lookup.
+        const snapshot = handler.snapshot.bind(handler);
+        let removed = false;
+        handler.snapshot = async locator => {
+            const text = await snapshot(locator);
+            if (text !== null && !removed) {
+                removed = true;
+                await page.locator('[role="dialog"]').evaluate(node => node.remove());
+            }
+            return text;
+        };
+        assert.equal(await handler.terms(), true);
+        assert.equal(handler.termsOutcome, "completed");
+    }
+);
+
+test(
+    "real browser: challenge reentry and delayed auto-submit never type into choice inputs",
+    { skip: !executablePath },
+    async () => {
+        for (const options of [{ bounceSubmit: true }, { bounceInput: true }, { autoSubmitDelayed: true }]) {
+            const result = await run({ ...options, directTotp: true, fast: true });
+            assert.ok(result.storageState, JSON.stringify(result));
+        }
+    }
+);

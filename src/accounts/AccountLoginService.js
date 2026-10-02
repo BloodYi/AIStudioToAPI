@@ -552,6 +552,7 @@ class AccountLoginService {
             artifactId: artifact?.id || null,
             attempt: task.attempts,
             controls: result.controls || [],
+            diagnostics: result.diagnostics,
             endedAt: Date.now(),
             error: result.error || null,
             executorExit: result.executorExit,

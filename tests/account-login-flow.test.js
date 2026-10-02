@@ -15,7 +15,8 @@ async function simulate(options = {}) {
         state = "email",
         url = "about:blank",
         rejected = 0,
-        alternativeChecks = 0;
+        alternativeChecks = 0,
+        reentries = 0;
     const pins = [],
         phases = [],
         screenshots = [];
@@ -64,6 +65,11 @@ async function simulate(options = {}) {
             state = "studio";
             url = "https://aistudio.google.com/prompts/new";
         } else if (state === "totp") {
+            if (reentries < (options.reentries || 0)) {
+                reentries++;
+                state = "choose";
+                return;
+            }
             if (rejected < (options.rejectCodes || 0)) {
                 rejected++;
                 return;
@@ -87,7 +93,12 @@ async function simulate(options = {}) {
                       unavailable: !!options.unavailable,
                   },
         frames: () => [],
-        getByRole: () => ({ first: () => ({ click: next, isVisible: async () => false }) }),
+        getByRole: () => ({
+            filter() {
+                return this;
+            },
+            first: () => ({ click: next, isVisible: async () => false }),
+        }),
         getByText: () => ({
             first: () => ({
                 click: async () => {
@@ -113,6 +124,8 @@ async function simulate(options = {}) {
                     } else await next();
                 },
                 count: async () => (visible(selector) ? 1 : 0),
+                elementHandle: async () => locator,
+                evaluate: async () => true,
                 fill: async value => {
                     if (selector.includes("totpPin")) pins.push({ time: clock, value });
                 },
@@ -120,6 +133,7 @@ async function simulate(options = {}) {
                 first: () => locator,
                 innerText: async () => text(),
                 isEditable: async () => true,
+                isEnabled: async () => true,
                 isVisible: async () => {
                     if (state === "alternative_loading") {
                         if (++alternativeChecks >= 4) state = "choose";
@@ -127,6 +141,7 @@ async function simulate(options = {}) {
                     }
                     return visible(selector);
                 },
+                locator: nested => (nested.startsWith("xpath") ? { count: async () => 0 } : page.locator(nested)),
                 nth: () => locator,
             };
             return locator;
@@ -283,4 +298,15 @@ test("missing target configuration stops before submitting credentials", async (
     assert.equal(result.error, "service_target_missing");
     assert.deepEqual(phases, []);
     assert.ok(!result.storageState);
+});
+
+test("TOTP challenge reentry resets local submissions but has an attempt-wide bound", async () => {
+    const recovered = await simulate({ reentries: 1, totp: true });
+    assert.ok(recovered.result.storageState);
+    assert.equal(recovered.pins.length, 2);
+    const bounded = await simulate({ reentries: 10, totp: true });
+    assert.equal(bounded.result.error, "totp_challenge_limit");
+    assert.equal(bounded.pins.length, 3);
+    assert.equal(bounded.result.diagnostics.pageStateBefore, "totp_input");
+    assert.ok(!JSON.stringify(bounded.result.diagnostics).includes(secret));
 });

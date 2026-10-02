@@ -11,6 +11,16 @@ class LoginPageHandlers {
     constructor({ page, interaction, guard, stepTimeout, deadline, phase }) {
         Object.assign(this, { deadline, guard, interaction, page, phase, stepTimeout });
     }
+    async snapshot(locator) {
+        this.operation = "terms_read";
+        // One DOM snapshot: missing containers never enter Playwright's locator retry.
+        return this.interaction.operation("text_read", () =>
+            locator.evaluateAll(nodes => {
+                const node = nodes.find(node => node.isConnected && node.getClientRects().length);
+                return node ? node.innerText : null;
+            })
+        );
+    }
     async terms(limit = this.deadline) {
         this.guard();
         if (new URL(this.page.url()).hostname !== "aistudio.google.com") return false;
@@ -18,7 +28,7 @@ class LoginPageHandlers {
         let handled = false;
         for (let attempt = 0; attempt <= 3; attempt++) {
             this.guard();
-            let found;
+            let found, foundFrame;
             for (const frame of this.page.frames().slice(0, 10)) {
                 this.guard();
                 // Never follow third-party consent frames or unclassified about:blank frames.
@@ -38,92 +48,112 @@ class LoginPageHandlers {
                     const dialog = dialogs.nth(index);
                     let text;
                     try {
-                        text = await dialog.innerText({ timeout: this.remaining(end) });
+                        text = await this.snapshot(dialog);
                     } catch (cause) {
                         this.guard();
                         if (frame.isDetached()) break;
                         throw cause;
                     }
-                    if (termsText.test(text) && /AI Studio|Gemini/i.test(text)) {
+                    if (text !== null && termsText.test(text) && /AI Studio|Gemini/i.test(text)) {
                         found = dialog;
+                        foundFrame = frame;
                         break;
                     }
                 }
                 if (found) break;
             }
-            if (!found) return handled;
+            if (!found) {
+                if (handled) this.termsOutcome = "completed";
+                this.phase("aistudio_ready_wait");
+                return handled;
+            }
             if (attempt === 3) throw failure("terms_or_consent_required");
             this.phase("aistudio_terms");
             this.termsOutcome = "identified";
             handled = true;
-            const boxes = found.locator('input[type="checkbox"], [role="checkbox"]').filter({ visible: true });
-            for (let index = 0; index < Math.min(await boxes.count(), 10); index++) {
-                this.guard();
-                const box = boxes.nth(index);
-                const info = await box.evaluate(node => ({
-                    checked: node.checked === true || node.getAttribute("aria-checked") === "true",
-                    label:
-                        node.labels?.[0]?.innerText ||
-                        document.getElementById(node.getAttribute("aria-labelledby"))?.innerText ||
-                        node.closest("label, mat-checkbox, .mdc-form-field")?.innerText ||
-                        node.getAttribute("aria-label") ||
-                        "",
-                    required: node.required || node.getAttribute("aria-required") === "true",
-                }));
-                if (optionalText.test(info.label)) continue;
-                if (
-                    !info.checked &&
-                    (info.required ||
-                        (/agree|accept|同意|接受/i.test(info.label) && /terms|条款|條款/i.test(info.label)))
-                )
-                    await this.interaction.click(box, { timeout: this.remaining(end) });
-            }
-            let button = found
-                .getByRole("button", { name: /^(I agree|I accept|Agree|Accept|同意|我同意|接受)$/i })
-                .first();
-            if (!(await button.isVisible())) button = found.getByRole("button", { name: acceptName }).first();
-            if (!(await button.isVisible())) {
-                // AI Studio can expose a longer aria-label than its visible
-                // confirmation caption. Use exact approved text only inside
-                // the already identified consent container.
-                const controls = found
-                    .locator('button, [role="button"], input[type="button"], input[type="submit"]')
-                    .filter({ visible: true });
-                const matches = [];
-                for (let index = 0; index < Math.min(await controls.count(), 30); index++) {
+            try {
+                const boxes = found.locator('input[type="checkbox"], [role="checkbox"]').filter({ visible: true });
+                for (let index = 0; index < Math.min(await boxes.count(), 10); index++) {
                     this.guard();
-                    const control = controls.nth(index);
-                    const caption = await control.evaluate(node =>
-                        (node.textContent || node.value || "").replace(/\s+/g, " ").trim()
-                    );
-                    if (acceptName.test(caption))
-                        matches.push({ control, explicit: !/^(Continue|继续|繼續)$/i.test(caption) });
+                    const box = boxes.nth(index);
+                    const info = await box.evaluate(node => ({
+                        checked: node.checked === true || node.getAttribute("aria-checked") === "true",
+                        label:
+                            node.labels?.[0]?.innerText ||
+                            document.getElementById(node.getAttribute("aria-labelledby"))?.innerText ||
+                            node.closest("label, mat-checkbox, .mdc-form-field")?.innerText ||
+                            node.getAttribute("aria-label") ||
+                            "",
+                        required: node.required || node.getAttribute("aria-required") === "true",
+                    }));
+                    if (optionalText.test(info.label)) continue;
+                    if (
+                        !info.checked &&
+                        (info.required ||
+                            (/agree|accept|同意|接受/i.test(info.label) && /terms|条款|條款/i.test(info.label)))
+                    )
+                        await this.interaction.click(box, { timeout: this.remaining(end) });
                 }
-                button = matches.find(match => match.explicit)?.control || matches[0]?.control || button;
-            }
-            if (!(await button.isVisible())) {
-                this.termsOutcome = "confirmation_missing";
-                throw failure("terms_or_consent_required");
-            }
-            const before = await found.innerText({ timeout: this.remaining(end) });
-            await this.interaction.click(button, { timeout: this.remaining(end) });
-            this.termsOutcome = "clicked";
-            let changed = false;
-            const observeUntil = Math.min(end, performance.now() + 2000);
-            while (performance.now() < observeUntil) {
+                let button = found
+                    .getByRole("button", { name: /^(I agree|I accept|Agree|Accept|同意|我同意|接受)$/i })
+                    .first();
+                if (!(await button.isVisible())) button = found.getByRole("button", { name: acceptName }).first();
+                if (!(await button.isVisible())) {
+                    // AI Studio can expose a longer aria-label than its visible
+                    // confirmation caption. Use exact approved text only inside
+                    // the already identified consent container.
+                    const controls = found
+                        .locator('button, [role="button"], input[type="button"], input[type="submit"]')
+                        .filter({ visible: true });
+                    const matches = [];
+                    for (let index = 0; index < Math.min(await controls.count(), 30); index++) {
+                        this.guard();
+                        const control = controls.nth(index);
+                        const caption = await control.evaluate(node =>
+                            (node.textContent || node.value || "").replace(/\s+/g, " ").trim()
+                        );
+                        if (acceptName.test(caption))
+                            matches.push({ control, explicit: !/^(Continue|继续|繼續)$/i.test(caption) });
+                    }
+                    button = matches.find(match => match.explicit)?.control || matches[0]?.control || button;
+                }
+                if (!(await button.isVisible())) {
+                    if ((await this.snapshot(found)) === null) continue;
+                    this.termsOutcome = "confirmation_missing";
+                    throw failure("terms_or_consent_required");
+                }
+                const before = await this.snapshot(found);
+                if (before === null) continue;
+                this.operation = "terms_confirm";
+                try {
+                    await this.interaction.click(button, { timeout: this.remaining(end) });
+                    this.termsOutcome = "clicked";
+                } catch (cause) {
+                    this.guard();
+                    if (cause.name !== "TimeoutError" || (await this.snapshot(found)) === before) throw cause;
+                    // Rescan and validate the current page; disappearance alone is not success.
+                    continue;
+                }
+                let changed = false;
+                const observeUntil = Math.min(end, performance.now() + 2000);
+                while (performance.now() < observeUntil) {
+                    this.guard();
+                    if ((await this.snapshot(found)) !== before) {
+                        changed = true;
+                        break;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+                if (!changed && attempt === 2) {
+                    this.termsOutcome = "unchanged";
+                    throw failure("terms_or_consent_required");
+                }
+            } catch (cause) {
                 this.guard();
-                if (
-                    !(await found.isVisible()) ||
-                    (await found.innerText({ timeout: this.remaining(end) })) !== before
-                ) {
-                    changed = true;
-                    break;
-                }
-                await new Promise(resolve => setTimeout(resolve, 100));
-            }
-            if (!changed && attempt === 2) {
-                this.termsOutcome = "unchanged";
-                throw failure("terms_or_consent_required");
+                if (foundFrame.isDetached()) continue;
+                if (cause.name !== "TimeoutError" || (await this.snapshot(found)) !== null) throw cause;
+                // A known consent container disappeared during control preparation.
+                // The next scan and Studio validation still have to succeed.
             }
         }
         throw failure("terms_or_consent_required");
@@ -136,7 +166,7 @@ class LoginPageHandlers {
         for (let index = 0; index < Math.min(await dialogs.count(), 5); index++) {
             this.guard();
             const dialog = dialogs.nth(index);
-            const text = await dialog.innerText({ timeout: this.remaining(end) });
+            const text = await this.snapshot(dialog);
             // Observed informational spending-cap hint, never its settings action.
             if (
                 !/New.*control API costs|新功能[：:].*控制 API 费用/i.test(text) ||
@@ -176,20 +206,38 @@ class LoginPageHandlers {
         if (remaining <= 0) throw failure("terms_or_consent_required");
         return Math.max(1, Math.floor(remaining));
     }
+    async pin(input) {
+        const handle = await input.elementHandle();
+        if (!handle) throw failure("challenge_changed");
+        // ElementHandle keeps the original node through redraws. Its per-character
+        // typing API is named type(), while Locator exposes pressSequentially().
+        return {
+            boundingBox: options => handle.boundingBox(options),
+            click: options => handle.click(options),
+            evaluate: (...args) => handle.evaluate(...args),
+            fill: (...args) => handle.fill(...args),
+            locator: selector => input.locator(selector),
+            press: (...args) => handle.press(...args),
+            pressSequentially: (text, options) => handle.type(text, options),
+        };
+    }
     async totpInputs(selector) {
         this.guard();
-        const inputs = this.page.locator(selector).filter({ visible: true });
+        const inputs = (typeof selector === "string" ? this.page.locator(selector) : selector).filter({
+            visible: true,
+        });
         const editable = [];
         for (let index = 0; index < Math.min(await inputs.count(), 12); index++) {
             const input = inputs.nth(index);
-            if (await input.isEditable()) editable.push(input);
+            if ((await input.isEnabled()) && (await input.isEditable())) editable.push(input);
         }
-        if (editable.length === 1) return editable;
+        this.editableCount = editable.length;
+        if (editable.length === 1) return Promise.all(editable.map(input => this.pin(input)));
         if (
             editable.length === 6 &&
             (await Promise.all(editable.map(input => input.getAttribute("maxlength")))).every(length => length === "1")
         )
-            return editable;
+            return Promise.all(editable.map(input => this.pin(input)));
         throw failure("manual_challenge");
     }
     async structure() {

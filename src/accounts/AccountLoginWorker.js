@@ -7,6 +7,8 @@ const { performance } = require("node:perf_hooks");
 /* eslint-env browser */
 const privateValues = new Set();
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+const explicitTotpSelector = 'input[name="totpPin"], input[id="totpPin"], input[autocomplete="one-time-code"]';
+const diagnostics = {};
 const totpSelector =
     'input[name="totpPin"], input[id="totpPin"], input[autocomplete="one-time-code"], input[inputmode="numeric"], input[type="tel"], input[type="text"], input[type="number"], input:not([type])';
 let page,
@@ -75,29 +77,95 @@ async function waitForPage(predicate) {
     }
     fail("page_transition_timeout", true);
 }
-async function totpReady() {
-    return (
-        (await visible('input[name="totpPin"], input[id="totpPin"]')) ||
-        (/Google Authenticator|身份验证器|身分驗證器/i.test(await page.locator("body").innerText()) &&
-            !(await visible("input#securityKeyOtpInputId")) &&
-            (await visible(totpSelector)))
-    );
+function totpCandidates() {
+    return page.locator(explicitTotpSelector).filter({ visible: true });
 }
-async function clickForState(locator, ready) {
+async function totpFields() {
+    const explicit = totpCandidates();
+    if (await explicit.count()) {
+        diagnostics.inputKind = "explicit_totp";
+        return explicit;
+    }
+    diagnostics.inputKind = "scoped_totp";
+    return page
+        .locator('form, main, [role="main"], [data-challengetype="6"]')
+        .filter({ visible: true })
+        .filter({ hasText: /Google Authenticator|身份验证器|身分驗證器/i })
+        .locator(totpSelector)
+        .filter({ visible: true });
+}
+async function totpReady() {
+    if (new URL(page.url()).hostname !== "accounts.google.com") return false;
+    if (
+        await visible(
+            '[data-challengetype="6"][role="link"], [data-challengetype="6"][role="button"], li[data-challengetype="6"], input#securityKeyOtpInputId'
+        )
+    )
+        return false;
+    const inputs = await totpFields();
+    for (let index = 0; index < Math.min(await inputs.count(), 12); index++) {
+        const input = inputs.nth(index);
+        if ((await input.isEnabled()) && (await input.isEditable())) return true;
+    }
+    return false;
+}
+async function pageState() {
+    const host = new URL(page.url()).hostname;
+    if (host === "aistudio.google.com") return "studio_shell";
+    if (host !== "accounts.google.com") return "unknown";
+    if (
+        await visible(
+            '[data-challengetype="6"][role="link"], [data-challengetype="6"][role="button"], li[data-challengetype="6"]'
+        )
+    )
+        return "challenge_choice";
+    if (await visible("input#securityKeyOtpInputId")) return "passkey";
+    if (await totpReady()) return "totp_input";
+    if (await visible('input[type="password"]')) return "password";
+    if (await visible('input[type="email"], input#identifierId, input[autocomplete="username"]')) return "email";
+    return "other_challenge";
+}
+async function clickForState(locator, ready, check) {
     try {
         // Let the click settle before moving on: racing it would leave an active
         // Playwright retry able to click the next page during code entry.
-        await interaction.click(locator, { timeout: Math.min(config.stepTimeout, 5000) });
+        await interaction.click(locator, { check, timeout: Math.min(config.stepTimeout, 5000) });
     } catch (cause) {
         guard();
-        if ((cause.reason !== "ui_click_timeout" && cause.name !== "TimeoutError") || !(await ready())) throw cause;
+        if (
+            (cause.reason !== "ui_click_timeout" &&
+                cause.reason !== "challenge_changed" &&
+                cause.name !== "TimeoutError") ||
+            !(await ready())
+        )
+            throw cause;
     }
     guard();
     await waitForPage(ready);
 }
-async function nextButton() {
-    const button = page.getByRole("button", { name: /^(Next|下一步|继续|Continue|Verify|验证)$/i }).first();
-    await interaction.click(button);
+async function nextButton(input, ready) {
+    const scope = input
+        ? input.locator('xpath=ancestor::*[self::form or self::main or @role="main" or @data-challengetype="6"][1]')
+        : null;
+    const root = scope && (await scope.count()) ? scope : page;
+    const button = root
+        .getByRole("button", { disabled: false, name: /^(Next|下一步|继续|Continue|Verify|验证)$/i })
+        .filter({ visible: true })
+        .first();
+    if (ready && (await ready())) return;
+    if (ready)
+        await clickForState(
+            button,
+            async () =>
+                (await ready()) ||
+                /wrong code|incorrect code|code.*expired|验证码.*错误|验证码.*过期/i.test(
+                    await page.locator("body").innerText()
+                ),
+            async () => {
+                if (await ready()) fail("challenge_changed", true);
+            }
+        );
+    else await interaction.click(button);
 }
 async function validateStudio(credentials) {
     if (!page.url().includes("/prompts/new_chat"))
@@ -117,9 +185,11 @@ async function validateStudio(credentials) {
                 fail("manual_challenge");
         }
         const ready =
+            /Upgrade to unlock|升级.*解锁/i.test(await page.locator("body").innerText()) ||
             /Failed to initialize applet|Available regions|not available in your country|地区.*不支持|Allow Drive access/i.test(
                 await page.locator("body").innerText()
-            ) || (await visible('textarea, [contenteditable="true"][role="textbox"]'));
+            ) ||
+            (await visible('textarea, [contenteditable="true"][role="textbox"]'));
         if (!ready) {
             readySince = null;
             return false;
@@ -144,10 +214,12 @@ async function validateStudio(credentials) {
         return {
             email: typeof email === "string" ? email.trim().toLowerCase() : null,
             initializationFailed: /Failed to initialize applet|snapshot.*failed|concurrent updates/i.test(body),
+            modelRestricted: /Upgrade to unlock|升级.*解锁/i.test(body),
             permissionRequired: /Allow Drive access/i.test(body),
             unavailable: /Available regions|not available in your country|地区.*不支持/i.test(body),
         };
     });
+    diagnostics.studioModelState = validation.modelRestricted ? "restricted" : "available";
     if (validation.unavailable) fail("service_region_restricted");
     if (validation.permissionRequired) fail("service_permission_required");
     if (validation.initializationFailed) fail("service_initialization_failed", true);
@@ -163,6 +235,7 @@ async function run(input) {
     interaction = new LoginInteraction({ config, deadline, guard });
     const phase = name => {
         guard();
+        diagnostics.operation = name;
         send({ phase: name });
     };
     handlers = new LoginPageHandlers({ deadline, guard, interaction, page, phase, stepTimeout: config.stepTimeout });
@@ -203,6 +276,10 @@ async function run(input) {
         alternativeAttempted = false,
         authenticatorSelected = false,
         totpSubmissions = 0,
+        totalTotpSubmissions = 0,
+        challengeAttempt = 0,
+        previousState = null,
+        currentChallenge = null,
         lastTotpWindow = -1,
         recoverySubmitted = false,
         recoverySelected = false;
@@ -219,7 +296,33 @@ async function run(input) {
         if (/couldn.t sign you in|could not sign you in|无法登录|browser or app may not be secure/i.test(text))
             fail("login_rejected");
         if (/change your password|更改密码|修改密码/i.test(text)) fail("password_change_required");
-        const codeReady = await totpReady();
+        const state = await pageState();
+        diagnostics.pageStateBefore = state;
+        if (state !== previousState && (state === "challenge_choice" || state === "passkey")) {
+            authenticatorSelected = false;
+            alternativeAttempted = false;
+            currentChallenge = null;
+        }
+        if (state === "totp_input") {
+            const fields = await totpFields();
+            const candidate = await fields.first().elementHandle();
+            let same = false;
+            try {
+                same =
+                    currentChallenge && (await currentChallenge.evaluate((node, other) => node === other, candidate));
+            } catch (cause) {
+                if (!/execution context.*destroyed|disposed|detached/i.test(cause.message)) throw cause;
+            }
+            if (!same) {
+                if (++challengeAttempt > 3) fail("totp_challenge_limit");
+                totpSubmissions = 0;
+                currentChallenge = candidate;
+            }
+        }
+        previousState = state;
+        diagnostics.challengeAttempt = challengeAttempt;
+        diagnostics.submitCount = totalTotpSubmissions;
+        const codeReady = state === "totp_input";
         if (credentials.totp && !authenticatorSelected && !codeReady && (await visible('[data-challengetype="6"]'))) {
             phase("choose_authenticator");
             authenticatorSelected = true;
@@ -316,6 +419,7 @@ async function run(input) {
             transitionUntil = performance.now() + config.stepTimeout;
         } else if (codeReady) {
             phase("totp");
+            diagnostics.operation = "totp_focus";
             if (!credentials.totp) fail("credentials_missing");
             const rejected = /wrong code|incorrect code|code.*expired|验证码.*错误|验证码.*过期/i.test(text);
             if (totpSubmissions && !rejected) {
@@ -323,8 +427,9 @@ async function run(input) {
                 await wait(250);
                 continue;
             }
-            if (totpSubmissions >= 2) fail("totp_rejected");
-            const inputs = await handlers.totpInputs(totpSelector);
+            if (totpSubmissions >= 2 || totalTotpSubmissions >= 4) fail("totp_rejected");
+            const inputs = await handlers.totpInputs(await totpFields());
+            diagnostics.editableCount = handlers.editableCount;
             let code;
             const generate = async () => {
                 const period = credentials.totp.period * 1000;
@@ -335,17 +440,46 @@ async function run(input) {
                     await wait(period - (Date.now() % period) + 100);
                 guard();
                 lastTotpWindow = Math.floor(Date.now() / period);
+                await check();
                 code = Totp.code(credentials.totp);
                 privateValues.add(code);
                 return inputs.length === 1 ? code : code[0];
             };
-            await interaction.type(inputs[0], generate);
-            for (let index = 1; index < inputs.length; index++) await interaction.type(inputs[index], code[index]);
-            // Last digit may submit automatically; let navigation settle before checking.
-            await wait(250);
-            guard();
-            if (new URL(page.url()).hostname === "accounts.google.com" && (await totpReady())) await nextButton();
+            const check = async () => {
+                guard();
+                if ((await pageState()) !== "totp_input" || !(await inputs[0].evaluate(node => node.isConnected)))
+                    fail("challenge_changed", true);
+            };
+            try {
+                await interaction.type(inputs[0], generate, check);
+                for (let index = 1; index < inputs.length; index++)
+                    await interaction.type(inputs[index], code[index], check);
+                // Last digit may submit automatically; let navigation settle before checking.
+                await wait(250);
+                guard();
+                diagnostics.operation = "totp_submit";
+                const advanced = async () => {
+                    diagnostics.pageStateAfter = await pageState();
+                    return ["studio_shell", "challenge_choice", "passkey"].includes(diagnostics.pageStateAfter);
+                };
+                if (!(await advanced())) await nextButton(inputs[0], advanced);
+            } catch (cause) {
+                guard();
+                diagnostics.pageStateAfter = await pageState();
+                const changed =
+                    ["studio_shell", "challenge_choice", "passkey"].includes(diagnostics.pageStateAfter) ||
+                    (diagnostics.pageStateAfter === "totp_input" &&
+                        !(await inputs[0].evaluate(node => node.isConnected)));
+                if (
+                    (cause.reason !== "challenge_changed" &&
+                        cause.name !== "TimeoutError" &&
+                        !/detached|execution context.*destroyed/i.test(cause.message)) ||
+                    !changed
+                )
+                    throw cause;
+            }
             totpSubmissions++;
+            totalTotpSubmissions++;
             transitionUntil = performance.now() + config.stepTimeout;
         } else if (/choose how.*sign in|选择.*验证|2-step verification|两步验证/i.test(text) && !credentials.totp)
             fail("credentials_missing");
@@ -397,7 +531,16 @@ async function run(input) {
     phase("storage_state");
     const storageState = await context.storageState();
     guard();
-    send({ result: { email: validation.email, storageState, targetInitialized: !!validator, termsVerified: true } });
+    send({
+        result: {
+            diagnostics: { ...diagnostics, pageStateAfter: "studio_shell" },
+            email: validation.email,
+            storageState,
+            targetInitialized: !!validator,
+            termsOutcome: handlers.termsOutcome,
+            termsVerified: true,
+        },
+    });
     await close();
 }
 process.on("disconnect", () => {
@@ -482,6 +625,15 @@ process.on("message", input => {
         send({
             result: {
                 controls: Array.isArray(controls) ? controls : [],
+                diagnostics: {
+                    ...diagnostics,
+                    ...interaction?.diagnostics,
+                    operation:
+                        handlers?.operation?.startsWith("terms_") && diagnostics.operation === "aistudio_terms"
+                            ? handlers.operation
+                            : diagnostics.operation,
+                    operationPart: cause.operationPart || interaction?.diagnostics?.operationPart,
+                },
                 error: reason,
                 frameKinds,
                 retryable:
