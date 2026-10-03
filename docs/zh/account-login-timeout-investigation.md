@@ -265,3 +265,26 @@ if (!(await found.isVisible()) || (await found.innerText(...)) !== before) {
 - 使用用户授权测试账号完成一次真实登录：实际经过验证码处理、返回方式列表、重新选择 Authenticator、首登协议、目标应用原生连接核验、最终上下文复查，到达 `storage_state` 并成功导出。真实测试不保存凭据、截图或会话文件，也不向账号库提交会话；首登协议接受会保留在账号侧。
 
 真实验证使用本地 Playwright Firefox，当前工作区未安装默认部署路径的 Camoufox，因此不能将本次验证描述为部署浏览器验收。原始生产截图对应的唯一异常触发点仍无法追溯，但此次真实账号流程验证了文档重点指出的挑战重入恢复路径。
+
+## 9. 概率性 Studio 弹窗误判的诊断采集
+
+新增诊断只采集证据，不调整弹窗白名单、模态判断、点击动作或人工挑战判定条件。Studio 未识别弹窗导致 `manual_challenge` 时，任务历史的“操作诊断”会包含：
+
+- `failureSource: "studio_unrecognized_dialog"`：明确本次人工挑战来自 Studio 弹窗兜底。
+- `studioDialogs.transitionScan`：提示扫描最初的 `scanCount`、实际扫描的 `scannedDialogs` 和扫描时视口尺寸；保留现有最多扫描 5 个弹窗的行为。若当时没有候选，数组为空。
+- `studioDialogs.failureSnapshot`：失败已判定后采集的可见候选弹窗、视口尺寸及 `status`。最多保存 10 个候选，超出时 `truncated=true`，数量仍保留。
+
+每个弹窗仅记录标签与属性的白名单枚举、宽高、面积占比，以及以下布尔值：
+
+- `textMatches.title/cap/create`：现有费用提示标题、支出上限说明和创建按钮文案三个正则是否匹配，不保存文字。
+- `transitionCandidate/gateCandidate`：该节点是否属于提示扫描选择器或人工挑战兜底选择器。
+- `nonblockingRule`：采样时是否满足现有非模态且面积小于视口四分之一的规则。扫描记录另有 `nonblockingResult`，仅在业务实际执行这项判断时记录其结果。
+- `closeButtonCandidate`：是否存在可见且标签匹配关闭文案的按钮候选，仅做 DOM 观察，不点击。该字段基于 DOM 标签近似检查，不等同于完整的浏览器无障碍名称计算。
+
+失败快照中的 `count` 包含更宽范围的候选容器，可能包含嵌套外层；比较出现时序时，应优先将 `failureSnapshot.transitionCount` 与 `transitionScan.scanCount` 对照，它们对应同一类 `role="dialog"` 节点。`gateCount` 则对应人工挑战兜底选择器。快照中的节点顺序不作为持久身份标识。
+
+失败后的采集最多等待 500 毫秒，并受剩余尝试预算限制；页面关闭或采集超时只记录 `capture_failed` 或 `capture_timeout`，仍返回原来的人工挑战结果。快照可能与判定瞬间有短暂时间差，例如失败快照为空可能表示弹窗已消失，不能据此否认判定时有弹窗。
+
+部署此代码并重启服务后，等待故障自然出现，再从账号管理页的登录任务历史复制整段“操作诊断” JSON 即可，无需手动复现或打开浏览器开发者工具。诊断不会输出原始弹窗文字、HTML、输入值、邮箱、验证码、密钥或 Cookie；异常信息也不原样记录。
+
+验证覆盖了模态费用提示、无 `role` 的 Material 容器、文案空白差异、扫描后新出现的弹窗、诊断数量上限、属性脱敏及采集失败/超时。上述失败场景仍返回 `manual_challenge`，已知非模态费用提示仍按原流程处理。

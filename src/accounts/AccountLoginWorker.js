@@ -181,8 +181,11 @@ async function validateStudio(credentials) {
             const accepted = await handlers.terms(stepDeadline);
             const knownHint = await handlers.transition(stepDeadline);
             if (accepted) readySince = null;
-            if (!accepted && !knownHint && (await visible('[role="dialog"], dialog, mat-dialog-container')))
+            if (!accepted && !knownHint && (await visible('[role="dialog"], dialog, mat-dialog-container'))) {
+                diagnostics.failureSource = "studio_unrecognized_dialog";
+                diagnostics.studioDialogs = await handlers.studioDialogDiagnostics();
                 fail("manual_challenge");
+            }
         }
         const ready =
             /Upgrade to unlock|升级.*解锁/i.test(await page.locator("body").innerText()) ||

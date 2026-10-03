@@ -116,3 +116,25 @@ test("challenge checks stop typing between keys when the page changes", async ()
     );
     assert.equal(text(), "1");
 });
+
+test("Studio diagnostic capture failures and deadlines remain best effort", async () => {
+    const LoginPageHandlers = require("../src/accounts/LoginPageHandlers");
+    const { performance } = require("node:perf_hooks");
+    for (const [evaluateAll, expected] of [
+        [
+            async () => {
+                throw new Error("private-password");
+            },
+            "capture_failed",
+        ],
+        [() => new Promise(() => {}), "capture_timeout"],
+    ]) {
+        const handler = new LoginPageHandlers({
+            deadline: performance.now() + 20,
+            page: { locator: () => ({ evaluateAll }) },
+        });
+        const result = await handler.studioDialogDiagnostics();
+        assert.equal(result.failureSnapshot.status, expected);
+        assert.ok(!JSON.stringify(result).includes("private-password"));
+    }
+});

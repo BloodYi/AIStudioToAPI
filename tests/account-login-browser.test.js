@@ -1,3 +1,4 @@
+/* eslint-env browser */
 // Optional DOM integration against the deployed browser; every HTTP request is
 // fulfilled locally, and only synthetic credentials are used.
 const test = require("node:test");
@@ -108,6 +109,8 @@ async function run(options = {}) {
                                 '<textarea aria-label="Prompt"></textarea>',
                                 "<p>Upgrade to unlock Gemini 3 Flash Preview</p>"
                             );
+                        if (options.studioDialog && url.hostname === "aistudio.google.com")
+                            html += options.studioDialog;
                         return `<!doctype html><html><head><meta charset="utf-8"></head><body><main>${html}</main></body></html>`;
                     };
                     const originalRoute = context.route.bind(context);
@@ -129,7 +132,24 @@ async function run(options = {}) {
         {
             Date,
             process: processMock,
-            require: name => (name === "playwright" ? mockPlaywright : workerRequire(name)),
+            require: name =>
+                name === "playwright"
+                    ? mockPlaywright
+                    : name === "./LoginPageHandlers" && options.lateStudioDialog
+                      ? class extends workerRequire(name) {
+                            async transition(...args) {
+                                const result = await super.transition(...args);
+                                if (!this.inserted) {
+                                    this.inserted = true;
+                                    await this.page.evaluate(
+                                        html => document.body.insertAdjacentHTML("beforeend", html),
+                                        options.lateStudioDialog
+                                    );
+                                }
+                                return result;
+                            }
+                        }
+                      : workerRequire(name),
             setTimeout,
             URL,
         },
@@ -380,5 +400,73 @@ test(
             const result = await run({ ...options, directTotp: true, fast: true });
             assert.ok(result.storageState, JSON.stringify(result));
         }
+    }
+);
+
+test(
+    "real browser: rejected Studio dialogs preserve classification and expose only safe evidence",
+    { skip: !executablePath },
+    async () => {
+        const hint =
+            '<h3>新功能：控制 API 费用</h3><p>设置每月支出上限，以防止意外超支</p><button>创建支出上限</button><button aria-label="Close">X</button><input value="password-secret">';
+        for (const studioDialog of [
+            `<div role="dialog" aria-modal="true" style="width:230px;height:150px">${hint}</div>`,
+            `<mat-dialog-container style="display:block;width:230px;height:150px">${hint}</mat-dialog-container>`,
+            `<div role="dialog" style="width:230px;height:150px">${hint.replace("API 费用", "API&nbsp;费用")}</div>`,
+        ]) {
+            const result = await run({ fast: true, noTotp: true, studioDialog, upgrade: true });
+            assert.equal(result.error, "manual_challenge");
+            assert.ok(!result.storageState);
+            assert.equal(result.diagnostics.failureSource, "studio_unrecognized_dialog");
+            const evidence = result.diagnostics.studioDialogs;
+            assert.equal(evidence.failureSnapshot.status, "captured");
+            assert.equal(evidence.failureSnapshot.count, 1);
+            const dialog = evidence.failureSnapshot.dialogs[0];
+            assert.equal(dialog.closeButtonCandidate, true);
+            assert.equal(dialog.width, 230);
+            assert.equal(dialog.height, 150);
+            if (dialog.tag === "mat-dialog-container") {
+                assert.equal(evidence.transitionScan.scanCount, 0);
+                assert.equal(dialog.transitionCandidate, false);
+            } else {
+                assert.equal(evidence.transitionScan.scanCount, 1);
+                assert.equal(evidence.transitionScan.scannedDialogs.length, 1);
+                if (dialog.ariaModal === "true")
+                    assert.equal(evidence.transitionScan.scannedDialogs[0].nonblockingResult, false);
+                else assert.equal(evidence.transitionScan.scannedDialogs[0].textMatches.title, false);
+            }
+            assert.ok(!JSON.stringify(evidence).includes("password-secret"));
+            assert.ok(!JSON.stringify(evidence).includes("新功能"));
+        }
+    }
+);
+test(
+    "real browser: failure snapshot records dialogs appearing after transition scan",
+    { skip: !executablePath },
+    async () => {
+        const result = await run({ fast: true, lateStudioDialog: '<div role="dialog">Late hint</div>', noTotp: true });
+        assert.equal(result.error, "manual_challenge");
+        const evidence = result.diagnostics.studioDialogs;
+        assert.equal(evidence.transitionScan.scanCount, 0);
+        assert.equal(evidence.failureSnapshot.count, 1);
+    }
+);
+test(
+    "real browser: dialog evidence is bounded and arbitrary attributes are redacted",
+    { skip: !executablePath },
+    async t => {
+        const html = Array.from(
+            { length: 12 },
+            () =>
+                '<aside aria-modal="private@example.com" role="dialog"><button aria-label="private@example.com">123456</button><p>password-secret</p></aside>'
+        ).join("");
+        const { handler } = await handlerFixture(t, html);
+        const evidence = await handler.studioDialogDiagnostics();
+        assert.equal(evidence.failureSnapshot.count, 12);
+        assert.equal(evidence.failureSnapshot.dialogs.length, 10);
+        assert.equal(evidence.failureSnapshot.truncated, true);
+        assert.equal(evidence.failureSnapshot.dialogs[0].ariaModal, "other");
+        for (const secret of ["private@example.com", "123456", "password-secret"])
+            assert.ok(!JSON.stringify(evidence).includes(secret));
     }
 );

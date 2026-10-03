@@ -2,6 +2,7 @@
 // Compatibility rules informed by iBUHub/AIStudioToAPI saveAuth.js
 // (Ellinav, iBenzene, bbbugg), CC BY-NC 4.0; see integration acceptance record.
 const { performance } = require("node:perf_hooks");
+const snapshotDialogs = require("./LoginDialogDiagnostics");
 const failure = reason => Object.assign(new Error(reason), { reason });
 const termsText =
     /terms of service|terms of use|Google APIs? terms|additional terms|服务条款|使用条款|服務條款|附加条款/i;
@@ -163,10 +164,22 @@ class LoginPageHandlers {
         if (new URL(this.page.url()).hostname !== "aistudio.google.com") return false;
         const end = Math.min(limit, this.deadline, performance.now() + this.stepTimeout);
         const dialogs = this.page.locator('[role="dialog"]').filter({ visible: true });
-        for (let index = 0; index < Math.min(await dialogs.count(), 5); index++) {
+        this.transitionDiagnostics = { scanCount: null, scannedDialogs: [] };
+        const countDialogs = async () => {
+            const count = await dialogs.count();
+            this.transitionDiagnostics.scanCount ??= count;
+            return count;
+        };
+        for (let index = 0; index < Math.min(await countDialogs(), 5); index++) {
             this.guard();
             const dialog = dialogs.nth(index);
-            const text = await this.snapshot(dialog);
+            this.operation = "terms_read";
+            const observed = await this.interaction.operation("text_read", () =>
+                dialog.evaluateAll(snapshotDialogs, true)
+            );
+            this.transitionDiagnostics.viewport ??= observed.viewport;
+            const text = observed.dialogs[0]?.text ?? null;
+            this.transitionDiagnostics.scannedDialogs.push(observed.dialogs[0]?.summary || { disappeared: true });
             // Observed informational spending-cap hint, never its settings action.
             if (
                 !/New.*control API costs|新功能[：:].*控制 API 费用/i.test(text) ||
@@ -181,6 +194,7 @@ class LoginPageHandlers {
                     box.width * box.height < (innerWidth * innerHeight) / 4
                 );
             });
+            this.transitionDiagnostics.scannedDialogs.at(-1).nonblockingResult = nonblocking;
             if (!nonblocking) continue;
             this.phase("aistudio_transition");
             const close = dialog.getByRole("button", { name: /^(Close|Dismiss|关闭|關閉)$/i }).first();
@@ -199,6 +213,31 @@ class LoginPageHandlers {
             return true;
         }
         return false;
+    }
+    async studioDialogDiagnostics() {
+        // Failure was already decided. Bound best-effort collection so it cannot
+        // replace that failure or consume a full UI operation timeout.
+        const budget = Math.max(1, Math.min(500, this.deadline - performance.now()));
+        let timer;
+        let failureSnapshot;
+        try {
+            failureSnapshot = await Promise.race([
+                this.page
+                    .locator(
+                        '[role="dialog"], [aria-modal="true"], dialog, mat-dialog-container, .mat-mdc-dialog-container, .cdk-overlay-pane, .mdc-dialog'
+                    )
+                    .evaluateAll(snapshotDialogs)
+                    .then(snapshot => ({ status: "captured", ...snapshot })),
+                new Promise(resolve => {
+                    timer = setTimeout(() => resolve({ status: "capture_timeout" }), budget);
+                }),
+            ]);
+        } catch {
+            failureSnapshot = { status: "capture_failed" };
+        } finally {
+            clearTimeout(timer);
+        }
+        return { failureSnapshot, transitionScan: this.transitionDiagnostics };
     }
     remaining(end) {
         this.guard();
