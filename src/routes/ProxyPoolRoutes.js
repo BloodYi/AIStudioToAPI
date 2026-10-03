@@ -1,6 +1,7 @@
 class ProxyPoolRoutes {
     constructor(serverSystem) {
         this.service = serverSystem.proxyPoolService;
+        this.distIndexPath = serverSystem.distIndexPath;
     }
 
     setupRoutes(app, isAuthenticated) {
@@ -11,6 +12,7 @@ class ProxyPoolRoutes {
                 res.status(error.status || 500).json({ error: error.message });
             }
         };
+        app.get("/proxy-pool", isAuthenticated, (_req, res) => res.sendFile(this.distIndexPath));
         app.use("/api/proxy-pool", isAuthenticated);
         app.get(
             "/api/proxy-pool/status",

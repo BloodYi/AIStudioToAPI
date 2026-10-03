@@ -2625,11 +2625,12 @@ const fileInput = ref(null);
 const accountsPage = ref(null);
 const usageStatsImportInput = ref(null);
 const route = useRoute();
-const activeTab = ref(route.path === "/accounts" ? "accounts" : "home");
+const tabForPath = path => ({ "/accounts": "accounts", "/proxy-pool": "proxy-pool" })[path] || "home";
+const activeTab = ref(tabForPath(route.path));
 watch(
     () => route.path,
     path => {
-        activeTab.value = path === "/accounts" ? "accounts" : "home";
+        activeTab.value = tabForPath(path);
     }
 );
 const isDownloadingUsageStats = ref(false);
@@ -3597,7 +3598,8 @@ const openLogSettings = async () => {
 
 const switchTab = tabName => {
     if (tabName === "accounts") router.push("/accounts");
-    else if (route.path === "/accounts")
+    else if (tabName === "proxy-pool") router.push("/proxy-pool");
+    else if (["/accounts", "/proxy-pool"].includes(route.path))
         router.push("/").then(() => {
             activeTab.value = tabName;
         });

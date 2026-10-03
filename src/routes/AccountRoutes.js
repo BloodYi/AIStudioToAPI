@@ -46,6 +46,7 @@ class AccountRoutes {
                 size = Math.min(100, Math.max(1, Number(req.query.pageSize) || 25));
             return { accounts: accounts.slice((page - 1) * size, page * size), total: accounts.length };
         });
+        route("post", "/accounts/batch/cancel-login", (service, req) => service.batchCancelLogin(req.body));
         route("post", "/accounts", (service, req) => service.create(req.body), 202);
         route("patch", "/accounts/batch/recovery", (service, req) => service.setRecovery(req.body));
         route("post", "/export/credentials", (service, req, res) => {

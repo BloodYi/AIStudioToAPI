@@ -244,3 +244,384 @@ test(
         assert.deepEqual(errors, []);
     }
 );
+
+async function browserFixture(t) {
+    const server = await createServer({
+        configFile: path.resolve(__dirname, "../vite.config.js"),
+        logLevel: "error",
+        server: { host: "127.0.0.1", port: 0, strictPort: false },
+    });
+    t.after(() => server.close());
+    await server.listen();
+    const browser = await chromium.launch({ args: ["--no-sandbox"] });
+    t.after(() => browser.close());
+    const page = await browser.newPage();
+    await page.route("**/locales/*.json", route =>
+        route.fulfill({
+            body: fs.readFileSync(path.resolve(__dirname, "../ui/locales/en.json"), "utf8"),
+            contentType: "application/json",
+        })
+    );
+    return { page, url: `http://127.0.0.1:${server.httpServer.address().port}` };
+}
+
+test(
+    "account selections span pages, preview choices stay constrained, and cancellation covers in-flight login",
+    { skip: !fs.existsSync(chromium.executablePath()) },
+    async t => {
+        const { page, url } = await browserFixture(t);
+        let accounts = Array.from({ length: 55 }, (_, i) => ({
+            accountId: `id-${i}`,
+            authIndex: null,
+            autoRecovery: true,
+            credentialVersion: 1,
+            email: `user${i}@example.com`,
+            hasPassword: true,
+            recoveryState: "idle",
+            sessionState: "missing",
+        }));
+        const queries = [],
+            loginIds = [],
+            cancelIds = [],
+            importBodies = [];
+        let releaseLogin, releaseImport;
+        await page.route("**/api/**", async route => {
+            const request = route.request(),
+                u = new URL(request.url());
+            let result = {};
+            if (u.pathname === "/api/status" || u.pathname === "/api/status/core")
+                result = { status: { accountDetails: [], currentAuthIndex: -1 } };
+            else if (u.pathname.endsWith("/login-queue"))
+                result = { autoRecovery: false, concurrency: 1, executions: [] };
+            else if (u.pathname === "/api/account-management/accounts") {
+                queries.push(Object.fromEntries(u.searchParams));
+                const matches = accounts.filter(row => row.email.includes(u.searchParams.get("search") || ""));
+                const size = Number(u.searchParams.get("pageSize")),
+                    cursor = Number(u.searchParams.get("page"));
+                result = { accounts: matches.slice((cursor - 1) * size, cursor * size), total: matches.length };
+            } else if (u.pathname.endsWith("/batch/cancel-login")) {
+                cancelIds.push(request.postDataJSON().accountIds);
+                result = {
+                    cancelled: cancelIds.at(-1).length,
+                    failed: 0,
+                    results: cancelIds.at(-1).map(accountId => ({ accountId, status: "cancelled" })),
+                    stopping: 0,
+                    unnecessary: 0,
+                };
+            } else if (u.pathname.endsWith("/login")) {
+                loginIds.push(u.pathname.split("/").at(-2));
+                await new Promise(resolve => {
+                    releaseLogin = resolve;
+                });
+                result = { taskId: "dispatched-task" };
+            } else if (u.pathname.endsWith("/import/preview"))
+                result = {
+                    complete: true,
+                    previewId: "preview",
+                    rows: [
+                        { accountId: null, email: "new@example.com", index: 0 },
+                        { accountId: "id-0", conflict: true, email: "user0@example.com", index: 1 },
+                        { email: "bad", error: "Invalid email", index: 2 },
+                        { accountId: "id-1", email: "user1@example.com", index: 3, unchanged: true },
+                        { accountId: "id-2", email: "user2@example.com", index: 4 },
+                    ],
+                };
+            else if (u.pathname.endsWith("/import/commit")) {
+                importBodies.push(request.postDataJSON());
+                await new Promise(resolve => {
+                    releaseImport = resolve;
+                });
+                result = { created: 1, failed: 0, loginQueued: 0, loginWarnings: [], skipped: 2, updated: 2 };
+            } else if (request.method() === "DELETE")
+                accounts = accounts.filter(row => row.accountId !== u.pathname.split("/").at(-1));
+            await route.fulfill({ json: result });
+        });
+        await page.goto(`${url}/accounts`);
+        const rows = page.locator(".accounts-panel .el-table__body-wrapper tbody tr");
+        await page.waitForFunction(
+            () => document.querySelectorAll(".accounts-panel .el-table__body-wrapper tbody tr").length === 20
+        );
+        assert.equal(queries.at(-1).pageSize, "20");
+        await page.getByRole("button", { exact: true, name: "Select this page" }).click();
+        await page.getByRole("button", { exact: true, name: "Select this page" }).click();
+        assert.match(await page.locator(".batch-toolbar").innerText(), /Selected 20/);
+        const pagination = page.locator(".accounts-panel > .el-pagination");
+        await pagination.getByLabel("Go to next page").click();
+        await page.waitForFunction(() =>
+            document
+                .querySelector(".accounts-panel .el-table__body-wrapper")
+                ?.textContent.includes("user20@example.com")
+        );
+        await rows.first().locator(".el-checkbox").click();
+        assert.match(await page.locator(".batch-toolbar").innerText(), /Selected 21/);
+        await page.getByRole("button", { exact: true, name: "Cancel selected logins" }).click();
+        await page.waitForFunction(() =>
+            document.querySelector(".cancel-result")?.textContent.includes("Cancelled 21")
+        );
+        assert.equal(cancelIds[0].length, 21);
+        await page.getByRole("button", { exact: true, name: "Clear selection" }).click();
+        assert.match(await page.locator(".batch-toolbar").innerText(), /Selected 0/);
+        await rows.first().locator(".el-checkbox").click();
+        await page.getByPlaceholder("Search email / account index").fill("user1@");
+        await page.waitForFunction(
+            () => document.querySelectorAll(".accounts-panel .el-table__body-wrapper tbody tr").length === 1
+        );
+        assert.match(await page.locator(".batch-toolbar").innerText(), /Selected 0/);
+        await page.getByPlaceholder("Search email / account index").fill("");
+        await page.waitForFunction(
+            () => document.querySelectorAll(".accounts-panel .el-table__body-wrapper tbody tr").length === 20
+        );
+        await pagination.locator(".el-select").click();
+        await page.getByRole("option", { exact: true, name: "50/page" }).click();
+        await page.waitForFunction(
+            () => document.querySelectorAll(".accounts-panel .el-table__body-wrapper tbody tr").length === 50
+        );
+        assert.equal(queries.at(-1).page, "1");
+        assert.equal(queries.at(-1).pageSize, "50");
+        await pagination.locator(".el-select").click();
+        await page.getByRole("option", { exact: true, name: "100/page" }).click();
+        await page.waitForFunction(
+            () => document.querySelectorAll(".accounts-panel .el-table__body-wrapper tbody tr").length === 55
+        );
+        assert.equal(queries.at(-1).pageSize, "100");
+        await page.getByRole("button", { exact: true, name: "Select this page" }).click();
+        await page.getByRole("button", { exact: true, name: "Log in selected" }).click();
+        await page
+            .waitForRequest(request => request.url().endsWith("/batch/cancel-login"), { timeout: 100 })
+            .catch(() => {});
+        assert.equal(loginIds.length, 1);
+        await page.getByRole("button", { exact: true, name: "Cancel selected logins" }).click();
+        assert.equal(cancelIds.length, 1);
+        releaseLogin();
+        await page.waitForFunction(() =>
+            document.querySelector(".cancel-result")?.textContent.includes("Cancelled 55")
+        );
+        assert.equal(loginIds.length, 1);
+        assert.equal(cancelIds[1].length, 55);
+        assert.match(await page.locator(".batch-toolbar").innerText(), /Selected 55/);
+        await page.getByRole("button", { exact: true, name: "Import credentials / authenticator" }).click();
+        const dialog = page.getByRole("dialog", { exact: true, name: "Import preview" });
+        await dialog.getByRole("button", { exact: true, name: "Preview" }).click();
+        await dialog.getByText("New account will be created", { exact: true }).first().waitFor();
+        assert.equal(await dialog.getByText("Create record without login", { exact: true }).count(), 0);
+        await dialog.getByText("Skip all", { exact: true }).click();
+        await dialog.getByText("Skip all", { exact: true }).click();
+        const previewRows = dialog.locator(".el-table__body-wrapper tbody tr");
+        assert.equal(await previewRows.nth(2).getByRole("checkbox", { exact: true, name: "Skip" }).isChecked(), true);
+        assert.equal(await previewRows.nth(2).getByRole("checkbox", { exact: true, name: "Skip" }).isDisabled(), true);
+        await previewRows.nth(0).getByText("Skip", { exact: true }).click();
+        assert.equal(
+            await dialog.getByText("Skip all", { exact: true }).locator("..").locator(".is-indeterminate").count(),
+            1
+        );
+        await previewRows.nth(0).getByText("Skip", { exact: true }).click();
+        await dialog.getByText("Overwrite all", { exact: true }).click();
+        await previewRows.nth(4).getByText("Overwrite", { exact: true }).click();
+        assert.equal(
+            await dialog.getByText("Overwrite all", { exact: true }).locator("..").locator(".is-indeterminate").count(),
+            1
+        );
+        await dialog.getByText("Overwrite all", { exact: true }).click();
+        await dialog.getByRole("button", { exact: true, name: "Commit import" }).click();
+        await page.waitForFunction(() => document.querySelector(".el-dialog button.is-loading"));
+        assert.equal(await dialog.getByRole("checkbox", { exact: true, name: "Skip all" }).isDisabled(), true);
+        assert.deepEqual(
+            importBodies[0].rows.map(row => row.skip),
+            [false, false, true, true, false]
+        );
+        releaseImport();
+        await dialog
+            .locator(".import-result")
+            .getByText(/Created 1/)
+            .waitFor();
+        assert.equal(await dialog.getByRole("button", { exact: true, name: "Commit import" }).isDisabled(), true);
+        await dialog.locator(".el-dialog__headerbtn").click();
+        await dialog.waitFor({ state: "hidden" });
+        await pagination.locator(".el-select").click();
+        await page.getByRole("option", { exact: true, name: "20/page" }).click();
+        await page.waitForFunction(
+            () => document.querySelectorAll(".accounts-panel .el-table__body-wrapper tbody tr").length === 20
+        );
+        await pagination.getByLabel("Go to next page").click();
+        await page.waitForFunction(() =>
+            document
+                .querySelector(".accounts-panel .el-table__body-wrapper")
+                ?.textContent.includes("user20@example.com")
+        );
+        await pagination.getByLabel("Go to next page").click();
+        await page.waitForFunction(
+            () => document.querySelectorAll(".accounts-panel .el-table__body-wrapper tbody tr").length === 15
+        );
+        assert.match(await page.locator(".batch-toolbar").innerText(), /Selected 55/);
+        const emptyPage = page.waitForResponse(response => {
+            const requestUrl = new URL(response.url());
+            return (
+                requestUrl.pathname === "/api/account-management/accounts" &&
+                requestUrl.searchParams.get("page") === "1"
+            );
+        });
+        await page.getByRole("button", { exact: true, name: "Delete selected" }).click();
+        await page.locator(".el-message-box__btns button").last().click();
+        await page.waitForFunction(() => document.querySelector(".batch-toolbar")?.textContent.includes("Selected 0"));
+        await emptyPage;
+        assert.equal(queries.at(-1).page, "1");
+        assert.equal(accounts.length, 0);
+    }
+);
+
+test(
+    "proxy pool keeps all mobile actions and contains long text and dialogs at supported widths",
+    { skip: !fs.existsSync(chromium.executablePath()) },
+    async t => {
+        const { page, url } = await browserFixture(t);
+        const writes = [],
+            errors = [];
+        page.on("pageerror", error => errors.push(error.message));
+        const long = "Very-long-name-".repeat(10);
+        const node = {
+            boundAccounts: 0,
+            enabled: true,
+            exitIp: "2001:db8::1234",
+            host: "2001:db8:1234:5678:9abc:def0:1234:5678",
+            id: "node",
+            latencyMs: 42,
+            localPort: 10801,
+            name: long,
+            port: 1080,
+            status: "ready",
+            type: "socks5",
+        };
+        await page.route("**/api/**", async route => {
+            const request = route.request(),
+                u = new URL(request.url());
+            let result = {};
+            if (request.method() !== "GET")
+                writes.push({ body: request.postDataJSON(), method: request.method(), path: u.pathname });
+            if (u.pathname === "/api/status" || u.pathname === "/api/status/core")
+                result = { status: { accountDetails: [], currentAuthIndex: -1 } };
+            else if (u.pathname === "/api/account-management/accounts") result = { accounts: [], total: 0 };
+            else if (u.pathname.endsWith("/proxy-pool/status"))
+                result = {
+                    bindingCount: 1,
+                    enabled: true,
+                    mihomo: { lastError: long, ready: true, version: long },
+                    nodeCount: 1,
+                };
+            else if (u.pathname.endsWith("/nodes")) result = { nodes: [node] };
+            else if (u.pathname.endsWith("/subscriptions"))
+                result = {
+                    subscriptions: [
+                        {
+                            id: "sub",
+                            lastRefreshedAt: "2026-10-03T10:00:00Z",
+                            name: long,
+                            nodeCount: 1,
+                            url: `https://example.com/${"x".repeat(120)}?token=***`,
+                        },
+                    ],
+                };
+            else if (u.pathname.endsWith("/bindings"))
+                result = {
+                    bindings: [
+                        {
+                            accountKey: "account",
+                            accountName: `${long}@example.com`,
+                            authIndex: 0,
+                            desiredNodeId: "node",
+                            inflight: 2,
+                            proxySource: long,
+                            state: "pending",
+                        },
+                    ],
+                };
+            else if (u.pathname.endsWith("/test")) result = { latencyMs: 42 };
+            else if (u.pathname.endsWith("/refresh")) result = { nodeCount: 1 };
+            else if (u.pathname.endsWith("/import")) result = { added: [node], errors: [], nodes: [node], skipped: 0 };
+            else if (u.pathname.endsWith("/delete")) result = { deleted: 1, deletedNodes: 1, deletedSubscriptions: 1 };
+            await route.fulfill({ json: result });
+        });
+        await page.goto(`${url}/proxy-pool`);
+        const pool = page.locator(".proxy-pool");
+        await pool.getByText("42 ms", { exact: false }).first().waitFor({ state: "attached" });
+        const assertFits = async () => {
+            const widths = await page.evaluate(() => ({
+                body: document.documentElement.scrollWidth,
+                viewport: innerWidth,
+            }));
+            assert.ok(widths.body <= widths.viewport + 1, JSON.stringify(widths));
+        };
+        const assertDialogFits = async dialog => {
+            const box = await dialog.boundingBox();
+            assert.ok(box.x >= 0 && box.x + box.width <= page.viewportSize().width + 1, JSON.stringify(box));
+            assert.ok(await dialog.getByRole("button", { exact: true, name: "保存" }).isVisible());
+            await assertFits();
+        };
+        for (const width of [320, 375, 390, 414, 768, 1280, 844]) {
+            await page.setViewportSize({ height: width === 844 ? 390 : 900, width });
+            await assertFits();
+            assert.equal(
+                await pool.locator(".desktop-list").first().isVisible(),
+                (await pool.boundingBox()).width >= 768
+            );
+            await pool.getByRole("button", { exact: true, name: "添加节点" }).click();
+            const dialog = page.getByRole("dialog", { exact: true, name: "添加节点" });
+            await assertDialogFits(dialog);
+            await dialog.getByRole("button", { exact: true, name: "取消" }).click();
+        }
+        await page.setViewportSize({ height: 812, width: 375 });
+        const nodes = pool
+            .locator(".pool-card")
+            .filter({ has: page.getByRole("heading", { exact: true, name: "代理节点" }) });
+        const subscriptions = pool
+            .locator(".pool-card")
+            .filter({ has: page.getByRole("heading", { exact: true, name: "订阅（手动刷新）" }) });
+        const bindings = pool
+            .locator(".pool-card")
+            .filter({ has: page.getByRole("heading", { exact: true, name: "账号出口" }) });
+        await nodes.locator(".mobile-item .el-checkbox").click();
+        assert.equal(await nodes.getByRole("button", { exact: true, name: "删除选中" }).isEnabled(), true);
+        await nodes.locator(".mobile-item").getByRole("button", { exact: true, name: "测试" }).click();
+        await nodes.locator(".mobile-item").getByRole("button", { exact: true, name: "编辑" }).click();
+        await assertDialogFits(page.getByRole("dialog", { exact: true, name: "编辑节点" }));
+        await page.getByRole("dialog").getByRole("button", { exact: true, name: "保存" }).click();
+        await page.getByRole("dialog").waitFor({ state: "hidden" });
+        await nodes.getByRole("button", { exact: true, name: "批量导入" }).click();
+        const importing = page.getByRole("dialog", { exact: true, name: "批量导入分享链接 / Clash / Base64" });
+        await importing.getByRole("textbox").fill("socks5://example.com:1080");
+        await assertFits();
+        await importing.getByRole("button", { exact: true, name: "预览" }).click();
+        await importing.getByRole("button", { exact: true, name: "导入" }).click();
+        await importing.waitFor({ state: "hidden" });
+        await subscriptions.getByRole("button", { exact: true, name: "添加订阅" }).click();
+        const subscription = page.getByRole("dialog", { exact: true, name: "添加订阅" });
+        await assertDialogFits(subscription);
+        await subscription.getByPlaceholder("名称").fill("Subscription");
+        await subscription.getByPlaceholder("https://...").fill("https://example.com/masked");
+        await subscription.getByRole("button", { exact: true, name: "保存" }).click();
+        await subscription.waitFor({ state: "hidden" });
+        await subscriptions.locator(".mobile-item .el-checkbox").click();
+        await subscriptions.locator(".mobile-item").getByRole("button", { exact: true, name: "刷新" }).click();
+        await bindings.locator(".mobile-item .el-checkbox").click();
+        assert.equal(await bindings.getByRole("button", { exact: true, name: "保存选中绑定" }).isEnabled(), true);
+        await bindings.locator(".mobile-item").getByRole("button", { exact: true, name: "保存绑定" }).click();
+        await bindings.locator(".mobile-item").getByRole("button", { exact: true, name: "应用" }).click();
+        await pool.getByRole("button", { exact: true, name: "保存测试设置" }).click();
+        await nodes.locator(".mobile-item .el-checkbox").click();
+        await nodes.getByRole("button", { exact: true, name: "删除选中" }).click();
+        await page.locator(".el-message-box__btns button").last().click();
+        await subscriptions.locator(".mobile-item .el-checkbox").click();
+        await subscriptions.getByRole("button", { exact: true, name: "删除选中" }).click();
+        await page.locator(".el-message-box__btns button").last().click();
+        // Also check the account-page parent container used by the existing sidebar flow.
+        await page.goto(`${url}/accounts`);
+        await page.locator('button[title="节点池"]').click();
+        await pool.waitFor();
+        await assertFits();
+        await page.screenshot({ fullPage: true, path: "/tmp/proxy-pool-mobile.png" });
+        assert.ok(writes.some(write => write.path.endsWith("/test")));
+        assert.ok(writes.some(write => write.method === "PUT" && write.path.endsWith("/nodes/node")));
+        assert.ok(writes.some(write => write.path.endsWith("/subscriptions/sub/refresh")));
+        assert.ok(writes.some(write => write.path.endsWith("/bindings/account/apply")));
+        assert.deepEqual(errors, []);
+    }
+);

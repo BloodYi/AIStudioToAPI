@@ -198,6 +198,7 @@ class AccountLoginService {
             isDuplicate:
                 account.authIndex !== null &&
                 (this.system.authSource.duplicateIndices || []).includes(account.authIndex),
+            loginStopping: this.isLoginStopping(account.accountId),
             nextAttemptAt: task?.nextAttemptAt || null,
         };
     }
@@ -309,7 +310,10 @@ class AccountLoginService {
             "clearTotpSecret",
         ].some(key => input[key] !== undefined);
         if (changes) {
+            const manuallyStopped =
+                account.recoveryState === "manual_required" && account.lastFailure?.error === "cancelled";
             this.invalidate(account);
+            if (manuallyStopped) account.recoveryState = "manual_required";
             account.credentialVersion++;
         }
         if (input.email !== undefined) account.email = emailKey(input.email);
@@ -324,7 +328,15 @@ class AccountLoginService {
         await this.save();
         return this.publicAccount(account);
     }
+    isLoginStopping(accountId) {
+        return this.state.tasks.some(
+            task =>
+                task.accountId === accountId && !active(task) && (task.executor || this.queue.running.has(task.taskId))
+        );
+    }
     enqueue(account, source) {
+        if (this.isLoginStopping(account.accountId))
+            throw error("Previous login executor is still stopping; retry later", 409);
         if (this.deduplicating) throw error("Account deduplication is in progress", 409);
         const existing = this.state.tasks.find(task => task.accountId === account.accountId && active(task));
         if (existing) {
@@ -381,13 +393,46 @@ class AccountLoginService {
         const task = this.state.tasks.find(item => item.taskId === id);
         if (!task) throw error("Task not found", 404);
         if (active(task)) {
+            task.history.push({ attempt: task.attempts, endedAt: Date.now(), error: "cancelled", phase: task.phase });
             this.failTask(task, "cancelled");
-            const account = this.account(task.accountId);
-            account.recoveryState = "idle";
         }
         await this.save();
+        // The queue completion needs this same service lock: never await it here.
         setImmediate(() => this.queue.cancel(id).catch(() => {}));
-        return { status: task.status };
+        return { status: task.status, stopping: this.isLoginStopping(task.accountId) };
+    }
+    async batchCancelLogin(input) {
+        const ids = input?.accountIds;
+        if (
+            !Array.isArray(ids) ||
+            !ids.length ||
+            ids.length > 1000 ||
+            ids.some(id => typeof id !== "string" || !id || id.length > 256)
+        )
+            throw error("Select 1–1000 account IDs");
+        const result = { cancelled: 0, failed: 0, results: [], stopping: 0, unnecessary: 0 };
+        for (const accountId of new Set(ids)) {
+            try {
+                this.account(accountId);
+                const tasks = this.state.tasks.filter(task => task.accountId === accountId && active(task));
+                for (const task of tasks) await this.cancel(task.taskId);
+                const status = this.isLoginStopping(accountId)
+                    ? "stopping"
+                    : tasks.length
+                      ? "cancelled"
+                      : "unnecessary";
+                result[status]++;
+                result.results.push({ accountId, status });
+            } catch (cause) {
+                result.failed++;
+                result.results.push({
+                    accountId,
+                    error: cause.status ? cause.message : "Account service unavailable",
+                    status: "failed",
+                });
+            }
+        }
+        return result;
     }
     async scanRecovery() {
         if (this.deduplicating) return;
@@ -396,6 +441,7 @@ class AccountLoginService {
             if (
                 account.sessionState === "expired" &&
                 account.autoRecovery &&
+                !this.isLoginStopping(account.accountId) &&
                 ["idle", "queued", "credentials_missing"].includes(account.recoveryState)
             ) {
                 if (account.authIndex !== null && this.system.scheduler?.isAccountManuallyDisabled(account.authIndex))
@@ -780,7 +826,8 @@ class AccountLoginService {
         if (preview.result) return preview.result;
         if (!preview.complete) throw error("Migration batch is incomplete", 409);
         if (!Array.isArray(input.rows) || input.rows.length > 1000) throw error("Invalid import choices");
-        const result = { created: 0, errors: [], failed: 0, skipped: 0, updated: 0 },
+        const autoLogin = this.state.config.autoRecovery;
+        const result = { created: 0, errors: [], failed: 0, loginQueued: 0, loginWarnings: [], skipped: 0, updated: 0 },
             seen = new Set();
         for (const choice of input.rows) {
             const row = preview.rows[choice.index];
@@ -794,11 +841,11 @@ class AccountLoginService {
                 if (row.error) throw error(row.error);
                 const accountId = choice.accountId || row.accountId;
                 if (!accountId) {
-                    if (preview.kind !== "csv" || !choice.create || !row.email) {
+                    if (preview.kind !== "csv" || !row.email) {
                         result.skipped++;
                         continue;
                     }
-                    await this.create(
+                    const created = await this.create(
                         {
                             email: row.email,
                             password: row.password,
@@ -808,6 +855,20 @@ class AccountLoginService {
                         false
                     );
                     result.created++;
+                    if (autoLogin && created.account.autoRecovery) {
+                        try {
+                            this.enqueue(this.account(created.account.accountId), "new");
+                            await this.save();
+                            result.loginQueued++;
+                        } catch (cause) {
+                            if (!cause.status) throw cause;
+                            result.loginWarnings.push({
+                                accountId: created.account.accountId,
+                                error: cause.message,
+                                index: choice.index,
+                            });
+                        }
+                    }
                     continue;
                 }
                 const account = this.account(accountId);
@@ -830,6 +891,7 @@ class AccountLoginService {
                 });
                 result.updated++;
             } catch (cause) {
+                if (this.storageFailed) throw cause;
                 result.failed++;
                 result.errors.push({ error: cause.message, index: choice.index });
             }

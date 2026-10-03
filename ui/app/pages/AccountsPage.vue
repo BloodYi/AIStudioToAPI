@@ -91,10 +91,30 @@
             }}</ElButton>
         </div>
         <div class="account-toolbar batch-toolbar">
-            <span>{{ l("已选", "Selected") }} {{ selected.length }}</span>
-            <ElButton size="small" :disabled="!selected.length || busy" @click="batchLogin">{{
-                l("批量重新登录", "Log in selected")
+            <span
+                >{{ l("已选", "Selected") }} {{ selected.length }}
+                {{ text("accountSelectedAcrossPages", "个（含其他页）", "(including other pages)") }}</span
+            >
+            <ElButton size="small" @click="selectPage">{{
+                text("accountSelectPage", "全选本页", "Select this page")
             }}</ElButton>
+            <ElButton size="small" @click="clearSelection">{{
+                text("accountClearSelection", "取消全选", "Clear selection")
+            }}</ElButton>
+            <ElButton
+                size="small"
+                :disabled="!selected.length || cancelling"
+                :loading="cancelling"
+                @click="batchCancelLogin"
+                >{{ text("accountCancelSelectedLogins", "批量取消登录", "Cancel selected logins") }}</ElButton
+            >
+            <ElButton
+                size="small"
+                :disabled="!selected.length || busy || loginSubmitting || cancelling"
+                :loading="loginSubmitting"
+                @click="batchLogin"
+                >{{ l("批量重新登录", "Log in selected") }}</ElButton
+            >
             <ElButton size="small" :disabled="!selected.length || busy" @click="batchRecovery(true)">{{
                 l("启用自动恢复", "Enable auto recovery")
             }}</ElButton>
@@ -117,6 +137,17 @@
                 >{{ l("批量删除", "Delete selected") }}</ElButton
             >
         </div>
+        <p v-if="cancelResult" class="cancel-result">
+            {{ text("accountLoginCancelled", "取消成功", "Cancelled") }}
+            {{ cancelResult.cancelled + cancelResult.stopping - stoppingIds.length }} ·
+            {{ text("accountLoginCancelUnnecessary", "无需取消", "No cancellation needed") }}
+            {{ cancelResult.unnecessary }} · {{ text("accountLoginStopping", "执行器仍在停止", "Executors stopping") }}
+            {{ stoppingIds.length }} · {{ l("失败", "Failed") }}
+            {{ cancelResult.failed }}
+        </p>
+        <p v-for="result in cancelResult?.results.filter(item => item.error) || []" :key="result.accountId">
+            {{ result.accountId }}: {{ result.error }}
+        </p>
         <ElTable ref="accountTable" :data="accounts" row-key="accountId" @selection-change="selected = $event">
             <ElTableColumn type="selection" width="45" reserve-selection />
             <ElTableColumn :label="l('账号', 'Account')" min-width="210">
@@ -149,6 +180,9 @@
                     <span :class="['state-text', 'state-' + row.recoveryState]">{{
                         stateLabel(row.recoveryState)
                     }}</span>
+                    <small v-if="row.loginStopping">{{
+                        text("accountLoginStopping", "执行器仍在停止", "Executors stopping")
+                    }}</small>
                     <small v-if="row.lastFailure?.error" class="failure-reason">{{ row.lastFailure.error }}</small>
                 </template>
             </ElTableColumn>
@@ -215,10 +249,10 @@
         </ElTable>
         <ElPagination
             v-model:current-page="page"
-            :page-size="25"
+            v-model:page-size="pageSize"
+            :page-sizes="[20, 50, 100]"
             :total="total"
-            layout="prev, pager, next, total"
-            @current-change="refresh"
+            layout="total, sizes, prev, pager, next"
         />
         <ElDialog
             v-model="editVisible"
@@ -270,19 +304,20 @@
             >
         </ElDialog>
         <ElDialog v-model="importVisible" :title="l('导入预览', 'Import preview')" width="85%" @closed="clearImport">
-            <ElSelect v-model="importKind"
+            <ElSelect v-model="importKind" :disabled="importBusy"
                 ><ElOption
                     label="CSV: email,password,recovery_email,totp_secret (兼容 totpSecret)"
                     value="csv" /><ElOption label="Authenticator / otpauth-migration / Base32" value="authenticator"
             /></ElSelect>
-            <input type="file" accept=".csv,.txt" @change="readImportFile" />
+            <input type="file" :disabled="importBusy" accept=".csv,.txt" @change="readImportFile" />
             <ElInput
                 v-model="importContent"
+                :disabled="importBusy"
                 type="textarea"
                 :rows="5"
                 :placeholder="l('粘贴 CSV 或验证器链接 / 密钥', 'Paste CSV or authenticator links / secrets')"
             />
-            <ElButton @click="previewImport">{{ l("解析预览", "Preview") }}</ElButton>
+            <ElButton :disabled="importBusy" @click="previewImport">{{ l("解析预览", "Preview") }}</ElButton>
             <p v-if="preview && !preview.complete">
                 {{
                     l(
@@ -291,6 +326,31 @@
                     )
                 }}
             </p>
+            <div v-if="preview" class="account-toolbar">
+                <span>{{
+                    queue.autoRecovery
+                        ? text(
+                              "accountImportAutoLogin",
+                              "新账号导入后将自动登录",
+                              "New accounts will queue for automatic login"
+                          )
+                        : text("accountImportSaveOnly", "新账号仅创建记录", "New accounts will only be saved")
+                }}</span>
+                <ElCheckbox
+                    :model-value="skipState.checked"
+                    :indeterminate="skipState.partial"
+                    :disabled="importLocked || !actionableRows.length"
+                    @change="value => bulkChoice(actionableRows, 'skip', value)"
+                    >{{ text("accountImportSkipAll", "全部跳过", "Skip all") }}</ElCheckbox
+                >
+                <ElCheckbox
+                    :model-value="overwriteState.checked"
+                    :indeterminate="overwriteState.partial"
+                    :disabled="importLocked || !overwriteRows.length"
+                    @change="value => bulkChoice(overwriteRows, 'overwrite', value)"
+                    >{{ text("accountImportOverwriteAll", "全部覆盖", "Overwrite all") }}</ElCheckbox
+                >
+            </div>
             <ElTable v-if="preview" :data="preview.rows">
                 <ElTableColumn prop="email" label="Email" />
                 <ElTableColumn prop="error" :label="l('问题', 'Issue')" />
@@ -299,6 +359,7 @@
                         <ElSelect
                             v-if="importKind === 'authenticator'"
                             v-model="choices[row.index].accountId"
+                            :disabled="importLocked || !!row.error || row.unchanged"
                             clearable
                             :placeholder="l('选择账号或跳过', 'Select account or skip')"
                             ><ElOption
@@ -307,16 +368,22 @@
                                 :value="account.accountId"
                                 :label="account.email || account.displayName"
                         /></ElSelect>
-                        <ElCheckbox v-else-if="!row.accountId" v-model="choices[row.index].create">{{
-                            l("创建记录，不立即登录", "Create record without login")
-                        }}</ElCheckbox>
+                        <span v-else-if="!row.accountId">{{
+                            text("accountImportNewRecord", "将创建新账号", "New account will be created")
+                        }}</span>
                         <span v-else>{{ l("匹配已有账号", "Existing account matched") }}</span>
                     </template></ElTableColumn
                 >
                 <ElTableColumn :label="l('显式覆盖 / 跳过', 'Overwrite / skip')"
                     ><template #default="{ row }"
-                        ><ElCheckbox v-model="choices[row.index].overwrite">{{ l("覆盖", "Overwrite") }}</ElCheckbox
-                        ><ElCheckbox v-model="choices[row.index].skip">{{ l("跳过", "Skip") }}</ElCheckbox
+                        ><ElCheckbox
+                            v-model="choices[row.index].overwrite"
+                            :disabled="importLocked || !choices[row.index].accountId || !!row.error || row.unchanged"
+                            >{{ l("覆盖", "Overwrite") }}</ElCheckbox
+                        ><ElCheckbox
+                            v-model="choices[row.index].skip"
+                            :disabled="importLocked || !!row.error || row.unchanged"
+                            >{{ l("跳过", "Skip") }}</ElCheckbox
                         ><span v-if="row.hasRecoveryEmail">{{ l("恢复邮箱已配置", "Recovery email configured") }} </span
                         ><span v-if="row.conflict"
                             >⚠
@@ -329,11 +396,45 @@
                     ></ElTableColumn
                 >
             </ElTable>
-            <p v-if="importResult">{{ JSON.stringify(importResult) }}</p>
+            <div v-if="importResult" class="import-result">
+                <p>
+                    {{ l("创建", "Created") }} {{ importResult.created }} · {{ l("更新", "Updated") }}
+                    {{ importResult.updated }} · {{ l("跳过", "Skipped") }} {{ importResult.skipped }} ·
+                    {{ l("失败", "Failed") }} {{ importResult.failed }} ·
+                    {{ text("accountImportLoginQueued", "自动登录已入队", "Automatic logins queued") }}
+                    {{ importResult.loginQueued || 0 }}
+                </p>
+                <p v-for="warning in importResult.loginWarnings || []" :key="warning.index">
+                    {{
+                        text(
+                            "accountImportLoginWarning",
+                            "记录已创建，自动登录未入队",
+                            "Record saved, automatic login not queued"
+                        )
+                    }}
+                    ({{ warning.index + 1 }}): {{ warning.error }}
+                </p>
+                <p v-for="issue in importResult.errors || []" :key="issue.index">
+                    {{ issue.index + 1 }}: {{ issue.error }}
+                </p>
+                <p>
+                    {{
+                        text(
+                            "accountImportCommitted",
+                            "此预览已提交，继续导入请重新解析预览",
+                            "This preview has been committed. Parse a new preview to continue importing"
+                        )
+                    }}
+                </p>
+            </div>
             <template #footer
-                ><ElButton type="primary" :disabled="!preview?.complete" @click="commitImport">{{
-                    l("提交导入", "Commit import")
-                }}</ElButton></template
+                ><ElButton
+                    type="primary"
+                    :disabled="!preview?.complete || importLocked"
+                    :loading="importBusy"
+                    @click="commitImport"
+                    >{{ l("提交导入", "Commit import") }}</ElButton
+                ></template
             >
         </ElDialog>
         <ElDialog v-model="historyVisible" :title="l('登录任务与尝试日志', 'Login tasks and attempts')" width="85%">
@@ -376,7 +477,7 @@
     </section>
 </template>
 <script setup>
-import { ref, reactive, watch, onMounted, onBeforeUnmount } from "vue";
+import { computed, ref, reactive, watch, onMounted, onBeforeUnmount } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import I18n from "../utils/i18n";
@@ -390,6 +491,7 @@ defineProps({
 });
 const accountTable = ref(null);
 const l = (zh, en) => (I18n.getLang() === "zh" ? zh : en);
+const text = (key, zh, en) => I18n.t(key, { fallback: l(zh, en) });
 const labels = {
     cancelled: ["已取消", "Cancelled"],
     credentials_missing: ["缺少凭据", "Credentials missing"],
@@ -410,6 +512,7 @@ const stateLabel = value => (labels[value] ? l(...labels[value]) : value);
 const accounts = ref([]),
     total = ref(0),
     page = ref(1),
+    pageSize = ref(20),
     search = ref(""),
     filter = ref(""),
     selected = ref([]),
@@ -431,6 +534,7 @@ const editVisible = ref(false),
     });
 const importVisible = ref(false),
     importKind = ref("csv"),
+    importBusy = ref(false),
     importContent = ref(""),
     preview = ref(null),
     choices = ref([]),
@@ -443,6 +547,37 @@ const historyVisible = ref(false),
     taskTotal = ref(0),
     imageVisible = ref(false),
     imageUrl = ref("");
+const loginSubmitting = ref(false),
+    cancelling = ref(false),
+    cancelResult = ref(null),
+    stoppingIds = ref([]);
+const suppressedLogins = new Set();
+const pendingLogins = new Map();
+function selectPage() {
+    for (const row of accounts.value) accountTable.value?.toggleRowSelection(row, true);
+}
+function removeSelection(rows) {
+    const ids = new Set(rows.map(row => row.accountId));
+    for (const row of selected.value.filter(row => ids.has(row.accountId)))
+        accountTable.value?.toggleRowSelection(row, false);
+    selected.value = selected.value.filter(row => !ids.has(row.accountId));
+}
+function clearSelection() {
+    accountTable.value?.clearSelection();
+    selected.value = [];
+}
+const importLocked = computed(() => importBusy.value || !!importResult.value);
+const actionableRows = computed(() => (preview.value?.rows || []).filter(row => !row.error && !row.unchanged));
+const overwriteRows = computed(() => actionableRows.value.filter(row => choices.value[row.index]?.accountId));
+function bulkState(rows, key) {
+    const count = rows.filter(row => choices.value[row.index]?.[key]).length;
+    return { checked: !!rows.length && count === rows.length, partial: count > 0 && count < rows.length };
+}
+const skipState = computed(() => bulkState(actionableRows.value, "skip"));
+const overwriteState = computed(() => bulkState(overwriteRows.value, "overwrite"));
+function bulkChoice(rows, key, value) {
+    for (const row of rows) choices.value[row.index][key] = value;
+}
 let timer,
     polling = false,
     disposed = false,
@@ -471,21 +606,35 @@ async function refresh() {
     await action(async () => {
         const [list, status] = await Promise.all([
             api(
-                `/accounts?page=${page.value}&search=${encodeURIComponent(search.value || "")}&state=${encodeURIComponent(filter.value || "")}`
+                `/accounts?page=${page.value}&pageSize=${pageSize.value}&search=${encodeURIComponent(search.value || "")}&state=${encodeURIComponent(filter.value || "")}`
             ),
             api("/login-queue"),
         ]);
         if (disposed || sequence !== refreshSequence) return;
+        const lastPage = Math.max(1, Math.ceil(list.total / pageSize.value));
+        if (page.value > lastPage) {
+            page.value = lastPage;
+            return;
+        }
         accounts.value = list.accounts;
         const refreshed = new Map(list.accounts.map(account => [account.accountId, account]));
         selected.value = selected.value.map(account => refreshed.get(account.accountId) || account);
         total.value = list.total;
+        stoppingIds.value = stoppingIds.value.filter(
+            id =>
+                list.accounts.find(row => row.accountId === id)?.loginStopping ||
+                status.executions?.some(execution => execution.accountId === id)
+        );
         queue.value = status;
         if (!polling) concurrency.value = status.concurrency;
     });
 }
-watch([search, filter], () => {
-    page.value = 1;
+watch([search, filter, pageSize, page], (values, previous) => {
+    if (values[0] !== previous[0] || values[1] !== previous[1]) clearSelection();
+    if (values.slice(0, 3).some((value, index) => value !== previous[index]) && page.value !== 1) {
+        page.value = 1;
+        return;
+    }
     refresh();
 });
 defineExpose({ refresh });
@@ -565,7 +714,41 @@ async function login(account) {
     });
 }
 async function batchLogin() {
-    for (const account of selected.value) await login(account);
+    if (loginSubmitting.value || cancelling.value) return;
+    const ids = selected.value.map(row => row.accountId);
+    suppressedLogins.clear();
+    loginSubmitting.value = true;
+    try {
+        for (const id of ids) {
+            if (disposed || suppressedLogins.has(id)) continue;
+            const request = api(`/accounts/${id}/login`, "POST", {});
+            pendingLogins.set(id, request);
+            await action(() => request);
+            pendingLogins.delete(id);
+        }
+    } finally {
+        loginSubmitting.value = false;
+        await refresh();
+    }
+}
+async function batchCancelLogin() {
+    if (cancelling.value) return;
+    const ids = selected.value.map(row => row.accountId);
+    for (const id of ids) suppressedLogins.add(id);
+    cancelling.value = true;
+    try {
+        // Wait for dispatched requests so their newly created tasks are included in cancellation.
+        await Promise.allSettled(ids.map(id => pendingLogins.get(id)).filter(Boolean));
+        await action(async () => {
+            cancelResult.value = await api("/accounts/batch/cancel-login", "POST", { accountIds: ids });
+            stoppingIds.value = cancelResult.value.results
+                .filter(row => row.status === "stopping")
+                .map(row => row.accountId);
+            await refresh();
+        });
+    } finally {
+        cancelling.value = false;
+    }
 }
 async function cancel(id) {
     await action(async () => {
@@ -658,6 +841,8 @@ async function deleteRows(rows) {
                     response = await remove(true);
                     result = await response.json();
                 }
+                if (result.successIndices)
+                    removeSelection(chosen.filter(row => result.successIndices.includes(row.authIndex)));
                 if (!response.ok || response.status === 207)
                     throw new Error(
                         result.error ||
@@ -667,9 +852,10 @@ async function deleteRows(rows) {
                             )
                     );
             }
-            for (const row of chosen.filter(row => row.authIndex === null))
+            for (const row of chosen.filter(row => row.authIndex === null)) {
                 await api(`/accounts/${row.accountId}`, "DELETE");
-            accountTable.value?.clearSelection();
+                removeSelection([row]);
+            }
             ElMessage.success(l("已删除", "Deleted"));
         } finally {
             busy.value = false;
@@ -687,14 +873,14 @@ async function readImportFile(event) {
 }
 async function previewImport() {
     await action(async () => {
+        importResult.value = null;
         preview.value = await api("/import/preview", "POST", { content: importContent.value, kind: importKind.value });
         importContent.value = "";
         choices.value = preview.value.rows.map(row => ({
             accountId: row.accountId,
-            create: false,
             index: row.index,
             overwrite: false,
-            skip: !!row.error || row.unchanged,
+            skip: !!row.error || !!row.unchanged,
         }));
         mappingAccounts.value = [];
         let cursor = 1,
@@ -706,13 +892,19 @@ async function previewImport() {
     });
 }
 async function commitImport() {
-    await action(async () => {
-        importResult.value = await api("/import/commit", "POST", {
-            previewId: preview.value.previewId,
-            rows: choices.value,
+    if (importLocked.value || !preview.value?.complete) return;
+    importBusy.value = true;
+    try {
+        await action(async () => {
+            importResult.value = await api("/import/commit", "POST", {
+                previewId: preview.value.previewId,
+                rows: choices.value,
+            });
+            await refresh();
         });
-        await refresh();
-    });
+    } finally {
+        importBusy.value = false;
+    }
 }
 function clearImport() {
     importContent.value = "";

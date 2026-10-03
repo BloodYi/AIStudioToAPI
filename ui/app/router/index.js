@@ -12,6 +12,7 @@ import AuthPage from '../pages/AuthPage.vue';
 import NotFound from '../pages/NotFound.vue';
 
 const routes = [
+    { component: StatusPage, name: 'proxy-pool', path: '/proxy-pool' },
     {
         component: StatusPage,
         name: 'accounts',

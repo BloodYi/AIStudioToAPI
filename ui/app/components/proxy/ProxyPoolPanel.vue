@@ -57,7 +57,13 @@
                     ><el-button type="primary" @click="openNode()">添加节点</el-button>
                 </div>
             </div>
-            <el-table :data="nodes" empty-text="暂无节点" @selection-change="selectedNodes = $event">
+            <el-table
+                ref="nodeTable"
+                class="desktop-list"
+                :data="nodes"
+                empty-text="暂无节点"
+                @selection-change="selectedNodes = $event"
+            >
                 <el-table-column type="selection" width="45" />
                 <el-table-column prop="name" label="名称" min-width="130" />
                 <el-table-column label="类型" width="90">
@@ -93,6 +99,37 @@
                     ></el-table-column
                 >
             </el-table>
+            <div class="mobile-list">
+                <p v-if="!nodes.length">暂无节点</p>
+                <article v-for="row in nodes" :key="row.id" class="mobile-item">
+                    <el-checkbox
+                        :model-value="selectedNodes.some(item => item.id === row.id)"
+                        @change="value => nodeTable?.toggleRowSelection(row, value)"
+                        >{{ row.name }}</el-checkbox
+                    >
+                    <p>
+                        {{ row.type === "direct" ? "直连" : row.type }} ·
+                        {{ row.status === "missing" ? "订阅缺失" : row.enabled ? "启用" : "停用" }} ·
+                        {{ row.latencyMs == null ? "-" : `${row.latencyMs} ms` }}
+                    </p>
+                    <p>出口 IP：{{ row.exitIp || "-" }} · 绑定：{{ row.boundAccounts || 0 }}</p>
+                    <details>
+                        <summary>地址和本地端口</summary>
+                        <p>
+                            {{
+                                row.type === "direct"
+                                    ? "VPS 本机出口，不经过 Mihomo"
+                                    : `${row.host}:${row.port} / ${row.localPort || "-"}`
+                            }}
+                        </p>
+                    </details>
+                    <div class="actions">
+                        <el-button @click="testNode(row)">测试</el-button
+                        ><el-button @click="openNode(row)">编辑</el-button
+                        ><el-button type="danger" plain @click="removeNode(row)">删除</el-button>
+                    </div>
+                </article>
+            </div>
         </section>
 
         <section class="pool-card">
@@ -109,7 +146,13 @@
                     <el-button type="primary" @click="subscriptionVisible = true">添加订阅</el-button>
                 </div>
             </div>
-            <el-table :data="subscriptions" empty-text="暂无订阅" @selection-change="selectedSubscriptions = $event">
+            <el-table
+                ref="subscriptionTable"
+                class="desktop-list"
+                :data="subscriptions"
+                empty-text="暂无订阅"
+                @selection-change="selectedSubscriptions = $event"
+            >
                 <el-table-column type="selection" width="45" />
                 <el-table-column prop="name" label="名称" />
                 <el-table-column prop="url" label="地址（已脱敏）" min-width="220" />
@@ -122,6 +165,22 @@
                     ></el-table-column
                 >
             </el-table>
+            <div class="mobile-list">
+                <p v-if="!subscriptions.length">暂无订阅</p>
+                <article v-for="row in subscriptions" :key="row.id" class="mobile-item">
+                    <el-checkbox
+                        :model-value="selectedSubscriptions.some(item => item.id === row.id)"
+                        @change="value => subscriptionTable?.toggleRowSelection(row, value)"
+                        >{{ row.name }}</el-checkbox
+                    >
+                    <p>地址（已脱敏）：{{ row.url }}</p>
+                    <p>节点：{{ row.nodeCount }} · 最近刷新：{{ row.lastRefreshedAt || "-" }}</p>
+                    <div class="actions">
+                        <el-button @click="refreshSubscription(row)">刷新</el-button
+                        ><el-button type="danger" plain @click="removeSubscription(row)">删除</el-button>
+                    </div>
+                </article>
+            </div>
         </section>
 
         <section class="pool-card">
@@ -147,7 +206,13 @@
                 <el-button :disabled="!selectedBindings.length" @click="saveBatchBinding">保存选中绑定</el-button>
             </div>
             <p>未登录账号可先保存出口绑定，首次登录及后续请求会沿用该节点，无需点击「应用」。</p>
-            <el-table :data="pagedBindings" empty-text="暂无账号" @selection-change="selectedBindings = $event">
+            <el-table
+                ref="bindingTable"
+                class="desktop-list"
+                :data="pagedBindings"
+                empty-text="暂无账号"
+                @selection-change="selectedBindings = $event"
+            >
                 <el-table-column type="selection" width="45" />
                 <el-table-column label="#" width="85"
                     ><template #default="{ row }">{{ row.authIndex === null ? "未登录" : row.authIndex }}</template>
@@ -184,18 +249,70 @@
                     ></el-table-column
                 >
             </el-table>
+            <div class="mobile-list">
+                <p v-if="!pagedBindings.length">暂无账号</p>
+                <article v-for="row in pagedBindings" :key="row.accountKey" class="mobile-item">
+                    <el-checkbox
+                        :model-value="selectedBindings.some(item => item.accountKey === row.accountKey)"
+                        @change="value => bindingTable?.toggleRowSelection(row, value)"
+                        >{{ row.accountName }}</el-checkbox
+                    >
+                    <p>
+                        {{ row.authIndex === null ? "未登录" : `#${row.authIndex}` }} · 当前来源：{{
+                            row.proxySource || "-"
+                        }}
+                    </p>
+                    <p>状态：{{ row.state }} · 在途：{{ row.inflight || 0 }}</p>
+                    <label
+                        >期望节点<el-select v-model="row.desiredNodeId" clearable placeholder="未绑定"
+                            ><el-option
+                                v-for="node in usableNodes"
+                                :key="node.id"
+                                :label="node.name"
+                                :value="node.id" /></el-select
+                    ></label>
+                    <div class="actions">
+                        <el-button @click="saveBinding(row)">保存绑定</el-button
+                        ><el-button :disabled="row.authIndex === null || row.state === 'applied'" @click="applyOne(row)"
+                            >应用</el-button
+                        >
+                    </div>
+                </article>
+            </div>
             <el-pagination
                 v-model:current-page="accountPage"
                 v-model:page-size="accountPageSize"
-                class="pagination"
+                class="pagination desktop-list"
                 layout="total, sizes, prev, pager, next"
                 :page-sizes="[20, 50, 100]"
                 :total="filteredBindings.length"
             />
+            <div class="mobile-list mobile-pagination">
+                <span>共 {{ filteredBindings.length }} 个账号</span>
+                <el-select v-model="accountPageSize" aria-label="每页账号数"
+                    ><el-option v-for="size in [20, 50, 100]" :key="size" :label="`每页 ${size} 条`" :value="size"
+                /></el-select>
+                <div class="actions">
+                    <el-button :disabled="accountPage <= 1" @click="accountPage--">上一页</el-button
+                    ><span
+                        >{{ accountPage }} /
+                        {{ Math.max(1, Math.ceil(filteredBindings.length / accountPageSize)) }}</span
+                    ><el-button
+                        :disabled="accountPage * accountPageSize >= filteredBindings.length"
+                        @click="accountPage++"
+                        >下一页</el-button
+                    >
+                </div>
+            </div>
         </section>
 
-        <el-dialog v-model="nodeVisible" :title="editingId ? '编辑节点' : '添加节点'" width="520px">
-            <el-form label-width="95px">
+        <el-dialog
+            v-model="nodeVisible"
+            :title="editingId ? '编辑节点' : '添加节点'"
+            width="min(520px, calc(100vw - 24px))"
+            class="proxy-dialog"
+        >
+            <el-form label-position="top">
                 <el-form-item label="类型"
                     ><el-select v-model="nodeForm.type"
                         ><el-option
@@ -240,7 +357,12 @@
             >
         </el-dialog>
 
-        <el-dialog v-model="importVisible" title="批量导入分享链接 / Clash / Base64" width="650px">
+        <el-dialog
+            v-model="importVisible"
+            title="批量导入分享链接 / Clash / Base64"
+            width="min(650px, calc(100vw - 24px))"
+            class="proxy-dialog"
+        >
             <el-radio-group v-model="importFormat"
                 ><el-radio-button value="links">分享链接</el-radio-button
                 ><el-radio-button value="subscription">Clash / Base64</el-radio-button></el-radio-group
@@ -252,7 +374,12 @@
             >
         </el-dialog>
 
-        <el-dialog v-model="subscriptionVisible" title="添加订阅" width="520px">
+        <el-dialog
+            v-model="subscriptionVisible"
+            title="添加订阅"
+            width="min(520px, calc(100vw - 24px))"
+            class="proxy-dialog"
+        >
             <el-input v-model="subscriptionForm.name" placeholder="名称" /><el-input
                 v-model="subscriptionForm.url"
                 placeholder="https://..."
@@ -266,9 +393,12 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 
+const nodeTable = ref(null),
+    subscriptionTable = ref(null),
+    bindingTable = ref(null);
 const status = reactive({ mihomo: {} });
 const settings = reactive({
     basePort: 10801,
@@ -324,6 +454,15 @@ const pagedBindings = computed(() => {
     const start = (accountPage.value - 1) * accountPageSize.value;
     return filteredBindings.value.slice(start, start + accountPageSize.value);
 });
+watch([accountSearch, stateFilter, nodeFilter, accountPageSize], () => {
+    accountPage.value = 1;
+});
+watch(
+    () => filteredBindings.value.length,
+    total => {
+        accountPage.value = Math.min(accountPage.value, Math.max(1, Math.ceil(total / accountPageSize.value)));
+    }
+);
 const request = async (url, options = {}) => {
     const response = await fetch(url, { headers: { "Content-Type": "application/json" }, ...options });
     const body = response.status === 204 ? null : await response.json();
@@ -560,6 +699,9 @@ onMounted(loadAll);
 .proxy-pool {
     display: grid;
     gap: 18px;
+    min-width: 0;
+    container-type: inline-size;
+    overflow-wrap: anywhere;
 }
 .page-header,
 .section-title,
@@ -575,6 +717,7 @@ onMounted(loadAll);
 }
 .pool-card {
     padding: 20px;
+    min-width: 0;
     border: 1px solid var(--el-border-color-light);
     border-radius: 12px;
     background: var(--el-bg-color);
@@ -595,6 +738,99 @@ onMounted(loadAll);
 .pagination {
     justify-content: flex-end;
     margin-top: 14px;
+}
+.mobile-list {
+    display: none;
+}
+.mobile-item {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--el-border-color-light);
+}
+@container (max-width: 767px) {
+    .desktop-list {
+        display: none;
+    }
+    .mobile-list {
+        display: grid;
+        gap: 12px;
+        min-width: 0;
+    }
+    .pool-card {
+        padding: 12px;
+    }
+    .section-title {
+        align-items: flex-start;
+        flex-wrap: wrap;
+    }
+    .section-title > div {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+    .status-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        align-items: start;
+        gap: 10px;
+    }
+    .actions {
+        gap: 8px;
+    }
+    .actions :deep(.el-input),
+    .actions :deep(.el-select),
+    .mobile-item :deep(.el-select) {
+        width: 100% !important;
+        min-width: 0;
+    }
+    :deep(.el-button) {
+        min-height: 44px;
+        margin-left: 0;
+        white-space: normal;
+    }
+    :deep(.el-input__wrapper),
+    :deep(.el-select__wrapper) {
+        min-height: 44px;
+        box-sizing: border-box;
+    }
+    :deep(.el-checkbox) {
+        height: auto;
+        min-height: 44px;
+        max-width: 100%;
+    }
+    :deep(.el-checkbox__label) {
+        white-space: normal;
+        overflow-wrap: anywhere;
+    }
+    summary {
+        min-height: 44px;
+        display: flex;
+        align-items: center;
+        cursor: pointer;
+    }
+}
+:global(.proxy-dialog) {
+    max-height: calc(100dvh - 24px);
+    overflow-y: auto;
+    margin: 12px auto;
+    overflow-wrap: anywhere;
+}
+:global(.proxy-dialog .el-select) {
+    width: 100%;
+}
+@media (max-width: 767px) {
+    :global(.proxy-dialog .el-button) {
+        min-height: 44px;
+    }
+    :global(.proxy-dialog .el-input__wrapper),
+    :global(.proxy-dialog .el-select__wrapper) {
+        min-height: 44px;
+        box-sizing: border-box;
+    }
+}
+:global(.proxy-dialog .el-dialog__footer) {
+    position: sticky;
+    bottom: -16px;
+    background: var(--el-bg-color);
 }
 h1,
 h3 {

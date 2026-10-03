@@ -331,7 +331,7 @@ test("import preview is secret-free, session-bound, versioned and idempotent", a
     });
     assert.equal(result.updated, 1);
     assert.equal(result.created, 1);
-    assert.equal(service.state.tasks.length, 0);
+    assert.equal(service.state.tasks.length, service.state.config.autoRecovery ? 1 : 0);
     assert.equal(service.state.accounts[0].password, "synthetic, password");
     assert.deepEqual(await service.importCommit("session-a", { previewId: preview.previewId, rows: [] }), result);
     const stale = service.preview("session-a", "csv", content);
@@ -633,7 +633,15 @@ test("authenticator imports match existing emails, skip unknown and duplicate en
         previewId: preview.previewId,
         rows: [{ index: 0 }, { index: 1 }, { index: 2, skip: true }],
     });
-    assert.deepEqual(result, { created: 0, errors: [], failed: 0, skipped: 2, updated: 1 });
+    assert.deepEqual(result, {
+        created: 0,
+        errors: [],
+        failed: 0,
+        loginQueued: 0,
+        loginWarnings: [],
+        skipped: 2,
+        updated: 1,
+    });
     assert.equal(service.state.accounts.length, 1);
     const unchanged = service.preview("session", "authenticator", uri("known@example.com"));
     assert.equal(unchanged.rows[0].unchanged, true);
@@ -978,4 +986,131 @@ test("session commit removes legacy recovery credentials from auth JSON", async 
     assert.equal(saved.recoveryEmail, undefined);
     assert.equal(saved.recovery_email, undefined);
     assert.equal(account.recoveryEmail, "private-recovery@example.com");
+});
+
+test("CSV creates 19 accounts by default and only new records follow the global switch", async t => {
+    for (const enabled of [false, true]) {
+        const { service } = await fixture(t);
+        service.state.config.autoRecovery = enabled;
+        const content =
+            "email,password\n" + Array.from({ length: 19 }, (_, i) => `new${i}@example.com,synthetic`).join("\n");
+        const preview = service.preview("session", "csv", content);
+        const input = { previewId: preview.previewId, rows: preview.rows.map(row => ({ index: row.index })) };
+        const result = await service.exclusive(() => service.importCommit("session", input));
+        assert.equal(result.created, 19);
+        assert.equal(result.skipped, 0);
+        assert.equal(result.failed, 0);
+        assert.equal(result.loginQueued, enabled ? 19 : 0);
+        assert.equal(service.state.tasks.length, enabled ? 19 : 0);
+        assert.ok(service.state.tasks.every(task => task.source === "new"));
+        assert.deepEqual(await service.importCommit("session", input), result);
+        assert.equal(service.list().length, 19);
+        const mixed = service.preview(
+            "session",
+            "csv",
+            "email,password\nnew0@example.com,updated\nextra@example.com,synthetic\nskip@example.com,synthetic"
+        );
+        const update = await service.importCommit("session", {
+            previewId: mixed.previewId,
+            rows: [{ index: 0, overwrite: true }, { index: 1 }, { index: 2, overwrite: true, skip: true }],
+        });
+        assert.equal(update.updated, 1);
+        assert.equal(update.created, 1);
+        assert.equal(update.skipped, 1);
+        assert.equal(update.loginQueued, enabled ? 1 : 0);
+        assert.equal(
+            service.state.tasks.filter(
+                task => task.accountId === service.state.accounts[0].accountId && task.status !== "cancelled"
+            ).length,
+            0
+        );
+    }
+});
+test("CSV queue capacity warnings preserve created records and cached results", async t => {
+    const { service } = await fixture(t);
+    service.state.config.autoRecovery = true;
+    service.state.config.queueLimit = 1;
+    const preview = service.preview(
+        "session",
+        "csv",
+        "email,password\na@example.com,synthetic\nb@example.com,synthetic"
+    );
+    const input = { previewId: preview.previewId, rows: [{ index: 0 }, { index: 1 }] };
+    const result = await service.importCommit("session", input);
+    assert.equal(result.created, 2);
+    assert.equal(result.failed, 0);
+    assert.equal(result.loginQueued, 1);
+    assert.match(result.loginWarnings[0].error, /queue is full/);
+    assert.equal(result.loginWarnings[0].index, 1);
+    assert.deepEqual(await service.importCommit("session", input), result);
+    assert.equal(service.state.tasks.length, 1);
+    service.state.config.autoRecovery = false;
+    await service.queue.tick();
+    assert.equal(service.state.tasks[0].status, "queued");
+});
+test("batch cancellation isolates failures, holds recovery across restart and allows manual continuation", async t => {
+    const { service, close, system, options } = await fixture(t);
+    service.state.config.autoRecovery = true;
+    const ids = [];
+    for (const name of ["queued", "retry", "idle", "unselected"]) {
+        const { account } = await service.create({ email: `${name}@example.com`, password: "synthetic" }, false);
+        ids.push(account.accountId);
+        service.account(account.accountId).sessionState = "expired";
+    }
+    const queued = service.enqueue(service.account(ids[0]), "expired");
+    const retry = service.enqueue(service.account(ids[1]), "expired");
+    retry.status = "retry_wait";
+    const other = service.enqueue(service.account(ids[3]), "expired");
+    const result = await service.exclusive(() =>
+        service.batchCancelLogin({ accountIds: [ids[0], ids[1], ids[2], "missing", ids[0]] })
+    );
+    assert.equal(result.cancelled, 2);
+    assert.equal(result.unnecessary, 1);
+    assert.equal(result.failed, 1);
+    assert.equal(queued.status, "cancelled");
+    assert.equal(retry.status, "cancelled");
+    assert.equal(other.status, "queued");
+    assert.equal(service.account(ids[2]).recoveryState, "idle");
+    for (let i = 0; i < 3; i++) await service.scanRecovery();
+    assert.equal(service.account(ids[0]).currentTaskId, null);
+    assert.equal(service.account(ids[1]).recoveryState, "manual_required");
+    assert.equal(service.account(ids[0]).autoRecovery, true);
+    assert.equal(queued.history.at(-1).error, "cancelled");
+    assert.equal((await service.batchCancelLogin({ accountIds: ids.slice(0, 2) })).unnecessary, 2);
+    await assert.rejects(service.batchCancelLogin({ accountIds: [null] }), { status: 400 });
+    await close();
+    const resumed = new Service(system, options);
+    await resumed.initialize({ startQueue: false });
+    await resumed.scanRecovery();
+    assert.equal(resumed.account(ids[0]).recoveryState, "manual_required");
+    assert.equal(resumed.account(ids[0]).currentTaskId, null);
+    await resumed.edit(ids[0], { credentialVersion: resumed.account(ids[0]).credentialVersion, password: "corrected" });
+    await resumed.scanRecovery();
+    assert.equal(resumed.account(ids[0]).recoveryState, "manual_required");
+    assert.equal(resumed.account(ids[0]).currentTaskId, null);
+    await resumed.login(ids[0]);
+    assert.equal(resumed.account(ids[0]).recoveryState, "queued");
+    await resumed.close();
+});
+test("running cancellation reports stopping, blocks a second executor and rejects late success", async t => {
+    const { service, directory } = await fixture(t);
+    service.state.config.autoRecovery = true;
+    const created = await service.create({ email: "late@example.com", password: "synthetic" });
+    const account = service.account(created.account.accountId);
+    account.sessionState = "expired";
+    await service.queue.tick();
+    const result = await service.exclusive(() => service.batchCancelLogin({ accountIds: [account.accountId] }));
+    assert.equal(result.stopping, 1);
+    assert.equal(service.publicAccount(account).loginStopping, true);
+    await assert.rejects(service.login(account.accountId), { status: 409 });
+    await until(() => !service.queue.running.size);
+    await service.chain;
+    await service.scanRecovery();
+    assert.equal(account.recoveryState, "manual_required");
+    assert.equal(account.currentTaskId, null);
+    assert.equal(service.state.tasks[0].status, "cancelled");
+    assert.deepEqual(await fs.readdir(path.join(directory, "auth")), []);
+    service.state.config.paused = true;
+    await service.exclusive(() => service.login(account.accountId));
+    assert.equal(account.recoveryState, "queued");
 });

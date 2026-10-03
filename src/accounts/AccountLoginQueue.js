@@ -255,7 +255,7 @@ class AccountLoginQueue {
         }
         this.faults.set(slot.token, slot);
         this.running.set(slot.taskId, slot);
-        this.service.failTask(task, "executor_cleanup_failed");
+        if (task.status !== "cancelled") this.service.failTask(task, "executor_cleanup_failed");
     }
     async finish(slot, result) {
         if (slot.finishing) return slot.done;
@@ -266,7 +266,7 @@ class AccountLoginQueue {
             const task = this.service.state.tasks.find(item => item.taskId === slot.taskId);
             const authorized = task?.token === slot.token && performance.now() < slot.deadline && !result.error;
             if (task?.token === slot.token) task.token = null;
-            if (result.error && slot.child?.connected && !slot.screenshot) {
+            if (result.error && result.error !== "cancelled" && slot.child?.connected && !slot.screenshot) {
                 slot.child.send({ abort: true, token: slot.token });
                 const until = performance.now() + slot.config.screenshotTimeout;
                 while (!slot.screenshot && slot.child.exitCode === null && performance.now() < until) await wait(50);
