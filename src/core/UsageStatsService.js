@@ -440,6 +440,52 @@ class UsageStatsService {
         };
     }
 
+    async getPublicModelWindows(visibleModels = [], asOfMs = Date.now()) {
+        const modelKeys = [...new Set(visibleModels.filter(value => typeof value === "string" && value.trim()))];
+        let rows = [];
+        let status = this.enabled ? "available" : "disabled";
+        if (this.enabled) {
+            try {
+                await this.ready;
+                await this.appendPromise;
+                rows = await this.storage.call("public_model_windows", { asOfMs, visibleModels: modelKeys });
+            } catch {
+                status = "unavailable";
+            }
+        }
+        const byModel = new Map(rows.map(row => [row.model, row]));
+        const windows = {};
+        for (const [range, milliseconds] of [
+            ["24h", DAY_MS],
+            ["1h", 3600000],
+        ]) {
+            windows[range] = {
+                from: new Date(asOfMs - milliseconds).toISOString(),
+                status,
+                to: new Date(asOfMs).toISOString(),
+            };
+        }
+        const models = modelKeys.map(modelKey => {
+            const row = byModel.get(modelKey);
+            const stats = {};
+            for (const range of ["24h", "1h"]) {
+                const total = row?.[`total_${range}`] ?? 0;
+                stats[range] = {
+                    averageDurationMs:
+                        status === "available" && total ? Math.round(row[`duration_${range}`] / total) : null,
+                    failedRequests: status === "available" ? (row?.[`failed_${range}`] ?? 0) : null,
+                    successRate:
+                        status === "available" && total
+                            ? Number(((row[`success_${range}`] / total) * 100).toFixed(1))
+                            : null,
+                    totalRequests: status === "available" ? total : null,
+                };
+            }
+            return { modelKey, stats };
+        });
+        return { models, windows };
+    }
+
     queryRecords(options = {}) {
         if (!this.enabled) {
             return { dataset_revision: this.datasetRevision, has_more: false, next_cursor: null, records: [] };

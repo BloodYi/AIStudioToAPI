@@ -7,7 +7,33 @@ const useMock = ref(isDev);
 const availablePresets = ref([]);
 let mockPresets = null;
 
+const selectedRange = ref("24h");
+const ranges = [
+    { key: "all", label: "历史" },
+    { key: "24h", label: "近 24 小时" },
+    { key: "1h", label: "近 1 小时" },
+];
 const data = ref(null);
+const supportsRecent = computed(() =>
+    Boolean(data.value?.model_stat_windows?.["24h"] && data.value?.model_stat_windows?.["1h"])
+);
+const effectiveRange = computed(() => (supportsRecent.value ? selectedRange.value : "all"));
+const statsFor = model =>
+    effectiveRange.value === "all" ? model.history : model.recent_stats?.[effectiveRange.value] || {};
+const partialUnavailable = computed(
+    () =>
+        data.value &&
+        (!data.value.history.enabled ||
+            data.value.realtime.limit === 0 ||
+            !supportsRecent.value ||
+            Object.values(data.value.model_stat_windows || {}).some(window => window.status !== "available"))
+);
+const rangeNotice = computed(() => {
+    if (!supportsRecent.value) return "当前服务暂不支持近期统计";
+    if (effectiveRange.value === "all") return data.value?.history.enabled ? "" : "请求统计未启用";
+    const status = data.value.model_stat_windows[effectiveRange.value].status;
+    return status === "disabled" ? "请求统计未启用" : status === "unavailable" ? "近期统计暂时不可用" : "";
+});
 const error = ref(false);
 const loading = ref(true);
 const currentTime = ref(Date.now());
@@ -118,7 +144,23 @@ async function refresh() {
         const preset = mockPresets[activeMockPreset.value] || mockPresets.standard;
         data.value = {
             ...preset.data,
-            generated_at: new Date().toISOString(),
+            generated_at: new Date(currentTime.value).toISOString(),
+            ...(preset.data.model_stat_windows
+                ? {
+                      model_stat_windows: Object.fromEntries(
+                          Object.entries(preset.data.model_stat_windows).map(([range, window]) => [
+                              range,
+                              {
+                                  ...window,
+                                  from: new Date(
+                                      currentTime.value - (range === "24h" ? 86400000 : 3600000)
+                                  ).toISOString(),
+                                  to: new Date(currentTime.value).toISOString(),
+                              },
+                          ])
+                      ),
+                  }
+                : {}),
         };
         error.value = false;
         loading.value = false;
@@ -200,10 +242,7 @@ function onMockChange() {
                 <p class="updated">数据更新时间：{{ updatedAt }} (本地) · 配额重置倒计时：{{ resetCountdown }}</p>
             </div>
             <div class="header-actions">
-                <span
-                    class="status"
-                    :class="{ warning: error || (data && (!data.history.enabled || data.realtime.limit === 0)) }"
-                >
+                <span class="status" :class="{ warning: error || partialUnavailable }">
                     <span class="status-dot"></span>
                     {{
                         loading
@@ -212,7 +251,7 @@ function onMockChange() {
                               ? data
                                   ? "数据暂时中断，显示上次结果"
                                   : "暂时无法获取数据"
-                              : !data?.history.enabled || data?.realtime.limit === 0
+                              : partialUnavailable
                                 ? "部分统计不可用"
                                 : "服务正常运行"
                     }}
@@ -388,13 +427,28 @@ function onMockChange() {
             </section>
 
             <section aria-labelledby="history-title">
-                <h2 id="history-title">分模型历史统计</h2>
+                <div class="stats-heading">
+                    <h2 id="history-title">分模型统计</h2>
+                    <div class="range-buttons" role="group" aria-label="分模型统计时间范围">
+                        <button
+                            v-for="range in ranges"
+                            :key="range.key"
+                            type="button"
+                            :aria-pressed="effectiveRange === range.key"
+                            :disabled="range.key !== 'all' && !supportsRecent"
+                            @click="selectedRange = range.key"
+                        >
+                            {{ range.label }}
+                        </button>
+                    </div>
+                </div>
+                <p v-if="rangeNotice" class="muted" role="status">{{ rangeNotice }}</p>
                 <div class="table-wrap">
                     <table>
                         <thead>
                             <tr>
                                 <th>模型</th>
-                                <th>历史请求</th>
+                                <th>{{ effectiveRange === "all" ? "历史请求" : "请求数" }}</th>
                                 <th>成功率</th>
                                 <th>失败请求</th>
                                 <th>平均耗时</th>
@@ -408,24 +462,26 @@ function onMockChange() {
                                         {{ getModelTag(model.model).label }}
                                     </span>
                                 </th>
-                                <td class="tabular-num">{{ number(model.history.total_requests) }}</td>
+                                <td class="tabular-num">{{ number(statsFor(model).total_requests) }}</td>
                                 <td
                                     class="tabular-num"
                                     :class="{
-                                        'text-success': model.history.success_rate >= 98,
-                                        'text-warn': model.history.success_rate < 95,
+                                        'text-success': statsFor(model).success_rate >= 98,
+                                        'text-warn':
+                                            statsFor(model).success_rate != null && statsFor(model).success_rate < 95,
                                     }"
                                 >
-                                    {{ percent(model.history.success_rate) }}
+                                    {{ percent(statsFor(model).success_rate) }}
                                 </td>
-                                <td class="tabular-num" :class="{ 'text-danger': model.history.failed_requests > 0 }">
-                                    {{ number(model.history.failed_requests) }}
+                                <td class="tabular-num" :class="{ 'text-danger': statsFor(model).failed_requests > 0 }">
+                                    {{ number(statsFor(model).failed_requests) }}
                                 </td>
-                                <td class="tabular-num">{{ duration(model.history.average_duration_ms) }}</td>
+                                <td class="tabular-num">{{ duration(statsFor(model).average_duration_ms) }}</td>
                             </tr>
                         </tbody>
                     </table>
                 </div>
+                <p class="helper">近期统计按请求完成时间滚动计算；失败数包含用户中止，重试后成功按成功请求计。</p>
             </section>
         </template>
     </main>

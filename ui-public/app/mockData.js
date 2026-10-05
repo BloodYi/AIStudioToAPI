@@ -198,3 +198,56 @@ export const mockPresets = {
         label: "标准运行（多模型与各状态均衡）",
     },
 };
+
+// Recent recovery and deterioration deliberately differ from lifetime totals.
+for (const preset of Object.values(mockPresets)) {
+    preset.data.model_stat_windows = Object.fromEntries(
+        ["24h", "1h"].map(range => [
+            range,
+            {
+                from: new Date(Date.now() - (range === "24h" ? 86400000 : 3600000)).toISOString(),
+                status: preset.data.history.enabled ? "available" : "disabled",
+                to: preset.data.generated_at,
+            },
+        ])
+    );
+    preset.data.models.forEach((model, index) => {
+        model.recent_stats = preset.data.history.enabled
+            ? {
+                  "1h":
+                      index % 2
+                          ? { average_duration_ms: 20000, failed_requests: 6, success_rate: 40, total_requests: 10 }
+                          : { average_duration_ms: 2000, failed_requests: 0, success_rate: 100, total_requests: 10 },
+                  "24h": { average_duration_ms: 8000, failed_requests: 20, success_rate: 80, total_requests: 100 },
+              }
+            : {
+                  "1h": { average_duration_ms: null, failed_requests: null, success_rate: null, total_requests: null },
+                  "24h": { average_duration_ms: null, failed_requests: null, success_rate: null, total_requests: null },
+              };
+    });
+}
+const clone = value => JSON.parse(JSON.stringify(value));
+mockPresets.noRecentRequests = { data: clone(mockPresets.standard.data), label: "近期零请求" };
+mockPresets.recentUnavailable = { data: clone(mockPresets.standard.data), label: "近期查询不可用" };
+mockPresets.legacy = { data: clone(mockPresets.standard.data), label: "旧接口响应" };
+for (const range of ["24h", "1h"]) {
+    mockPresets.recentUnavailable.data.model_stat_windows[range].status = "unavailable";
+    for (const model of mockPresets.noRecentRequests.data.models) {
+        model.recent_stats[range] = {
+            average_duration_ms: null,
+            failed_requests: 0,
+            success_rate: null,
+            total_requests: 0,
+        };
+    }
+    for (const model of mockPresets.recentUnavailable.data.models) {
+        model.recent_stats[range] = {
+            average_duration_ms: null,
+            failed_requests: null,
+            success_rate: null,
+            total_requests: null,
+        };
+    }
+}
+delete mockPresets.legacy.data.model_stat_windows;
+for (const model of mockPresets.legacy.data.models) delete model.recent_stats;

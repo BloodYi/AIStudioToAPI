@@ -7,10 +7,7 @@ class PublicDashboardService {
         this.cachedSnapshot = null;
     }
 
-    getSnapshot() {
-        const now = Date.now();
-        if (this.cachedSnapshot && now - this.cachedAt < this.cacheTtlMs) return this.cachedSnapshot;
-
+    _realtimeSnapshot() {
         const realtime = this.scheduler?.publicSummarySnapshot?.() || {
             active: 0,
             limit: 0,
@@ -18,14 +15,73 @@ class PublicDashboardService {
             queued: 0,
             usageWindow: { date: null, timezone: "America/Los_Angeles" },
         };
+        return {
+            ...realtime,
+            models: realtime.models.filter(item => typeof item.model === "string" && item.model.trim()),
+        };
+    }
+
+    _visibilityKey(realtime) {
+        return JSON.stringify([...new Set(realtime.models.map(item => item.model))].sort());
+    }
+
+    async getSnapshot() {
+        const realtime = this._realtimeSnapshot();
+        const key = this._visibilityKey(realtime);
+        if (key !== this.visibilityKey) {
+            this.visibilityKey = key;
+            this.cachedSnapshot = null;
+            this.pending = null;
+        }
+        if (this.cachedSnapshot && Date.now() - this.cachedAt < this.cacheTtlMs) return this.cachedSnapshot;
+        if (!this.pending) {
+            const pending = this._buildSnapshot(realtime, Date.now())
+                .then(snapshot => {
+                    if (this.pending === pending && this._visibilityKey(this._realtimeSnapshot()) === key) {
+                        this.cachedSnapshot = snapshot;
+                        this.cachedAt = Date.now();
+                    }
+                    return snapshot;
+                })
+                .finally(() => {
+                    if (this.pending === pending) this.pending = null;
+                });
+            this.pending = pending;
+        }
+        const snapshot = await this.pending;
+        if (this._visibilityKey(this._realtimeSnapshot()) !== key) return this.getSnapshot();
+        return snapshot;
+    }
+
+    async _buildSnapshot(realtime, now) {
         const visibleModels = realtime.models.map(item => item.model);
+        let recent;
+        try {
+            recent = await this.usageStatsService.getPublicModelWindows(visibleModels, now);
+        } catch {
+            recent = { models: [], windows: {} };
+        }
+        const windows = Object.fromEntries(
+            ["24h", "1h"].map(range => {
+                const status = recent.windows[range]?.status;
+                return [
+                    range,
+                    {
+                        from: new Date(now - (range === "24h" ? 86400000 : 3600000)).toISOString(),
+                        status: ["available", "disabled", "unavailable"].includes(status) ? status : "unavailable",
+                        to: new Date(now).toISOString(),
+                    },
+                ];
+            })
+        );
+        const recentByModel = new Map(recent.models.map(item => [item.modelKey, item.stats]));
         const history = this.usageStatsService.getPublicSummarySnapshot(visibleModels);
         const historyByModel = new Map(history.models.map(item => [item.modelKey, item]));
         const count = value => (Number.isSafeInteger(value) && value >= 0 ? value : 0);
         const nullableCount = value => (value === null ? null : count(value));
         const rate = value => (Number.isFinite(value) && value >= 0 && value <= 100 ? Number(value.toFixed(1)) : null);
 
-        this.cachedSnapshot = {
+        return {
             disclaimer: "estimated_quota_may_differ_from_actual",
             generated_at: new Date(now).toISOString(),
             history: {
@@ -35,6 +91,7 @@ class PublicDashboardService {
                 success_rate: rate(history.summary.successRate),
                 total_requests: nullableCount(history.summary.totalRequests),
             },
+            model_stat_windows: windows,
             models: realtime.models.map(item => {
                 const modelHistory = historyByModel.get(item.model);
                 const quotaIsEstimable = Number.isSafeInteger(item.estimatedRemaining) && item.estimatedRemaining >= 0;
@@ -56,6 +113,21 @@ class PublicDashboardService {
                         queued: count(item.queued),
                         rate_limited_accounts: count(item.rateLimitedAccounts),
                     },
+                    recent_stats: Object.fromEntries(
+                        ["24h", "1h"].map(range => {
+                            const stats =
+                                windows[range].status === "available" ? recentByModel.get(item.model)?.[range] : null;
+                            return [
+                                range,
+                                {
+                                    average_duration_ms: nullableCount(stats?.averageDurationMs ?? null),
+                                    failed_requests: nullableCount(stats?.failedRequests ?? null),
+                                    success_rate: rate(stats?.successRate),
+                                    total_requests: nullableCount(stats?.totalRequests ?? null),
+                                },
+                            ];
+                        })
+                    ),
                     today: { requests: count(item.todayRequests) },
                 };
             }),
@@ -67,8 +139,6 @@ class PublicDashboardService {
             schema_version: 1,
             usage_window: { date: realtime.usageWindow.date, timezone: realtime.usageWindow.timezone },
         };
-        this.cachedAt = now;
-        return this.cachedSnapshot;
     }
 }
 

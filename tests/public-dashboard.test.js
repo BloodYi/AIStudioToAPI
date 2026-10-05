@@ -100,7 +100,7 @@ test("public history projection whitelists visible models and merges failures", 
     assert.doesNotMatch(JSON.stringify(snapshot), /hidden|public-must-not-see/);
 });
 
-test("dashboard DTO and isolated routes expose only public data", () => {
+test("dashboard DTO and isolated routes expose only public data", async () => {
     const scheduler = {
         publicSummarySnapshot: () => ({
             active: 1,
@@ -122,6 +122,8 @@ test("dashboard DTO and isolated routes expose only public data", () => {
         }),
     };
     const usageStatsService = {
+        getPublicModelWindows: async (models, asOfMs) =>
+            new UsageStatsService(null, logger, null, false).getPublicModelWindows(models, asOfMs),
         getPublicSummarySnapshot: () => ({
             enabled: true,
             models: [
@@ -136,7 +138,7 @@ test("dashboard DTO and isolated routes expose only public data", () => {
             summary: { averageDurationMs: 50, failedRequests: 0, successRate: 100, totalRequests: 1 },
         }),
     };
-    const projection = new PublicDashboardService(scheduler, usageStatsService, { cacheTtlMs: 0 }).getSnapshot();
+    const projection = await new PublicDashboardService(scheduler, usageStatsService, { cacheTtlMs: 0 }).getSnapshot();
     assert.equal(projection.models[0].quota.estimated_remaining, 99);
     assert.doesNotMatch(JSON.stringify(projection), /PUBLIC_MUST_NOT_SEE_KEY|secret/);
 
@@ -155,7 +157,7 @@ test("dashboard DTO and isolated routes expose only public data", () => {
     const dashboardRoute = routes.find(route => route.path === "/api/public/dashboard" && route.methods.get);
     assert.equal(dashboardRoute.methods.post, undefined);
 
-    const invokeDashboard = headers => {
+    const invokeDashboard = async headers => {
         const response = {
             body: null,
             end() {
@@ -184,15 +186,170 @@ test("dashboard DTO and isolated routes expose only public data", () => {
                 return this;
             },
         };
-        dashboardRoute.stack[0].handle(
+        await dashboardRoute.stack[0].handle(
             { get: name => headers?.[name.toLowerCase()], headers: headers || {} },
             response
         );
         return response;
     };
-    const dashboard = invokeDashboard();
+    const dashboard = await invokeDashboard();
     assert.equal(dashboard.statusCode, 200);
     assert.ok(dashboard.headers.ETag);
-    const cached = invokeDashboard({ "if-none-match": dashboard.headers.ETag });
+    const cached = await invokeDashboard({ "if-none-match": dashboard.headers.ETag });
     assert.equal(cached.statusCode, 304);
+    publicServer.service.getSnapshot = async () => {
+        throw new Error("PRIVATE_ERROR");
+    };
+    const failed = await invokeDashboard();
+    assert.equal(failed.statusCode, 503);
+    assert.deepEqual(JSON.parse(failed.body), { error: "dashboard_temporarily_unavailable" });
+});
+
+const deferred = () => {
+    let resolve;
+    const promise = new Promise(done => {
+        resolve = done;
+    });
+    return { promise, resolve };
+};
+const dashboardFixture = (cacheTtlMs = 1000) => {
+    let visible = ["visible", "hidden-later"];
+    const stats = new UsageStatsService(null, logger, null, false);
+    let queries = 0;
+    const service = new PublicDashboardService(
+        {
+            publicSummarySnapshot: () => ({
+                active: 0,
+                limit: 1,
+                models: visible.map(model => ({ model })),
+                queued: 0,
+                usageWindow: { date: null, timezone: "America/Los_Angeles" },
+            }),
+        },
+        {
+            getPublicModelWindows: async (...args) => {
+                queries++;
+                return stats.getPublicModelWindows(...args);
+            },
+            getPublicSummarySnapshot: models => stats.getPublicSummarySnapshot(models),
+        },
+        { cacheTtlMs }
+    );
+    return {
+        queries: () => queries,
+        service,
+        setVisible: models => {
+            visible = models;
+        },
+    };
+};
+
+test("snapshot merges concurrent queries, preserves cached boundaries and expires", async () => {
+    const fixture = dashboardFixture();
+    const [first, concurrent] = await Promise.all([fixture.service.getSnapshot(), fixture.service.getSnapshot()]);
+    assert.strictEqual(first, concurrent);
+    assert.strictEqual(await fixture.service.getSnapshot(), first);
+    assert.equal(fixture.queries(), 1);
+    assert.equal(first.generated_at, first.model_stat_windows["24h"].to);
+    assert.equal(first.generated_at, first.model_stat_windows["1h"].to);
+    fixture.service.cachedAt -= 1000;
+    assert.notStrictEqual(await fixture.service.getSnapshot(), first);
+    assert.equal(fixture.queries(), 2);
+    fixture.setVisible(["visible"]);
+    assert.deepEqual(
+        (await fixture.service.getSnapshot()).models.map(item => item.model),
+        ["visible"]
+    );
+});
+
+test("visibility changes discard both in-flight results and cached hidden models", async () => {
+    const fixture = dashboardFixture();
+    const gate = deferred();
+    const original = fixture.service.usageStatsService.getPublicModelWindows;
+    let calls = 0;
+    fixture.service.usageStatsService.getPublicModelWindows = async (...args) => {
+        if (++calls === 1) await gate.promise;
+        return original(...args);
+    };
+    const oldRequest = fixture.service.getSnapshot();
+    fixture.setVisible(["visible"]);
+    const current = await fixture.service.getSnapshot();
+    gate.resolve();
+    const previous = await oldRequest;
+    assert.deepEqual(
+        previous.models.map(item => item.model),
+        ["visible"]
+    );
+    assert.strictEqual(previous, current);
+    assert.strictEqual(await fixture.service.getSnapshot(), current);
+    assert.equal(calls, 2);
+});
+
+test("recent failure degrades safely and complete build failure releases pending promise", async () => {
+    const fixture = dashboardFixture(0);
+    const original = fixture.service.usageStatsService.getPublicModelWindows;
+    fixture.service.usageStatsService.getPublicModelWindows = async () => {
+        throw new Error("PRIVATE_DB");
+    };
+    const partial = await fixture.service.getSnapshot();
+    assert.equal(partial.model_stat_windows["24h"].status, "unavailable");
+    assert.equal(partial.models[0].recent_stats["24h"].total_requests, null);
+    assert.doesNotMatch(JSON.stringify(partial), /PRIVATE_DB/);
+    fixture.service.usageStatsService.getPublicModelWindows = original;
+    assert.equal((await fixture.service.getSnapshot()).model_stat_windows["24h"].status, "disabled");
+    const history = fixture.service.usageStatsService.getPublicSummarySnapshot;
+    fixture.service.usageStatsService.getPublicSummarySnapshot = () => {
+        throw new Error("failed build");
+    };
+    await assert.rejects(fixture.service.getSnapshot(), /failed build/);
+    assert.equal(fixture.service.pending, null);
+    fixture.service.usageStatsService.getPublicSummarySnapshot = history;
+    assert.ok(await fixture.service.getSnapshot());
+});
+
+test("recent DTO whitelists aggregates, sanitizes values and preserves history", async () => {
+    const fixture = dashboardFixture(0);
+    fixture.service.usageStatsService.getPublicModelWindows = async () => ({
+        models: [
+            {
+                clientIp: "203.0.113.99",
+                modelKey: "visible",
+                stats: {
+                    "1h": {
+                        averageDurationMs: -1,
+                        failedRequests: Infinity,
+                        successRate: 101,
+                        totalRequests: Number.MAX_SAFE_INTEGER + 1,
+                    },
+                    "24h": {
+                        averageDurationMs: 1234,
+                        failedRequests: 1,
+                        secret: "PRIVATE_VALUE",
+                        successRate: 66.666,
+                        totalRequests: 3,
+                    },
+                },
+            },
+        ],
+        windows: {
+            "1h": { status: "available" },
+            "24h": { from: "PRIVATE_FROM", secret: "PRIVATE_META", status: "available" },
+        },
+    });
+    const snapshot = await fixture.service.getSnapshot();
+    assert.deepEqual(snapshot.models[0].recent_stats["24h"], {
+        average_duration_ms: 1234,
+        failed_requests: 1,
+        success_rate: 66.7,
+        total_requests: 3,
+    });
+    assert.deepEqual(snapshot.models[0].recent_stats["1h"], {
+        average_duration_ms: 0,
+        failed_requests: 0,
+        success_rate: null,
+        total_requests: 0,
+    });
+    assert.equal(snapshot.schema_version, 1);
+    assert.equal(snapshot.history.enabled, false);
+    assert.doesNotMatch(JSON.stringify(snapshot), /PRIVATE_|203.0.113.99|clientIp|secret/);
 });

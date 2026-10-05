@@ -41,9 +41,9 @@ class PublicDashboardServer {
             return res.sendStatus(204);
         });
         app.get("/healthz", (req, res) => res.json({ status: "ok" }));
-        app.get("/api/public/dashboard", (req, res) => {
+        app.get("/api/public/dashboard", async (req, res) => {
             try {
-                const body = this.service.getSnapshot();
+                const body = await this.service.getSnapshot();
                 const serialized = JSON.stringify(body);
                 if (Buffer.byteLength(serialized) > 256 * 1024) throw new Error("Public dashboard response too large");
                 const etag = `"${crypto.createHash("sha256").update(serialized).digest("base64url")}"`;

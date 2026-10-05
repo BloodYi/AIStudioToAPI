@@ -540,8 +540,36 @@ function storageStatus() {
     };
 }
 
+// Both rolling windows share one indexed scan and one snapshot boundary.
+function publicModelWindows({ visibleModels, asOfMs }) {
+    const models = [...new Set(visibleModels.filter(model => typeof model === "string" && model.trim()))];
+    if (!Number.isSafeInteger(asOfMs)) throw new Error("Invalid snapshot time");
+    if (!models.length) return [];
+    const hour = asOfMs - 3600000;
+    return db
+        .prepare(
+            `
+        SELECT model,
+            COUNT(*) AS total_24h,
+            SUM(outcome = 'success') AS success_24h,
+            SUM(outcome IN ('error', 'aborted')) AS failed_24h,
+            SUM(duration_ms) AS duration_24h,
+            SUM(finished_at_ms >= ?) AS total_1h,
+            SUM(finished_at_ms >= ? AND outcome = 'success') AS success_1h,
+            SUM(finished_at_ms >= ? AND outcome IN ('error', 'aborted')) AS failed_1h,
+            SUM(CASE WHEN finished_at_ms >= ? THEN duration_ms ELSE 0 END) AS duration_1h
+        FROM requests
+        WHERE finished_at_ms >= ? AND finished_at_ms < ?
+            AND model IN (${models.map(() => "?").join(",")})
+        GROUP BY model
+    `
+        )
+        .all(hour, hour, hour, hour, asOfMs - DAY_MS, asOfMs, ...models);
+}
+
 async function handle(command, payload) {
     if (command === "insert") return insertRequest(payload);
+    if (command === "public_model_windows") return publicModelWindows(payload);
     if (command === "summary") return summary();
     if (command === "query") return queryRecords(payload || {});
     if (command === "cleanup") return cleanup(payload?.now);
