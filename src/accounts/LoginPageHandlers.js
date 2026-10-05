@@ -159,60 +159,125 @@ class LoginPageHandlers {
         }
         throw failure("terms_or_consent_required");
     }
-    async transition(limit = this.deadline) {
+    async observeStudioDialogs(limit = this.deadline) {
         this.guard();
-        if (new URL(this.page.url()).hostname !== "aistudio.google.com") return false;
-        const end = Math.min(limit, this.deadline, performance.now() + this.stepTimeout);
-        const dialogs = this.page.locator('[role="dialog"]').filter({ visible: true });
-        this.transitionDiagnostics = { scanCount: null, scannedDialogs: [] };
-        const countDialogs = async () => {
-            const count = await dialogs.count();
-            this.transitionDiagnostics.scanCount ??= count;
-            return count;
-        };
-        for (let index = 0; index < Math.min(await countDialogs(), 5); index++) {
-            this.guard();
-            const dialog = dialogs.nth(index);
-            this.operation = "terms_read";
-            const observed = await this.interaction.operation("text_read", () =>
-                dialog.evaluateAll(snapshotDialogs, true)
+        let observed, timer;
+        try {
+            if (new URL(this.page.url()).hostname !== "aistudio.google.com") throw failure("observation_unavailable");
+            const budget = Math.max(
+                1,
+                Math.min(limit, this.deadline, performance.now() + this.stepTimeout) - performance.now()
             );
-            this.transitionDiagnostics.viewport ??= observed.viewport;
-            const text = observed.dialogs[0]?.text ?? null;
-            this.transitionDiagnostics.scannedDialogs.push(observed.dialogs[0]?.summary || { disappeared: true });
-            // Observed informational spending-cap hint, never its settings action.
-            if (
-                !/New.*control API costs|新功能[：:].*控制 API 费用/i.test(text) ||
-                !/Set a monthly spending cap|设置每月支出上限/i.test(text) ||
-                !/Create spending cap|创建支出上限/i.test(text)
-            )
-                continue;
-            const nonblocking = await dialog.evaluate(node => {
-                const box = node.getBoundingClientRect();
-                return (
-                    node.getAttribute("aria-modal") !== "true" &&
-                    box.width * box.height < (innerWidth * innerHeight) / 4
-                );
-            });
-            this.transitionDiagnostics.scannedDialogs.at(-1).nonblockingResult = nonblocking;
-            if (!nonblocking) continue;
-            this.phase("aistudio_transition");
-            const close = dialog.getByRole("button", { name: /^(Close|Dismiss|关闭|關閉)$/i }).first();
-            this.transitionClicks ||= 0;
-            if ((await close.isVisible()) && this.transitionClicks < 2) {
-                this.transitionClicks++;
-                await this.interaction.click(close, { timeout: this.remaining(end) });
-                const observeUntil = Math.min(end, performance.now() + 1000);
-                while ((await dialog.isVisible()) && performance.now() < observeUntil) {
-                    this.guard();
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                }
-            }
-            // The exact known, nonmodal hint can remain visible without blocking
-            // service validation. Never select its optional spending-cap settings.
+            observed = await this.interaction.operation("text_read", () =>
+                Promise.race([
+                    this.page
+                        .locator('[role="dialog"], dialog, mat-dialog-container')
+                        .evaluateAll(snapshotDialogs, "business"),
+                    new Promise((_, reject) => {
+                        timer = setTimeout(() => reject(failure("observation_timeout")), budget);
+                    }),
+                ])
+            );
+        } catch {
+            this.guard();
+            observed = { dialogs: [], dialogState: "incomplete", knownHintCount: 0, termsCount: 0, unknownCount: 0 };
+        } finally {
+            clearTimeout(timer);
+        }
+        this.guard();
+        // Business evidence is a projection of this exact decision snapshot.
+        // The later, wider failure snapshot is explicitly separate evidence.
+        this.dialogObservation = {
+            ...observed,
+            diagnosticTruncated: observed.dialogs.length > 10,
+            dialogs: observed.dialogs.slice(0, 10),
+        };
+        return observed;
+    }
+    async transition(limit = this.deadline) {
+        const observed = await this.observeStudioDialogs(limit);
+        if (!["clear", "known_hint_only"].includes(observed.dialogState)) return false;
+        const hint = observed.dialogs.find(dialog => dialog.classification === "known_hint");
+        if (!hint) return false;
+        this.phase("aistudio_transition");
+        this.transitionClicks ||= 0;
+        if (!hint.closeButtonCandidate || this.transitionClicks >= 2) return true;
+        const end = Math.min(limit, this.deadline, performance.now() + this.stepTimeout);
+        // Pin the original node so a reordered/replaced candidate cannot receive
+        // a close action intended for the hint.
+        const handle = await this.page.evaluateHandle(
+            index => document.querySelectorAll('[role="dialog"], dialog, mat-dialog-container')[index] || null,
+            hint.index
+        );
+        const dialog = handle.asElement();
+        if (!dialog) {
+            await handle.dispose();
             return true;
         }
-        return false;
+        let close,
+            buttons = [];
+        try {
+            buttons = await dialog.$$('button, [role="button"]');
+            close = null;
+            for (const button of buttons) {
+                const isClose = await button.evaluate(node => {
+                    const name =
+                        (node.getAttribute("aria-labelledby") || "")
+                            .split(/\s+/)
+                            .map(id => document.getElementById(id)?.textContent || "")
+                            .join(" ")
+                            .trim() ||
+                        node.getAttribute("aria-label") ||
+                        node.innerText ||
+                        "";
+                    return node.getClientRects().length > 0 && /^(Close|Dismiss|关闭|關閉)$/i.test(name.trim());
+                });
+                if (isClose) {
+                    close = button;
+                    break;
+                }
+            }
+            if (!close) return true;
+            this.transitionClicks++;
+            await this.interaction.click(close, {
+                check: async () => {
+                    this.guard();
+                    if (performance.now() >= end) throw failure("page_transition_timeout");
+                    if (new URL(this.page.url()).hostname !== "aistudio.google.com") throw failure("challenge_changed");
+                    const classification = await dialog.evaluate(node => {
+                        const text = node.innerText || "";
+                        const box = node.getBoundingClientRect();
+                        return (
+                            node.isConnected &&
+                            !/terms of service|terms of use|Google APIs? terms|additional terms|服务条款|使用条款|服務條款|附加条款/i.test(
+                                text
+                            ) &&
+                            !node.querySelector('[role="dialog"], dialog, mat-dialog-container') &&
+                            node.getAttribute("aria-modal") !== "true" &&
+                            box.width > 0 &&
+                            box.height > 0 &&
+                            box.width * box.height < (innerWidth * innerHeight) / 4 &&
+                            /New.*control API costs|新功能[：:].*控制 API 费用/i.test(text) &&
+                            /Set a monthly spending cap|设置每月支出上限/i.test(text) &&
+                            /Create spending cap|创建支出上限/i.test(text)
+                        );
+                    });
+                    if (!classification) throw failure("challenge_changed");
+                },
+                timeout: Math.max(1, Math.floor(end - performance.now())),
+            });
+        } catch (cause) {
+            this.guard();
+            if (cause.name !== "TimeoutError" && cause.reason !== "challenge_changed") throw cause;
+            const after = await this.observeStudioDialogs(limit);
+            // A click timeout is recoverable only with a complete safe state.
+            if (!["clear", "known_hint_only"].includes(after.dialogState)) return false;
+        } finally {
+            await Promise.all(buttons.map(button => button.dispose()));
+            await dialog.dispose();
+        }
+        await this.observeStudioDialogs(limit);
+        return true;
     }
     async studioDialogDiagnostics() {
         // Failure was already decided. Bound best-effort collection so it cannot
@@ -237,7 +302,7 @@ class LoginPageHandlers {
         } finally {
             clearTimeout(timer);
         }
-        return { failureSnapshot, transitionScan: this.transitionDiagnostics };
+        return { businessSnapshot: this.dialogObservation, failureSnapshot, sameSnapshot: false };
     }
     remaining(end) {
         this.guard();

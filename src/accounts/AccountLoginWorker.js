@@ -170,22 +170,44 @@ async function nextButton(input, ready) {
 async function validateStudio(credentials) {
     if (!page.url().includes("/prompts/new_chat"))
         await page.goto("https://aistudio.google.com/u/0/prompts/new_chat", { waitUntil: "domcontentloaded" });
-    let readySince = null;
+    let readySince = null,
+        unknownRecheckCount = null;
     await waitForPage(async stepDeadline => {
-        const body = await page.locator("body").innerText();
-        if (
-            !/Failed to initialize applet|Available regions|not available in your country|地区.*不支持|Allow Drive access/i.test(
-                body
-            )
-        ) {
-            const accepted = await handlers.terms(stepDeadline);
-            const knownHint = await handlers.transition(stepDeadline);
-            if (accepted) readySince = null;
-            if (!accepted && !knownHint && (await visible('[role="dialog"], dialog, mat-dialog-container'))) {
-                diagnostics.failureSource = "studio_unrecognized_dialog";
-                diagnostics.studioDialogs = await handlers.studioDialogDiagnostics();
-                fail("manual_challenge");
-            }
+        const accepted = await handlers.terms(stepDeadline);
+        if (accepted) readySince = null;
+        let observed = await handlers.observeStudioDialogs(stepDeadline);
+        if (observed.dialogState === "known_hint_only") {
+            const previousClicks = handlers.transitionClicks || 0;
+            const handled = await handlers.transition(stepDeadline);
+            if (!handled || (handlers.transitionClicks || 0) !== previousClicks) readySince = null;
+            observed = await handlers.observeStudioDialogs(stepDeadline);
+        }
+        guard();
+        const allowed = ["clear", "known_hint_only"].includes(observed.dialogState);
+        if (!allowed) readySince = null;
+        if (allowed) unknownRecheckCount = null;
+        else if (observed.dialogState !== "terms_present")
+            unknownRecheckCount = unknownRecheckCount === null ? 0 : unknownRecheckCount + 1;
+        Object.assign(diagnostics, {
+            dialogState: observed.dialogState,
+            knownHintCount: observed.knownHintCount,
+            termsCount: observed.termsCount,
+            unknownCount: observed.unknownCount,
+            unknownRecheckCount: unknownRecheckCount ?? 0,
+        });
+        // Step/attempt deadlines take precedence over a dialog verdict and its
+        // best-effort failure diagnostics. Neither rechecks nor node replacement
+        // starts a new deadline or a new continuous unknown event.
+        if (performance.now() >= stepDeadline) fail("page_transition_timeout", true);
+        if (observed.dialogState === "terms_present") return false;
+        if (!allowed) {
+            if (unknownRecheckCount < 2) return false;
+            diagnostics.failureSource =
+                observed.dialogState === "incomplete"
+                    ? "studio_dialog_observation_incomplete"
+                    : "studio_unrecognized_dialog";
+            diagnostics.studioDialogs = await handlers.studioDialogDiagnostics();
+            fail("manual_challenge");
         }
         const ready =
             /Upgrade to unlock|升级.*解锁/i.test(await page.locator("body").innerText()) ||

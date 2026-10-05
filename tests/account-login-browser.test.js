@@ -111,6 +111,13 @@ async function run(options = {}) {
                             );
                         if (options.studioDialog && url.hostname === "aistudio.google.com")
                             html += options.studioDialog;
+                        if (
+                            options.finalDialog &&
+                            validationContext &&
+                            url.hostname === "aistudio.google.com" &&
+                            !url.pathname.startsWith("/apps/")
+                        )
+                            html += options.finalDialog;
                         return `<!doctype html><html><head><meta charset="utf-8"></head><body><main>${html}</main></body></html>`;
                     };
                     const originalRoute = context.route.bind(context);
@@ -135,11 +142,14 @@ async function run(options = {}) {
             require: name =>
                 name === "playwright"
                     ? mockPlaywright
-                    : name === "./LoginPageHandlers" && options.lateStudioDialog
+                    : name === "./LoginPageHandlers" && (options.lateStudioDialog || options.onStudioObservation)
                       ? class extends workerRequire(name) {
-                            async transition(...args) {
-                                const result = await super.transition(...args);
-                                if (!this.inserted) {
+                            async terms(...args) {
+                                const result = await super.terms(...args);
+                                if (options.lateStudioDialog && !this.inserted) {
+                                    // The legacy hint scan sees no dialogs. Insert
+                                    // at a fixed boundary before business classification.
+                                    assert.equal(await super.transition(...args), false);
                                     this.inserted = true;
                                     await this.page.evaluate(
                                         html => document.body.insertAdjacentHTML("beforeend", html),
@@ -147,6 +157,15 @@ async function run(options = {}) {
                                     );
                                 }
                                 return result;
+                            }
+                            async observeStudioDialogs(...args) {
+                                if (this.observationPage !== this.page) {
+                                    this.observationPage = this.page;
+                                    this.observations = 0;
+                                }
+                                this.observations++;
+                                await options.onStudioObservation?.(this.page, this.observations);
+                                return super.observeStudioDialogs(...args);
                             }
                         }
                       : workerRequire(name),
@@ -156,7 +175,12 @@ async function run(options = {}) {
         { filename: workerPath }
     );
     processMock.emit("message", {
-        config: { attemptTimeout: 90000, humanize: options.fast !== true, screenshotTimeout: 1000, stepTimeout: 10000 },
+        config: {
+            attemptTimeout: options.attemptTimeout || 90000,
+            humanize: options.fast !== true,
+            screenshotTimeout: 1000,
+            stepTimeout: options.stepTimeout || 10000,
+        },
         credentials: {
             email: "user@example.com",
             password: "synthetic",
@@ -411,7 +435,7 @@ test(
             '<h3>新功能：控制 API 费用</h3><p>设置每月支出上限，以防止意外超支</p><button>创建支出上限</button><button aria-label="Close">X</button><input value="password-secret">';
         for (const studioDialog of [
             `<div role="dialog" aria-modal="true" style="width:230px;height:150px">${hint}</div>`,
-            `<mat-dialog-container style="display:block;width:230px;height:150px">${hint}</mat-dialog-container>`,
+
             `<div role="dialog" style="width:230px;height:150px">${hint.replace("API 费用", "API&nbsp;费用")}</div>`,
         ]) {
             const result = await run({ fast: true, noTotp: true, studioDialog, upgrade: true });
@@ -425,16 +449,10 @@ test(
             assert.equal(dialog.closeButtonCandidate, true);
             assert.equal(dialog.width, 230);
             assert.equal(dialog.height, 150);
-            if (dialog.tag === "mat-dialog-container") {
-                assert.equal(evidence.transitionScan.scanCount, 0);
-                assert.equal(dialog.transitionCandidate, false);
-            } else {
-                assert.equal(evidence.transitionScan.scanCount, 1);
-                assert.equal(evidence.transitionScan.scannedDialogs.length, 1);
-                if (dialog.ariaModal === "true")
-                    assert.equal(evidence.transitionScan.scannedDialogs[0].nonblockingResult, false);
-                else assert.equal(evidence.transitionScan.scannedDialogs[0].textMatches.title, false);
-            }
+            assert.equal(evidence.businessSnapshot.scanCount, 1);
+            assert.equal(evidence.businessSnapshot.dialogs[0].classification, "unknown");
+            assert.equal(evidence.sameSnapshot, false);
+            assert.equal(result.diagnostics.unknownRecheckCount, 2);
             assert.ok(!JSON.stringify(evidence).includes("password-secret"));
             assert.ok(!JSON.stringify(evidence).includes("新功能"));
         }
@@ -447,7 +465,8 @@ test(
         const result = await run({ fast: true, lateStudioDialog: '<div role="dialog">Late hint</div>', noTotp: true });
         assert.equal(result.error, "manual_challenge");
         const evidence = result.diagnostics.studioDialogs;
-        assert.equal(evidence.transitionScan.scanCount, 0);
+        assert.equal(evidence.businessSnapshot.scanCount, 1);
+        assert.equal(evidence.businessSnapshot.dialogState, "unknown_present");
         assert.equal(evidence.failureSnapshot.count, 1);
     }
 );
@@ -468,5 +487,187 @@ test(
         assert.equal(evidence.failureSnapshot.dialogs[0].ariaModal, "other");
         for (const secret of ["private@example.com", "123456", "password-secret"])
             assert.ok(!JSON.stringify(evidence).includes(secret));
+    }
+);
+
+const costHint = `<div role="dialog" style="width:241px;height:129px"><p>新功能：控制 API 费用</p><p>设置每月支出上限</p><button onclick="throw Error('settings clicked')">创建支出上限</button></div>`;
+const unknownAuthorization = `<div role="dialog">Unknown authorization<button onclick="throw Error('authorization clicked')">Allow</button></div>`;
+test(
+    "real browser: fixed-boundary late cost hint passes full Worker identity and native target gates",
+    { skip: !executablePath },
+    async () => {
+        const options = { fast: true, lateStudioDialog: costHint, noTotp: true, upgrade: true };
+        const success = await run(options);
+        assert.ok(success.storageState, JSON.stringify(success));
+        assert.equal(success.targetInitialized, true);
+        assert.equal(success.diagnostics.dialogState, "clear");
+        assert.equal((await run({ ...options, mismatch: true })).error, "account_mismatch");
+        assert.equal((await run({ ...options, appFailure: true })).error, "service_initialization_failed");
+    }
+);
+test(
+    "real browser: safe hints never mask unknown authorizations in either DOM order or final context",
+    { skip: !executablePath },
+    async () => {
+        for (const studioDialog of [costHint + unknownAuthorization, unknownAuthorization + costHint]) {
+            const result = await run({ fast: true, noTotp: true, studioDialog });
+            assert.equal(result.error, "manual_challenge");
+            assert.equal(result.diagnostics.knownHintCount, 1);
+            assert.equal(result.diagnostics.unknownCount, 1);
+            assert.equal(result.diagnostics.unknownRecheckCount, 2);
+            assert.ok(!result.storageState);
+        }
+        const final = await run({
+            fast: true,
+            finalDialog: unknownAuthorization,
+            noTotp: true,
+            studioDialog: costHint,
+        });
+        assert.equal(final.error, "manual_challenge");
+        assert.ok(!final.storageState);
+    }
+);
+test(
+    "real browser: transient hint shells recover, persistent/replaced shells remain bounded",
+    { skip: !executablePath },
+    async () => {
+        const recovered = await run({
+            fast: true,
+            noTotp: true,
+            onStudioObservation: async (page, count) => {
+                if (count === 2)
+                    await page.locator("#shell").evaluate((node, html) => {
+                        node.outerHTML = html;
+                    }, costHint);
+            },
+            studioDialog: '<div role="dialog" id="shell" style="width:241px;height:129px"></div>',
+        });
+        assert.ok(recovered.storageState, JSON.stringify(recovered));
+        for (const replacement of [false, true]) {
+            const result = await run({
+                fast: true,
+                noTotp: true,
+                onStudioObservation: async (page, count) => {
+                    if (replacement && count > 1)
+                        await page.locator("#shell").evaluate(node => {
+                            node.replaceWith(node.cloneNode(true));
+                        });
+                },
+                studioDialog: '<div role="dialog" id="shell" style="width:241px;height:129px"></div>',
+            });
+            assert.equal(result.error, "manual_challenge");
+            assert.equal(result.diagnostics.unknownRecheckCount, 2);
+        }
+    }
+);
+test(
+    "real browser: business scope, candidate cap and conservative nested classification",
+    { skip: !executablePath },
+    async t => {
+        const { handler, page } = await handlerFixture(
+            t,
+            '<div class="cdk-overlay-pane" style="width:128px;height:34px">overlay</div>'
+        );
+        assert.equal((await handler.observeStudioDialogs()).dialogState, "clear");
+        assert.equal((await handler.studioDialogDiagnostics()).failureSnapshot.count, 1);
+        for (const html of [
+            costHint
+                .replace('div role="dialog"', 'mat-dialog-container role="dialog"')
+                .replace("</div>", "</mat-dialog-container>"),
+            costHint,
+        ]) {
+            await page.setContent(html);
+            assert.equal((await handler.observeStudioDialogs()).dialogState, "known_hint_only");
+            assert.equal(handler.transitionClicks, undefined);
+        }
+        await page.setContent(
+            `<mat-dialog-container style="display:block">${costHint}${unknownAuthorization}</mat-dialog-container>`
+        );
+        const nested = await handler.observeStudioDialogs();
+        assert.equal(nested.dialogState, "unknown_present");
+        assert.equal(nested.knownHintCount, 1);
+        assert.equal(nested.unknownCount, 2);
+        await page.setContent(costHint.repeat(21));
+        const capped = await handler.observeStudioDialogs();
+        assert.equal(capped.dialogState, "incomplete");
+        assert.equal(capped.truncated, true);
+        const evidence = await handler.studioDialogDiagnostics();
+        assert.equal(evidence.businessSnapshot.dialogs.length, 10);
+        assert.equal(evidence.businessSnapshot.diagnosticTruncated, true);
+        assert.equal(evidence.failureSnapshot.dialogs.length, 10);
+    }
+);
+test(
+    "real browser: close timeout recovers only through a complete current classification",
+    { skip: !executablePath },
+    async t => {
+        const html = costHint.replace("</div>", '<button aria-label="Close">X</button></div>');
+        const { handler, interaction, page } = await handlerFixture(t, html);
+        interaction.click = async () => {
+            await page.locator('[role="dialog"]').evaluate(node => node.remove());
+            throw Object.assign(new Error("private timeout"), { name: "TimeoutError" });
+        };
+        assert.equal(await handler.transition(), true);
+        assert.equal(handler.dialogObservation.dialogState, "clear");
+        await page.setContent(html);
+        interaction.click = async () => {
+            await page.locator('[role="dialog"]').evaluate(node => {
+                node.innerText = "Unknown authorization";
+            });
+            throw Object.assign(new Error("private timeout"), { name: "TimeoutError" });
+        };
+        assert.equal(await handler.transition(), false);
+        assert.equal(handler.dialogObservation.dialogState, "unknown_present");
+    }
+);
+
+test(
+    "real browser: hint whitelist stays strict across mutations, modal flags and oversized candidates",
+    { skip: !executablePath },
+    async t => {
+        const { handler, page } = await handlerFixture(t, costHint);
+        assert.equal((await handler.observeStudioDialogs()).dialogState, "known_hint_only");
+        for (const html of [
+            costHint.replace("控制 API 费用", "控制 API&nbsp;费用"),
+            costHint.replace('role="dialog"', 'role="dialog" aria-modal="true"'),
+            costHint.replace("width:241px;height:129px", "width:1400px;height:900px"),
+            unknownAuthorization,
+            costHint + unknownAuthorization,
+        ]) {
+            await page.setContent(html);
+            assert.equal((await handler.observeStudioDialogs()).dialogState, "unknown_present");
+        }
+        await page.setContent(
+            costHint + unknownAuthorization.replace('role="dialog"', 'role="dialog" style="display:none"')
+        );
+        assert.equal((await handler.observeStudioDialogs()).dialogState, "known_hint_only");
+        await page
+            .locator('[role="dialog"]')
+            .first()
+            .evaluate(node => node.remove());
+        assert.equal((await handler.observeStudioDialogs()).dialogState, "clear");
+    }
+);
+test(
+    "real browser: failed/expired diagnostic collection is sanitized and cannot classify the page as clear",
+    { skip: !executablePath },
+    async t => {
+        const { handler, page } = await handlerFixture(t, costHint);
+        const original = page.locator.bind(page);
+        page.locator = () => ({
+            evaluateAll: async () => {
+                throw new Error("private@example.com password-secret");
+            },
+        });
+        assert.equal((await handler.observeStudioDialogs()).dialogState, "incomplete");
+        const evidence = await handler.studioDialogDiagnostics();
+        assert.equal(evidence.failureSnapshot.status, "capture_failed");
+        assert.ok(!JSON.stringify(evidence).includes("password-secret"));
+        page.locator = () => ({ evaluateAll: () => new Promise(() => {}) });
+        const timed = await handler.studioDialogDiagnostics();
+        assert.equal(timed.failureSnapshot.status, "capture_timeout");
+        page.locator = original;
+        await page.close();
+        assert.equal((await handler.observeStudioDialogs()).dialogState, "incomplete");
     }
 );

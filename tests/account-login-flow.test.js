@@ -19,7 +19,8 @@ async function simulate(options = {}) {
         reentries = 0;
     const pins = [],
         phases = [],
-        screenshots = [];
+        screenshots = [],
+        dialogObservations = [];
     const visible = selector =>
         selector.includes("textarea")
             ? state === "studio"
@@ -126,6 +127,20 @@ async function simulate(options = {}) {
                 count: async () => (visible(selector) ? 1 : 0),
                 elementHandle: async () => locator,
                 evaluate: async () => true,
+                evaluateAll: async (_callback, mode) => {
+                    if (mode !== "business") return { count: 0, dialogs: [] };
+                    const states = options.dialogStates || ["clear"];
+                    const dialogState = states[Math.min(dialogObservations.length, states.length - 1)];
+                    dialogObservations.push(dialogState);
+                    if (options.observationFails) throw new Error("password-secret private@example.com");
+                    return {
+                        dialogs: [],
+                        dialogState,
+                        knownHintCount: dialogState === "known_hint_only" ? 1 : 0,
+                        termsCount: 0,
+                        unknownCount: dialogState === "unknown_present" ? 1 : 0,
+                    };
+                },
                 fill: async value => {
                     if (selector.includes("totpPin")) pins.push({ time: clock, value });
                 },
@@ -218,7 +233,12 @@ async function simulate(options = {}) {
         { filename: workerPath }
     );
     processMock.emit("message", {
-        config: { attemptTimeout: 180000, humanize: false, screenshotTimeout: 5000, stepTimeout: 30000 },
+        config: {
+            attemptTimeout: options.attemptTimeout || 180000,
+            humanize: false,
+            screenshotTimeout: 5000,
+            stepTimeout: options.stepTimeout || 30000,
+        },
         credentials: {
             email: "user@example.com",
             password: "synthetic-password",
@@ -227,7 +247,7 @@ async function simulate(options = {}) {
         targetUrl: options.missingTarget ? null : "https://ai.studio/apps/synthetic",
         token: "synthetic-token",
     });
-    return { phases, pins, result: await result, screenshots };
+    return { dialogObservations, phases, pins, result: await result, screenshots };
 }
 test("no two-step login verifies account and target app before saving complete storageState", async () => {
     const { result, phases } = await simulate();
@@ -309,4 +329,42 @@ test("TOTP challenge reentry resets local submissions but has an attempt-wide bo
     assert.equal(bounded.pins.length, 3);
     assert.equal(bounded.result.diagnostics.pageStateBefore, "totp_input");
     assert.ok(!JSON.stringify(bounded.result.diagnostics).includes(secret));
+});
+
+test("Studio unknown events allow exactly two rechecks, including replaced nodes and incomplete reads", async () => {
+    for (const options of [
+        { dialogStates: ["unknown_present"] },
+        { dialogStates: ["unknown_present", "incomplete", "unknown_present"] },
+        { observationFails: true },
+    ]) {
+        const { result, dialogObservations, phases } = await simulate(options);
+        assert.equal(result.error, "manual_challenge");
+        assert.equal(result.diagnostics.unknownRecheckCount, 2);
+        assert.equal(dialogObservations.length, 3);
+        assert.ok(!result.storageState);
+        assert.ok(!phases.includes("target_service_initialization"));
+        assert.ok(!JSON.stringify(result).includes("password-secret"));
+    }
+});
+test("Studio recovery restarts the stable interval and a later unknown event has its own bounded rechecks", async () => {
+    const recovered = await simulate({ dialogStates: ["unknown_present", "unknown_present", "clear"] });
+    assert.ok(recovered.result.storageState);
+    assert.ok(recovered.dialogObservations.length >= 10);
+    const interrupted = await simulate({
+        dialogStates: ["clear", "clear", "clear", "clear", "clear", "unknown_present"],
+    });
+    assert.equal(interrupted.result.error, "manual_challenge");
+    assert.equal(interrupted.dialogObservations.length, 8);
+    const newEvent = await simulate({ dialogStates: ["unknown_present", "clear", "unknown_present"] });
+    assert.equal(newEvent.dialogObservations.length, 5);
+    assert.equal(newEvent.result.diagnostics.unknownRecheckCount, 2);
+});
+test("Studio rechecks preserve step and attempt timeout precedence", async () => {
+    const step = await simulate({ dialogStates: ["unknown_present"], stepTimeout: 400 });
+    assert.equal(step.result.error, "page_transition_timeout");
+    assert.ok(!step.result.storageState);
+    assert.ok(!step.result.diagnostics.failureSource);
+    const attempt = await simulate({ attemptTimeout: 400, dialogStates: ["unknown_present"] });
+    assert.equal(attempt.result.error, "attempt_timeout");
+    assert.ok(!attempt.result.storageState);
 });
