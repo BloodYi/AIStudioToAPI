@@ -27,6 +27,7 @@ function loadSchedulerConfig(env = process.env) {
     );
     const globalConcurrency = integer("GLOBAL_MAX_CONCURRENCY", maxWorkers);
     const contextMaxConcurrency = integer("CONTEXT_MAX_CONCURRENCY", 0, 0);
+    // A background ready target among resident-eligible accounts; quota exhaustion may shrink it to zero.
     const contextPoolMinReady = integer("CONTEXT_POOL_MIN_READY", maxWorkers, 0);
     if (contextPoolMinReady > maxWorkers) throw new Error("CONTEXT_POOL_MIN_READY exceeds MAX_BROWSER_WORKERS");
     const accountConcurrency = integer("ACCOUNT_MAX_CONCURRENCY", 0, 0);

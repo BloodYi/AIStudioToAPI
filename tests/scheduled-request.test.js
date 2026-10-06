@@ -480,3 +480,64 @@ test("concurrent streams on one account keep request IDs and response queues iso
     assert.equal(fixture.scheduler.account(0).models.a.success_count, 8);
     fixture.scheduler.close();
 });
+
+test("hidden models reject every protocol before early stream headers or model discovery", async t => {
+    const cases = [
+        {
+            body: { messages: [{ content: "hi", role: "user" }], model: "flash-high-real-search", stream: true },
+            method: "processOpenAIRequest",
+            path: "/v1/chat/completions",
+        },
+        {
+            body: { input: "hi", model: "flash-high-real-code", stream: true },
+            method: "processOpenAIResponseRequest",
+            path: "/v1/responses",
+        },
+        {
+            body: {
+                max_tokens: 20,
+                messages: [{ content: "hi", role: "user" }],
+                model: "flash-high-real-search",
+                stream: true,
+            },
+            method: "processClaudeRequest",
+            path: "/v1/messages",
+        },
+        {
+            body: { contents: [{ parts: [{ text: "hi" }], role: "user" }] },
+            method: "processRequest",
+            path: "/v1beta/models/flash-high-real-search:streamGenerateContent",
+        },
+        { body: { input: "hi", model: "flash" }, method: "processOpenAIEmbeddingsRequest", path: "/v1/embeddings" },
+    ];
+    for (const entry of cases)
+        await t.test(entry.method, async () => {
+            const fixture = setup(() => success, {
+                scheduler: { allocation: { flash: { min: 0, preferred: 1 } }, streamEarlyHeaders: true },
+            });
+            fixture.scheduler.hideModel("flash");
+            const res = new Response();
+            const writes = [];
+            const write = res.write.bind(res);
+            res.write = value => {
+                writes.push(value);
+                return write(value);
+            };
+            const req = {
+                ...request(),
+                body: entry.body,
+                path: entry.path,
+                rawBody: Buffer.from(JSON.stringify(entry.body)),
+            };
+            await fixture.handler[entry.method](req, res);
+            assert.equal(res.statusCode, 403, res.body);
+            assert.deepEqual(writes, []);
+            assert.deepEqual(fixture.sent, []);
+            assert.equal(fixture.scheduler.pending.length, 0);
+            assert.equal(
+                [...fixture.scheduler.accounts.values()].some(account => Object.keys(account.models).length),
+                false
+            );
+            fixture.scheduler.close();
+        });
+});

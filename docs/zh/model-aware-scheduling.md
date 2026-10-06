@@ -50,7 +50,7 @@ SCHEDULER_STATE_PATH=data/scheduler-state.json
 | `ACCOUNT_ROTATION_STRATEGY`        | `least_recently_used` 默认；`least_used` 按调用次数优先；`legacy` 恢复原账号轮换                    |
 | `MAX_BROWSER_WORKERS`              | 最大缓存 context/page 数量                                                                          |
 | `GLOBAL_MAX_CONCURRENCY`           | 最大执行租约数，默认等于 context 上限，可以大于它                                                   |
-| `CONTEXT_POOL_MIN_READY`           | 后台维持的最少 ready context 数，不得超过 `MAX_BROWSER_WORKERS`                                     |
+| `CONTEXT_POOL_MIN_READY`           | 后台最少就绪目标，只对具备驻留资格的账号生效；可用账号不足或全部显示模型处于实际 429 冷却时可低于目标（含 0），不得超过 `MAX_BROWSER_WORKERS`                                     |
 | `CONTEXT_INIT_CONCURRENCY`         | 后台同时初始化的 context 数，默认 2                                                                 |
 | `CONTEXT_CREATION_TIMEOUT_MS`      | 串行 BrowserContext 创建阶段的超时毫秒数，默认 120000                                               |
 | `CONTEXT_MAX_CONCURRENCY`          | 单 context 并发硬上限，0 表示不限但仍执行 least-inflight                                            |

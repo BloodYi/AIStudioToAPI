@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const FormatConverter = require("./FormatConverter");
 const { isUserAbortedError } = require("../utils/CustomErrors");
 
 const schedulerError = (message, status = 503) => Object.assign(new Error(message), { status });
@@ -71,7 +72,10 @@ function calculateNextPacificResetAt(now, configuredTime, skipDate = null) {
 
 function normalizeModelName(model) {
     if (typeof model !== "string") throw schedulerError("Model must be a non-empty string", 400);
-    const normalized = model.trim().replace(/^models\//, "");
+    let normalized = model.trim().replace(/^models\//, "");
+    normalized = FormatConverter.parseModelBuiltInToolSuffixes(normalized).cleanModelName;
+    normalized = FormatConverter.parseModelStreamingModeSuffix(normalized).cleanModelName;
+    normalized = FormatConverter.parseModelThinkingLevel(normalized).cleanModelName;
     if (!normalized || normalized.length > MAX_MODEL_NAME_LENGTH)
         throw schedulerError(`Model must contain 1-${MAX_MODEL_NAME_LENGTH} characters`, 400);
     if (normalized.startsWith("__") || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(normalized))
@@ -166,6 +170,8 @@ class ModelScheduler {
         this.now = typeof config.now === "function" ? config.now : Date.now;
         this.setTimer = typeof config.setTimer === "function" ? config.setTimer : setTimeout;
         this.clearTimer = typeof config.clearTimer === "function" ? config.clearTimer : clearTimeout;
+        this.cooldownWakeTimer = null;
+        this.nextCooldownCheckAt = null;
         this.dailyResetTimer = null;
         this.lastDailyResetPacificDate = null;
         this.metrics = {
@@ -175,6 +181,7 @@ class ModelScheduler {
             upstream_error: 0,
         };
         this.load();
+        this._scheduleCooldownWake();
         if (this.config.dailyResetEnabled !== false) this._scheduleDailyReset();
     }
 
@@ -249,20 +256,107 @@ class ModelScheduler {
         return slot;
     }
 
+    getVisibleModels() {
+        return new Set(
+            [...this._snapshotModels()]
+                .filter(model => !model.startsWith("__"))
+                .filter(model => !this.hiddenModels.has(model))
+        );
+    }
+
+    isAccountQuotaExhausted(account, now = this.now(), models = this.getVisibleModels()) {
+        return (
+            models.size > 0 &&
+            [...models].every(model => {
+                const slot = account.models[model];
+                return slot?.rate_limited === true && slot.cooldown_until > now;
+            })
+        );
+    }
+
+    isAccountPoolResident(index, now = this.now(), models = this.getVisibleModels()) {
+        const account = this.account(index);
+        return (
+            this.authSource.getRotationIndices().includes(index) &&
+            account.healthy &&
+            !account.disabled &&
+            !this.authSource.isExpired?.(index) &&
+            !this.isAccountQuotaExhausted(account, now, models)
+        );
+    }
+
+    isResourceEligible(account, model, now = this.now()) {
+        const slot = account.models[model];
+        return (
+            account.healthy &&
+            !account.disabled &&
+            !this.authSource.isExpired?.(account.index) &&
+            !this.hiddenModels.has(model) &&
+            !slot?.unsupported &&
+            (!slot?.cooldown_until || slot.cooldown_until <= now)
+        );
+    }
+
+    assertModelAccessible(model) {
+        const normalized = model === "__files__" ? model : normalizeModelName(model);
+        if (this.hiddenModels.has(normalized)) throw schedulerError(`Model ${normalized} is disabled`, 403);
+        return normalized;
+    }
+
+    coordinateContextPool() {
+        if (this.closed || this.poolCoordinationQueued) return;
+        this.poolCoordinationQueued = true;
+        queueMicrotask(() => {
+            this.poolCoordinationQueued = false;
+            if (this.closed) return;
+            this._scheduleCooldownWake();
+            this.browserManager?.reconcileContextPool?.();
+        });
+    }
+
+    _scheduleCooldownWake() {
+        this.clearTimer(this.cooldownWakeTimer);
+        this.cooldownWakeTimer = null;
+        this.nextCooldownCheckAt = null;
+        if (this.closed) return;
+        const now = this.now();
+        const models = this.getVisibleModels();
+        const deadlines = [...this.accounts.values()].flatMap(account =>
+            [...models]
+                .map(model => account.models[model])
+                .filter(slot => slot?.rate_limited === true && slot.cooldown_until > now)
+                .map(slot => slot.cooldown_until)
+        );
+        if (!deadlines.length) return;
+        this.nextCooldownCheckAt = Math.min(...deadlines);
+        this.cooldownWakeTimer = this.setTimer(
+            () => {
+                this.cooldownWakeTimer = null;
+                if (this.closed) return;
+                const firedAt = this.now();
+                for (const account of this.accounts.values())
+                    for (const model of models) {
+                        const slot = account.models[model];
+                        if (slot?.rate_limited && slot.cooldown_until <= firedAt) {
+                            slot.rate_limited = false;
+                            slot.cooldown_until = 0;
+                        }
+                    }
+                this.sequence++;
+                this.saveSoon();
+                this.drain();
+                this._scheduleCooldownWake();
+            },
+            Math.min(2147483647, Math.max(1, this.nextCooldownCheckAt - now))
+        );
+        this.cooldownWakeTimer?.unref?.();
+    }
+
     eligibleAccounts(model, excluded = new Set()) {
         return this.authSource
             .getRotationIndices()
             .map(index => this.account(index))
-            .filter(account => {
-                const slot = this.slot(account, model);
-                return (
-                    account.healthy &&
-                    !account.disabled &&
-                    !excluded.has(account.key) &&
-                    !slot.unsupported &&
-                    slot.cooldown_until <= Date.now()
-                );
-            });
+            .filter(account => !excluded.has(account.key) && this.isResourceEligible(account, model));
     }
 
     candidates(model, excluded = new Set()) {
@@ -277,6 +371,7 @@ class ModelScheduler {
 
     canLease(account, model) {
         if (account.key === this.drainingAccount) return false;
+        if (model !== "__files__" && this.isAccountQuotaExhausted(account)) return false;
         const accountLimit = this.config.accountConcurrency || 0;
         const modelLimit = this.config.accountModelConcurrency?.[model] ?? accountLimit;
         if (accountLimit && account.inflight >= accountLimit) return false;
@@ -298,9 +393,17 @@ class ModelScheduler {
 
     acquire(model, excluded = new Set(), signal) {
         if (this.closed) return Promise.reject(schedulerError("Scheduler is shutting down"));
+        try {
+            model = this.assertModelAccessible(model);
+        } catch (error) {
+            return Promise.reject(error);
+        }
         if (signal?.aborted) return Promise.reject(schedulerError("Client disconnected", 499));
-        if (!this.eligibleAccounts(model, excluded).length)
-            return Promise.reject(schedulerError(`No eligible accounts for model ${model}`));
+        const eligible = this.eligibleAccounts(model, excluded);
+        if (!eligible.length) return Promise.reject(schedulerError(`No eligible accounts for model ${model}`));
+        // Record accepted discovery only after validation and access checks. Other
+        // accounts remain unknown until they actually participate in this model.
+        this.slot(eligible[0], model, this.now());
         return new Promise((resolve, reject) => {
             const item = { createdAt: Date.now(), excluded, model, order: ++this.sequence, reject, resolve, signal };
             item.abort = () => {
@@ -331,17 +434,23 @@ class ModelScheduler {
         if (index >= 0) this.pending.splice(index, 1);
         clearTimeout(item.timer);
         item.signal?.removeEventListener("abort", item.abort);
+        this.coordinateContextPool();
     }
 
     drain() {
-        if (this.closed || this.paused) return;
+        if (this.closed) return;
+        this.coordinateContextPool();
         // Reservation and selection are synchronous: there is no await between checking and leasing.
         for (const item of [...this.pending]) {
-            if (!this.eligibleAccounts(item.model, item.excluded).length) {
+            if (this.hiddenModels.has(item.model)) {
+                this.remove(item);
+                item.reject(schedulerError(`Model ${item.model} is disabled`, 403));
+            } else if (!this.eligibleAccounts(item.model, item.excluded).length) {
                 this.remove(item);
                 item.reject(schedulerError(`No eligible accounts for model ${item.model}`));
             }
         }
+        if (this.paused) return;
         this._signalContextDemand();
         // Stop replenishing one context when a waiting model needs a different account.
         // Existing streams finish normally; this prevents permanent starvation at capacity.
@@ -492,7 +601,7 @@ class ModelScheduler {
         if (kind === "unsupported") slot.unsupported = true;
         if (kind === "rate_limited") {
             slot.rate_limited = true;
-            slot.cooldown_until = Date.now() + this.config.rateLimitCooldownMs;
+            slot.cooldown_until = this.now() + this.config.rateLimitCooldownMs;
         }
         if (kind === "temporary")
             slot.cooldown_until =
@@ -510,7 +619,9 @@ class ModelScheduler {
                 `[Scheduler] Risk control account #${account.index}, model ${lease.model}, consecutive=${slot.risk_control_failures}, cooldown_until=${slot.cooldown_until}`
             );
         }
+        this.sequence++;
         this.saveSoon();
+        this.coordinateContextPool();
     }
 
     release(lease, success = false) {
@@ -755,15 +866,17 @@ class ModelScheduler {
     }
 
     _snapshotModels() {
-        return new Set([
-            ...Object.keys(this.config.allocation),
-            ...this.pending.map(item => item.model),
-            ...[...this.accounts.values()].flatMap(account => Object.keys(account.models)),
-        ]);
+        return new Set(
+            [
+                ...Object.keys(this.config.allocation),
+                ...this.pending.map(item => item.model),
+                ...[...this.accounts.values()].flatMap(account => Object.keys(account.models)),
+            ].map(model => (model.startsWith("__") ? model : normalizeModelName(model)))
+        );
     }
 
     _visibleSnapshotModels() {
-        return new Set([...this._snapshotModels()].filter(model => !this.hiddenModels.has(model)));
+        return this.getVisibleModels();
     }
 
     hideModel(model) {
@@ -773,6 +886,7 @@ class ModelScheduler {
         this.hiddenModels.add(normalized);
         this.sequence++;
         this.flush();
+        this.drain();
         return { changed: true, hidden: true, model: normalized };
     }
 
@@ -783,6 +897,7 @@ class ModelScheduler {
             this.sequence++;
             this.flush();
         }
+        this.drain();
         return { changed, hidden: false, model: normalized };
     }
 
@@ -866,7 +981,7 @@ class ModelScheduler {
     }
 
     summarySnapshot() {
-        const now = Date.now();
+        const now = this.now();
         const indices = this.authSource.getRotationIndices();
         for (const index of indices) this.account(index);
         const models = this._visibleSnapshotModels();
@@ -879,9 +994,11 @@ class ModelScheduler {
             let dailyRequests = 0;
             let estimatedRemainingQuota = 0;
             for (const account of quotaAccounts) {
-                const slot = this.slot(account, model, now);
-                dailyRequests += slot.daily_request_count;
-                estimatedRemainingQuota += Math.max(0, limit - slot.daily_request_count);
+                const slot = account.models[model];
+                const requests =
+                    slot?.daily_request_date === this.getPacificDateKey(now) ? slot.daily_request_count : 0;
+                dailyRequests += requests;
+                estimatedRemainingQuota += Math.max(0, limit - requests);
             }
             return {
                 daily_requests: dailyRequests,
@@ -901,9 +1018,23 @@ class ModelScheduler {
             active_workers: this.workers.filter(worker => worker.lease).length,
             busy_browser_workers: busyContexts,
             contexts_summary: {
+                all_visible_models_rate_limited:
+                    models.size > 0 &&
+                    indices.length > 0 &&
+                    indices.every(index => this.isAccountQuotaExhausted(this.account(index), now, models)),
                 busy: busyContexts,
+                configured_min_ready: this.config.contextPoolMinReady,
+                draining: contexts.filter(context => context.draining).length,
+                effective_warm_target: Math.min(
+                    this.config.contextPoolMinReady,
+                    indices.filter(index => this.isAccountPoolResident(index, now, models)).length
+                ),
                 initializing: contextCount("INITIALIZING"),
                 max: this.config.maxWorkers,
+                next_cooldown_check_at: this.nextCooldownCheckAt,
+                quota_exhausted_accounts: indices.filter(index =>
+                    this.isAccountQuotaExhausted(this.account(index), now, models)
+                ).length,
                 ready: readyContexts,
                 reconnecting: contextCount("RECONNECTING"),
                 unavailable: contextCount("UNAVAILABLE"),
@@ -1004,6 +1135,7 @@ class ModelScheduler {
                 auth_index: context.auth_index,
                 connection_epoch: context.connection_epoch || null,
                 created_at: context.created_at || null,
+                drain_reason: context.drain_reason || null,
                 draining: Boolean(context.draining),
                 eviction_priority: context.eviction_priority || null,
                 inflight: context.inflight || 0,
@@ -1025,7 +1157,7 @@ class ModelScheduler {
             accounts: requested.map(index => {
                 const account = this.account(index);
                 const models = Object.keys(account.models)
-                    .filter(model => !this.hiddenModels.has(model))
+                    .filter(model => !model.startsWith("__") && !this.hiddenModels.has(model))
                     .sort()
                     .map(model => {
                         const slot = this.slot(account, model, now);
@@ -1246,6 +1378,9 @@ class ModelScheduler {
 
     close() {
         this.closed = true;
+        this.clearTimer(this.cooldownWakeTimer);
+        this.cooldownWakeTimer = null;
+        this.nextCooldownCheckAt = null;
         this.clearTimer(this.dailyResetTimer);
         this.dailyResetTimer = null;
         for (const item of [...this.pending]) {

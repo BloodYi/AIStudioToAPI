@@ -410,7 +410,7 @@ test("state persists across restart but leases never do", async () => {
     fs.rmSync(directory, { recursive: true });
 });
 
-test("hidden models are filtered only from management snapshots and remain schedulable", async () => {
+test("hidden models preserve history and reject new leases until restored", async () => {
     const scheduler = setup(
         {
             allocation: {
@@ -460,11 +460,9 @@ test("hidden models are filtered only from management snapshots and remain sched
 
     slot.cooldown_until = 0;
     slot.rate_limited = false;
-    const lease = await scheduler.acquire("gemini-3-flash");
-    scheduler.startAttempt(lease);
-    scheduler.release(lease, true);
+    await assert.rejects(scheduler.acquire("gemini-3-flash"), error => error.status === 403);
     assert.equal(scheduler.isModelHidden("gemini-3-flash"), true);
-    assert.equal(slot.request_count, 10);
+    assert.equal(slot.request_count, 9);
     assert.equal(
         scheduler.summarySnapshot().models.some(model => model.model === "gemini-3-flash"),
         false
@@ -475,6 +473,9 @@ test("hidden models are filtered only from management snapshots and remain sched
         hidden: false,
         model: "gemini-3-flash",
     });
+    const lease = await scheduler.acquire("gemini-3-flash");
+    scheduler.startAttempt(lease);
+    scheduler.release(lease, true);
     assert.equal(scheduler.snapshot().accounts[0].models["gemini-3-flash"].request_count, 10);
     assert.equal(scheduler.showModel("gemini-3-flash").changed, false);
     assert.throws(
@@ -1119,4 +1120,86 @@ test("cold model demand does not block requests using an existing ready context"
     await assert.rejects(cold);
     scheduler.release(hot);
     scheduler.close();
+});
+
+test("visible quota exhaustion is pure and requires actual unexpired 429 for every model", () => {
+    const scheduler = setup({ allocation: { flash: { min: 0, preferred: 1 }, pro: { min: 0, preferred: 1 } } }, 1);
+    const account = scheduler.account(0);
+    assert.equal(scheduler.isAccountQuotaExhausted(account, 1000), false);
+    assert.deepEqual(Object.keys(account.models), []);
+    account.models.pro = { cooldown_until: 2000, rate_limited: true };
+    assert.equal(scheduler.isAccountQuotaExhausted(account, 1000), false);
+    account.models.flash = { cooldown_until: 2000, rate_limited: true };
+    account.models.__files__ = {};
+    assert.deepEqual([...scheduler.getVisibleModels()].sort(), ["flash", "pro"]);
+    assert.equal(scheduler.isAccountQuotaExhausted(account, 1000), true);
+    assert.equal(scheduler.isAccountQuotaExhausted(account, 2000), false);
+    for (const kind of ["risk_controlled", "temporary", "transport", "unsupported"]) {
+        account.models.flash = {
+            cooldown_until: 2000,
+            daily_request_count: 100,
+            last_error_kind: kind,
+            rate_limited: false,
+            unsupported: kind === "unsupported",
+        };
+        assert.equal(scheduler.isAccountQuotaExhausted(account, 1000), false);
+    }
+    scheduler.hiddenModels = new Set(["flash", "pro"]);
+    assert.equal(scheduler.isAccountQuotaExhausted(account, 1000), false);
+    scheduler.close();
+});
+
+test("hidden model queues reject immediately while existing leases finish", async () => {
+    const scheduler = setup({ allocation: {}, globalConcurrency: 1 }, 1);
+    const lease = await scheduler.acquire("gemini-3-pro");
+    const pending = scheduler.acquire("gemini-3-pro");
+    scheduler.hideModel("models/gemini-3-pro-high-fake-search");
+    await assert.rejects(pending, error => error.status === 403);
+    await assert.rejects(scheduler.acquire("gemini-3-pro-high-real-code"), error => error.status === 403);
+    assert.equal(lease.released, false);
+    assert.equal(lease.account.inflight, 1);
+    scheduler.release(lease, true);
+    assert.equal(scheduler.pending.length, 0);
+    scheduler.close();
+});
+
+test("persisted cooldown rebuilds a single wake timer on restart and clears it at shutdown", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "scheduler-wake-"));
+    const statePath = path.join(directory, "state.json");
+    const now = Date.now();
+    const first = setup({ dailyResetEnabled: false, statePath }, 1);
+    const slot = first.slot(first.account(0), "pro");
+    Object.assign(slot, { cooldown_until: now + 60000, rate_limited: true });
+    first.close();
+    const timers = [];
+    const cleared = [];
+    const second = setup(
+        {
+            clearTimer: timer => {
+                if (timer) cleared.push(timer);
+            },
+            dailyResetEnabled: false,
+            now: () => now,
+            setTimer(callback, delay) {
+                const timer = { callback, delay, unref() {} };
+                timers.push(timer);
+                return timer;
+            },
+            statePath,
+        },
+        1
+    );
+    assert.equal(timers.length, 1);
+    assert.equal(timers[0].delay, 60000);
+    assert.equal(second.nextCooldownCheckAt, now + 60000);
+    assert.equal(second.isAccountPoolResident(0), false);
+    second.hideModel("pro");
+    second._scheduleCooldownWake();
+    assert.equal(second.nextCooldownCheckAt, null);
+    second.showModel("pro");
+    second._scheduleCooldownWake();
+    assert.equal(timers.length, 2);
+    second.close();
+    assert.equal(cleared.at(-1), timers[1]);
+    fs.rmSync(directory, { recursive: true });
 });

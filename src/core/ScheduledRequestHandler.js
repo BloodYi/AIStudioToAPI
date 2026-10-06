@@ -128,6 +128,7 @@ class ScheduledRequestHandler extends RequestHandler {
             }
         }
         this.model ||= "__files__";
+        this.model = this.scheduler.assertModelAccessible(this.model);
         let body;
         try {
             body = JSON.parse(proxyRequest.body || "{}");

@@ -53,6 +53,28 @@
             </div>
         </div>
 
+        <p v-if="data.contexts_summary" class="header-sub" :title="t('schedulerPoolTargetTip')">
+            {{
+                t("schedulerPoolTarget", {
+                    configured: data.contexts_summary.configured_min_ready ?? 0,
+                    effective: data.contexts_summary.effective_warm_target ?? 0,
+                    ready: data.contexts_summary.ready ?? 0,
+                    draining: data.contexts_summary.draining ?? 0,
+                    exhausted: data.contexts_summary.quota_exhausted_accounts ?? 0,
+                })
+            }}
+        </p>
+        <p v-if="data.contexts_summary?.all_visible_models_rate_limited" class="scheduler-empty">
+            {{ t("schedulerPoolExhausted") }}
+        </p>
+        <p v-if="data.contexts_summary?.next_cooldown_check_at" class="header-sub">
+            {{
+                t("schedulerPoolNextCheck", {
+                    time: new Date(data.contexts_summary.next_cooldown_check_at).toLocaleString(),
+                })
+            }}
+        </p>
+
         <!-- 2. Quota Section -->
         <div class="quota-section" :title="t('schedulerEstimatedQuotaTooltip')">
             <div class="quota-header">
@@ -339,8 +361,15 @@
                                 <span class="node-state-tag">{{ context.state }}</span>
                             </div>
                             <div class="node-body">
+                                <span v-if="context.draining" class="node-sub-text">
+                                    {{
+                                        context.drain_reason === "visible_models_rate_limited"
+                                            ? t("schedulerPoolQuotaDraining")
+                                            : context.drain_reason
+                                    }}
+                                </span>
                                 <span
-                                    v-if="context.last_disconnect_reason"
+                                    v-else-if="context.last_disconnect_reason"
                                     class="node-error-text"
                                     :title="context.last_disconnect_reason"
                                 >
@@ -411,6 +440,13 @@
                                 <td>
                                     <span class="status-badge" :class="'badge-' + (context.state || '').toLowerCase()">
                                         {{ context.state }}
+                                    </span>
+                                    <span v-if="context.draining" class="node-sub-text">
+                                        {{
+                                            context.drain_reason === "visible_models_rate_limited"
+                                                ? t("schedulerPoolQuotaDraining")
+                                                : context.drain_reason
+                                        }}
                                     </span>
                                 </td>
                                 <td class="font-mono">{{ context.inflight }}</td>

@@ -799,3 +799,264 @@ test("RPC timeouts require distinct accounts before browser recovery is triggere
     manager._recordBrowserRpcTimeout({ authIndex: 2 }, { operation: "locator.count" });
     assert.deepEqual(recoveries, ["playwright_rpc_timeout"]);
 });
+
+function quotaPoolFixture(overrides = {}) {
+    const manager = browserFixture(3);
+    manager.authSource.accountNameMap = new Map();
+    const scheduler = new ModelScheduler(
+        {
+            ...loadSchedulerConfig({ MAX_BROWSER_WORKERS: "3" }),
+            contextPoolMinReady: 3,
+            dailyResetEnabled: false,
+            statePath: null,
+            ...overrides,
+        },
+        manager.authSource,
+        logger
+    );
+    manager.scheduler = scheduler;
+    scheduler.browserManager = manager;
+    manager.closingContexts = new Set();
+    manager.connectionRegistry.getConnectionEpoch = () => null;
+    manager.closedIndices = [];
+    manager.closeContext = async function (index) {
+        assert.equal(this._isContextIdle(index), true);
+        this.closedIndices.push(index);
+        this.pendingContextClosures.delete(index);
+        this.contexts.delete(index);
+    };
+    return { manager, scheduler };
+}
+
+function exhaust(scheduler, index, model = "pro", deadline = scheduler.now() + 60000) {
+    Object.assign(scheduler.slot(scheduler.account(index), model, scheduler.now()), {
+        cooldown_until: deadline,
+        rate_limited: true,
+    });
+}
+
+test("quota eviction releases every idle context and never rewarms exhausted accounts", async () => {
+    const { manager, scheduler } = quotaPoolFixture();
+    manager.startContextPool();
+    await waitForPool(manager, 3);
+    for (const index of [0, 1, 2]) exhaust(scheduler, index);
+    // Internal slots must not prevent quota eviction.
+    scheduler.slot(scheduler.account(0), "__files__");
+    scheduler.coordinateContextPool();
+    await waitForPool(manager, 0);
+    assert.equal(manager.contexts.size, 0);
+    assert.deepEqual(manager._poolCandidates(), []);
+    assert.equal(scheduler.summarySnapshot().contexts_summary.effective_warm_target, 0);
+    assert.equal(scheduler.summarySnapshot().contexts_summary.all_visible_models_rate_limited, true);
+    manager._pumpContextPool();
+    await waitForPool(manager, 0);
+    assert.equal(manager.closedIndices.length, 3);
+    scheduler.resetAllRateLimits();
+    await waitForPool(manager, 3);
+    assert.equal(manager.contexts.size, 3);
+    scheduler.close();
+});
+
+test("multiple exhausted accounts drain leases and message queues independently", async () => {
+    const { manager, scheduler } = quotaPoolFixture();
+    manager.startContextPool();
+    await waitForPool(manager, 3);
+    const leases = await Promise.all([scheduler.acquire("pro"), scheduler.acquire("pro")]);
+    const queuedAuth = leases[1].account.index;
+    let queueBusy = true;
+    manager.connectionRegistry.hasMessageQueueForAuth = index => index === queuedAuth && queueBusy;
+    for (const lease of leases) exhaust(scheduler, lease.account.index);
+    scheduler.coordinateContextPool();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.pendingContextClosures.size, 2);
+    assert.equal(manager.closedIndices.length, 0);
+    for (const lease of leases) assert.equal(scheduler.canLease(lease.account, "pro"), false);
+    scheduler.release(leases[0]);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contexts.has(leases[0].account.index), false);
+    scheduler.release(leases[1]);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contexts.has(queuedAuth), true);
+    queueBusy = false;
+    manager.handleAccountLeaseReleased(queuedAuth);
+    await waitForPool(manager, 1);
+    assert.equal(manager.contexts.size, 1);
+    assert.equal(scheduler.summarySnapshot().contexts_summary.effective_warm_target, 1);
+    scheduler.close();
+});
+
+test("quota recovery cancels pending drains while preserving capacity and disabled drains", async () => {
+    const { manager, scheduler } = quotaPoolFixture();
+    manager.startContextPool();
+    await waitForPool(manager, 3);
+    const lease = await scheduler.acquire("pro");
+    exhaust(scheduler, lease.account.index);
+    scheduler.coordinateContextPool();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contexts.get(lease.account.index).draining, true);
+    // A new, unknown model restores resident eligibility without creating its slot.
+    scheduler.config.allocation.flash = { min: 0, preferred: 1 };
+    scheduler.coordinateContextPool();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contexts.get(lease.account.index).draining, false);
+    assert.equal(lease.account.models.flash, undefined);
+    manager.beginAccountDrain(lease.account.index, "context_capacity");
+    scheduler.coordinateContextPool();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contexts.get(lease.account.index).draining, true);
+    scheduler.disable(lease.account.index);
+    scheduler.resetAllRateLimits();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contexts.get(lease.account.index).drainReason, "account_disabled");
+    scheduler.release(lease);
+    await waitForPool(manager, 2);
+    scheduler.close();
+});
+
+test("zero context pool wakes at natural cooldown expiry even with daily reset disabled", async () => {
+    let now = Date.now();
+    const timers = [];
+    const { manager, scheduler } = quotaPoolFixture({
+        clearTimer() {},
+        now: () => now,
+        setTimer(callback, delay) {
+            const timer = { callback, delay, unref() {} };
+            timers.push(timer);
+            return timer;
+        },
+    });
+    for (const index of [0, 1, 2]) exhaust(scheduler, index, "pro", now + 1000);
+    manager.startContextPool();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contexts.size, 0);
+    assert.equal(timers.at(-1).delay, 1000);
+    now += 1000;
+    timers.at(-1).callback();
+    await waitForPool(manager, 3);
+    assert.equal(manager.contexts.size, 3);
+    assert.equal(scheduler.nextCooldownCheckAt, null);
+    scheduler.close();
+});
+
+test("new model and internal file demand can initialize a fully exhausted pool", async t => {
+    for (const model of ["flash", "__files__"])
+        await t.test(model, async () => {
+            const { manager, scheduler } = quotaPoolFixture({ contextPoolMinReady: 0 });
+            for (const index of [0, 1, 2]) exhaust(scheduler, index);
+            manager.startContextPool();
+            const lease = await scheduler.acquire(model);
+            assert.equal(manager.contexts.size, 1);
+            assert.equal(manager.isContextReady(lease.account.index), true);
+            scheduler.release(lease, true);
+            scheduler.coordinateContextPool();
+            await new Promise(resolve => setImmediate(resolve));
+            if (model === "__files__") {
+                await waitForPool(manager, 0);
+                assert.equal(manager.contexts.size, 0);
+            } else assert.equal(manager.contexts.size, 1);
+            scheduler.close();
+        });
+});
+
+test("quota changes during initialization prevent publication without transport failures", async () => {
+    const { manager, scheduler } = quotaPoolFixture({ contextPoolMinReady: 1 });
+    const initialize = manager._initializeContext;
+    manager._initializeContext = async function (index, ...args) {
+        await initialize.call(this, index, ...args);
+        for (const candidate of [0, 1, 2]) exhaust(scheduler, candidate);
+    };
+    manager.startContextPool();
+    await waitForPool(manager, 0);
+    assert.equal(manager.contexts.size, 0);
+    assert.equal(manager.contextUnavailable.size, 0);
+    assert.equal(manager._contextInitTasks.size, 0);
+    scheduler.close();
+});
+
+test("exhausted idle accounts are replaced in the background within capacity", async () => {
+    const { manager, scheduler } = quotaPoolFixture({ contextPoolMinReady: 2, maxWorkers: 2 });
+    manager.startContextPool();
+    await waitForPool(manager, 2);
+    exhaust(scheduler, 0);
+    scheduler.coordinateContextPool();
+    await new Promise(resolve => setImmediate(resolve));
+    await waitForPool(manager, 2);
+    // waitForPool also waits for replacement initialization.
+    assert.equal(manager.contexts.has(0), false);
+    assert.equal(manager.contexts.has(2), true);
+    assert.ok(manager.peak <= 2);
+    scheduler.close();
+});
+
+test("hiding the only available model drains accounts and hiding all restores empty-set warming", async () => {
+    const { manager, scheduler } = quotaPoolFixture({
+        allocation: { flash: { min: 0, preferred: 1 }, pro: { min: 0, preferred: 1 } },
+    });
+    for (const index of [0, 1, 2]) exhaust(scheduler, index);
+    manager.startContextPool();
+    await waitForPool(manager, 3);
+    scheduler.hideModel("flash");
+    await new Promise(resolve => setImmediate(resolve));
+    await waitForPool(manager, 0);
+    assert.equal(manager.contexts.size, 0);
+    scheduler.hideModel("pro");
+    await waitForPool(manager, 3);
+    assert.equal(manager.contexts.size, 3);
+    await assert.rejects(scheduler.acquire("pro"), error => error.status === 403);
+    scheduler.close();
+});
+
+test("quota recovery during an already started close completes closing then reloads once", async () => {
+    const { manager, scheduler } = quotaPoolFixture({ contextPoolMinReady: 1 });
+    manager.startContextPool();
+    await waitForPool(manager, 1);
+    let finishClose;
+    const closing = new Promise(resolve => {
+        finishClose = resolve;
+    });
+    const close = manager.closeContext;
+    manager._poolClosingContexts = new Set();
+    manager.closeContext = async function (index) {
+        this._poolClosingContexts.add(index);
+        await close.call(this, index);
+        await closing;
+        this._poolClosingContexts.delete(index);
+        scheduler.coordinateContextPool();
+    };
+    for (const index of [0, 1, 2]) exhaust(scheduler, index);
+    scheduler.coordinateContextPool();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contexts.size, 0);
+    scheduler.resetAllRateLimits();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contexts.has(0), false);
+    finishClose();
+    await waitForPool(manager, 1);
+    assert.equal(manager.contexts.size, 1);
+    assert.equal(manager.closedIndices.length, 1);
+    scheduler.close();
+});
+
+test("an actual 429 triggers retirement automatically while a usable Flash keeps its context", async () => {
+    const { manager, scheduler } = quotaPoolFixture({
+        allocation: { flash: { min: 0, preferred: 1 }, pro: { min: 0, preferred: 1 } },
+    });
+    manager.startContextPool();
+    await waitForPool(manager, 3);
+    const lease = await scheduler.acquire("pro");
+    scheduler.startAttempt(lease);
+    scheduler.failure(lease, { message: "RESOURCE_EXHAUSTED", status: 429 });
+    scheduler.release(lease);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contexts.has(lease.account.index), true);
+    const flash = await scheduler.acquire("flash", new Set(["auth-1", "auth-2"]));
+    assert.equal(flash.account.index, lease.account.index);
+    scheduler.startAttempt(flash);
+    scheduler.failure(flash, { message: "RESOURCE_EXHAUSTED", status: 429 });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contexts.get(flash.account.index).draining, true);
+    scheduler.release(flash);
+    await waitForPool(manager, 2);
+    assert.equal(manager.contexts.has(flash.account.index), false);
+    scheduler.close();
+});
