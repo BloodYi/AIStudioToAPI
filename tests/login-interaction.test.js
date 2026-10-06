@@ -116,6 +116,30 @@ test("challenge checks stop typing between keys when the page changes", async ()
     );
     assert.equal(text(), "1");
 });
+test("click failure diagnostics survive a later consent snapshot", async () => {
+    const { interaction, locator } = setup({ humanize: false });
+    locator.click = async () => {
+        throw Object.assign(new Error("synthetic timeout"), { name: "TimeoutError" });
+    };
+    let failure;
+    try {
+        await interaction.click(locator);
+    } catch (cause) {
+        failure = cause;
+    }
+    await interaction.operation("text_read", async () => null);
+    assert.equal(interaction.diagnostics.operationPart, "text_read");
+    assert.equal(failure.operationDiagnostics.operationPart, "click");
+    assert.equal(failure.operationDiagnostics.operationElapsedMs, 0);
+});
+test("onboarding ignores uninitialized and foreign frames", async () => {
+    const LoginPageHandlers = require("../src/accounts/LoginPageHandlers");
+    const handler = new LoginPageHandlers({
+        guard() {},
+        page: { frames: () => ["", "about:blank", "https://untrusted.example/"].map(url => ({ url: () => url })) },
+    });
+    assert.equal(await handler.skipOnboarding(), false);
+});
 
 test("Studio diagnostic capture failures and deadlines remain best effort", async () => {
     const LoginPageHandlers = require("../src/accounts/LoginPageHandlers");

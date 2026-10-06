@@ -37,6 +37,10 @@ class LoginInteraction {
             return await action();
         } catch (cause) {
             cause.operationPart = part;
+            cause.operationDiagnostics = {
+                ...this.diagnostics,
+                operationElapsedMs: Math.max(0, Math.floor(this.now() - started)),
+            };
             throw cause;
         } finally {
             this.diagnostics.operationElapsedMs = Math.max(0, Math.floor(this.now() - started));

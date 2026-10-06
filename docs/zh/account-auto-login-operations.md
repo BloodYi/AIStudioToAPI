@@ -76,9 +76,11 @@ CSV 必须有表头，支持 `email,password,totpSecret` 和 `email,password,rec
 
 ## 首次协议、恢复邮箱与兼容输入
 
-后台登录会自动接受来源为 `aistudio.google.com`、具有 AI Studio/Gemini 标识和已知服务条款文字的首次协议弹窗，包括同源 iframe。只操作弹窗内明确必需的协议复选框和确认按钮；不勾选可选邮件订阅。处理发生在等待编辑器就绪期间，随后仍须验证实际登录邮箱、目标应用初始化和原生连接。未知授权、Drive 权限、地区限制、修改密码、短信、设备确认及图片验证码不自动处理。
+后台登录会自动接受来源为 `aistudio.google.com`、具有 AI Studio/Gemini 标识和已知服务条款文字的首次协议弹窗，包括同源 iframe。也支持同时包含 AI Studio 欢迎标题、服务条款和年满 18 岁及专业/商业用途确认的整页首次协议。只操作已识别协议范围内明确必需的复选框和确认按钮；年龄及用途确认即使没有 `required` 属性也会处理，不勾选可选邮件订阅。确认按钮可带装饰性箭头图标。处理发生在等待编辑器就绪期间，随后仍须验证实际登录邮箱、目标应用初始化和原生连接。未知授权、Drive 权限、地区限制、修改密码、短信、设备确认及图片验证码不自动处理。
 
 恢复邮箱是可选凭据，仅用于 Google 明确要求确认已登记恢复邮箱地址的挑战，不读取邮件验证码。可新增、编辑或通过「清除恢复邮箱」显式移除；留空及导入空列保留原值。普通列表和导入预览仅显示是否配置及冲突状态，完整地址通过受鉴权的凭据读取入口查看。修改会更新凭据版本并取消旧任务；恢复邮箱不会写入 Cookie JSON。
+
+对明确识别的“您为何选择使用 Google AI Studio？”可选用途问卷，仅点击同一内容范围内的“跳过”，最多两次；不选择用途或处理其他未知问卷。
 
 CSV 必须提供表头。继续支持 `email,password,totpSecret`，新导出（含 ZIP 中的 `credentials.csv`）采用 `email,password,recovery_email,totp_secret`。可使用 `recoveryEmail` / `recovery_email` 和 `totpSecret` / `totp_secret`；同一字段别名列内容不一致时该行失败。表头允许 BOM 和首尾空白，密码保持原样，包括空格、引号、逗号及换行。覆盖不同恢复邮箱、密码或密钥仍须显式选择。批量 CLI 支持这两种带表头格式及带换行的引用字段。
 
@@ -88,8 +90,9 @@ Authenticator 页面支持单输入框和六个可编辑、`maxlength=1` 的分�
 
 2026-10-01 最终真实验收：已完成首次登录的账号续登与新账号首次协议均一次成功，目标原生连接、最终协议/身份复查及会话提交通过。测试使用独立临时存储，未修改生产认证目录。
 
-本次兼容性改造的参考提交、回归结果和真实验收边界见 [验收记录](account-login-integration-acceptance.md)。
+2026-10-06 在 `meow_us` 现有容器中使用独立临时存储验收：浏览器为 Camoufox `135.0.1-beta.24`、Playwright `1.59.1`。真实账号的整页首次协议成功勾选年龄及用途确认并点击带箭头的“继续”，记录 `termsOutcome=completed`；该次随后停在可选用途问卷。补充兼容后，后续登录一次成功，`identityMatched=true`、`targetInitialized=true`、`termsVerified=true`、`sessionCommitted=true`。用途问卷跳过逻辑另由本地响应的 Camoufox 测试覆盖。测试未替换线上代码或生产账号库，临时凭据和 Cookie 已清理。
 
+本次兼容性改造的参考提交、回归结果和真实验收边界见 [验收记录](account-login-integration-acceptance.md)。
 
 ### 账号选择与停止登录
 

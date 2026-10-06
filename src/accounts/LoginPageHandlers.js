@@ -8,6 +8,10 @@ const termsText =
     /terms of service|terms of use|Google APIs? terms|additional terms|服务条款|使用条款|服務條款|附加条款/i;
 const optionalText = /newsletter|updates|marketing|offers|optional|订阅|訂閱|最新消息|電子郵件.*接收|接收.*邮件/i;
 const acceptName = /^(I agree|I accept|Agree|Accept|同意|我同意|接受|Continue|继续|繼續)$/i;
+// This confirmation gates Continue even when the checkbox has no required attribute.
+const ageAndPurposeText = text =>
+    (/at least 18 years old/i.test(text) && /professional or business purposes/i.test(text)) ||
+    (/年满\s*18|年滿\s*18|至少\s*18\s*[岁歲]/i.test(text) && /专业|專業|商业|商業/i.test(text));
 class LoginPageHandlers {
     constructor({ page, interaction, guard, stepTimeout, deadline, phase }) {
         Object.assign(this, { deadline, guard, interaction, page, phase, stepTimeout });
@@ -61,6 +65,29 @@ class LoginPageHandlers {
                         break;
                     }
                 }
+                if (!found) {
+                    // First-run consent also has a full-page welcome variant.
+                    // Require its welcome title, terms and age/business gate;
+                    // choose the smallest matching content scope, never the body.
+                    const welcome = frame
+                        .locator("main, section, article, div")
+                        .filter({
+                            hasText:
+                                /Welcome to (?:Google )?AI Studio|欢迎使用\s*(?:Google )?AI Studio|歡迎使用\s*(?:Google )?AI Studio/i,
+                        })
+                        .filter({ hasText: termsText })
+                        .filter({ has: frame.locator('input[type="checkbox"], [role="checkbox"]') })
+                        .filter({
+                            has: frame.locator('button, [role="button"], input[type="button"], input[type="submit"]'),
+                        })
+                        .filter({ visible: true })
+                        .last();
+                    const text = await this.snapshot(welcome);
+                    if (text !== null && ageAndPurposeText(text)) {
+                        found = welcome;
+                        foundFrame = frame;
+                    }
+                }
                 if (found) break;
             }
             if (!found) {
@@ -91,9 +118,12 @@ class LoginPageHandlers {
                     if (
                         !info.checked &&
                         (info.required ||
+                            ageAndPurposeText(info.label) ||
                             (/agree|accept|同意|接受/i.test(info.label) && /terms|条款|條款/i.test(info.label)))
-                    )
+                    ) {
+                        this.operation = "terms_checkbox";
                         await this.interaction.click(box, { timeout: this.remaining(end) });
+                    }
                 }
                 let button = found
                     .getByRole("button", { name: /^(I agree|I accept|Agree|Accept|同意|我同意|接受)$/i })
@@ -110,9 +140,11 @@ class LoginPageHandlers {
                     for (let index = 0; index < Math.min(await controls.count(), 30); index++) {
                         this.guard();
                         const control = controls.nth(index);
-                        const caption = await control.evaluate(node =>
-                            (node.textContent || node.value || "").replace(/\s+/g, " ").trim()
-                        );
+                        const caption = await control.evaluate(node => {
+                            const copy = node.cloneNode(true);
+                            copy.querySelectorAll('mat-icon, svg, [aria-hidden="true"]').forEach(icon => icon.remove());
+                            return (copy.textContent || node.value || "").replace(/\s+/g, " ").trim();
+                        });
                         if (acceptName.test(caption))
                             matches.push({ control, explicit: !/^(Continue|继续|繼續)$/i.test(caption) });
                     }
@@ -130,6 +162,7 @@ class LoginPageHandlers {
                     await this.interaction.click(button, { timeout: this.remaining(end) });
                     this.termsOutcome = "clicked";
                 } catch (cause) {
+                    cause.loginOperation ||= this.operation;
                     this.guard();
                     if (cause.name !== "TimeoutError" || (await this.snapshot(found)) === before) throw cause;
                     // Rescan and validate the current page; disappearance alone is not success.
@@ -150,6 +183,7 @@ class LoginPageHandlers {
                     throw failure("terms_or_consent_required");
                 }
             } catch (cause) {
+                cause.loginOperation ||= this.operation;
                 this.guard();
                 if (foundFrame.isDetached()) continue;
                 if (cause.name !== "TimeoutError" || (await this.snapshot(found)) !== null) throw cause;
@@ -158,6 +192,39 @@ class LoginPageHandlers {
             }
         }
         throw failure("terms_or_consent_required");
+    }
+    async skipOnboarding(limit = this.deadline) {
+        this.guard();
+        if ((this.onboardingSkips || 0) >= 2) return false;
+        const title =
+            /^(Why (?:are you using|did you choose to use) Google AI Studio\s*\?|您为何选择使用 Google AI Studio\s*[？?])$/i;
+        for (const frame of this.page.frames().slice(0, 10)) {
+            this.guard();
+            let host;
+            try {
+                host = new URL(frame.url()).hostname;
+            } catch {
+                continue;
+            }
+            if (host !== "aistudio.google.com") continue;
+            const heading = frame.getByRole("heading", { name: title });
+            if (!(await heading.first().isVisible())) continue;
+            const skip = frame.getByRole("button", { name: /^(Skip|跳过|跳過)$/i });
+            const scope = frame
+                .locator("main, section, article, div")
+                .filter({ has: heading })
+                .filter({ has: skip })
+                .last();
+            const text = await this.snapshot(scope);
+            if (text === null || termsText.test(text)) continue;
+            const button = scope.getByRole("button", { name: /^(Skip|跳过|跳過)$/i }).first();
+            if (!(await button.isVisible())) continue;
+            this.phase("aistudio_onboarding");
+            this.onboardingSkips = (this.onboardingSkips || 0) + 1;
+            await this.interaction.click(button, { timeout: this.remaining(Math.min(limit, this.deadline)) });
+            return true;
+        }
+        return false;
     }
     async observeStudioDialogs(limit = this.deadline) {
         this.guard();

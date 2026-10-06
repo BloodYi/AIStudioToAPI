@@ -243,11 +243,57 @@ test("real browser: first terms leave optional controls untouched", { skip: !exe
         assert.ok(result.storageState, JSON.stringify({ options, result }));
     }
 });
+test(
+    "real browser: age and business confirmation enables Continue without required metadata",
+    { skip: !executablePath },
+    async t => {
+        for (const label of [
+            "I acknowledge that I am at least 18 years old, and that I am a developer using the service for professional or business purposes to build products for users 18+.",
+            "我确认我已年满 18 岁，并将服务用于专业或商业用途。",
+        ]) {
+            const { handler, page } = await handlerFixture(
+                t,
+                `<div role="dialog">Google AI Studio Terms of Service
+            <label><input id="age" type="checkbox" onchange="document.querySelector('button').disabled=!this.checked">${label}</label>
+            <label><input id="updates" type="checkbox">Email newsletter updates</label>
+            <label><input id="unrelated" type="checkbox">I acknowledge another request</label>
+            <button disabled onclick="this.parentNode.hidden=true">Continue</button></div>`
+            );
+            assert.equal(await handler.terms(), true);
+            assert.equal(handler.termsOutcome, "completed");
+            assert.equal(await page.locator("#age").isChecked(), true);
+            assert.equal(await page.locator("#updates").isChecked(), false);
+            assert.equal(await page.locator("#unrelated").isChecked(), false);
+        }
+    }
+);
 test("real browser: recovery confirmation and manual failure boundaries", { skip: !executablePath }, async () => {
     assert.ok((await run({ fast: true, recovery: true })).storageState);
     assert.equal((await run({ fast: true, missingRecovery: true, recovery: true })).error, "recovery_email_missing");
     assert.equal((await run({ fast: true, recovery: true, wrongRecovery: true })).error, "recovery_email_rejected");
 });
+test(
+    "real browser: full-page welcome consent is scoped and must contain the age/business gate",
+    { skip: !executablePath },
+    async t => {
+        const { handler, page } = await handlerFixture(
+            t,
+            `<button onclick="throw Error('outside clicked')">Continue</button>
+        <main><div><h1>欢迎使用 Google AI Studio！</h1>
+        <label><input id="age" type="checkbox" onchange="document.getElementById('continue').disabled=!this.checked">I acknowledge that I am at least 18 years old, using the service for professional or business purposes.</label>
+        <label><input id="marketing" type="checkbox">Email newsletter updates</label>
+        <p>Gemini API Additional Terms of Service</p>
+        </div><button id="continue" disabled onclick="this.closest('main').remove()">继续<mat-icon>arrow_forward</mat-icon></button></main>`
+        );
+        assert.equal(await handler.terms(), true);
+        assert.equal(handler.termsOutcome, "completed");
+        await page.setContent(
+            '<main><h1>Welcome to Google AI Studio</h1><p>Terms of Service</p><label><input type="checkbox">Allow other access</label><button>Continue</button></main>'
+        );
+        assert.equal(await handler.terms(), false);
+        assert.equal(await page.locator("input").isChecked(), false);
+    }
+);
 test("real browser: six digit code, automatic submission and ambiguous counts", { skip: !executablePath }, async () => {
     assert.ok((await run({ fast: true, split: 6 })).storageState);
     assert.ok((await run({ autoSubmit: true, fast: true, split: 6 })).storageState);
@@ -345,6 +391,23 @@ test(
         cancelled = false;
         handler.deadline = performance.now() - 1;
         await assert.rejects(handler.terms(), { reason: "terms_or_consent_required" });
+    }
+);
+test(
+    "real browser: known optional onboarding uses Skip and leaves unknown questions untouched",
+    { skip: !executablePath },
+    async t => {
+        const { handler, page } = await handlerFixture(
+            t,
+            '<main><h1>您为何选择使用 Google AI Studio？</h1><label><input type="checkbox">Use Gemini API</label><button onclick="this.closest(\'main\').remove()">跳过</button><button disabled>继续</button></main>'
+        );
+        assert.equal(await handler.skipOnboarding(), true);
+        assert.equal(await page.locator("main").count(), 0);
+        await page.setContent(
+            '<main><h1>Unknown authorization</h1><button onclick="this.remove()">Skip</button></main>'
+        );
+        assert.equal(await handler.skipOnboarding(), false);
+        assert.equal(await page.locator("button").count(), 1);
     }
 );
 

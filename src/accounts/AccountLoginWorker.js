@@ -175,6 +175,7 @@ async function validateStudio(credentials) {
     await waitForPage(async stepDeadline => {
         const accepted = await handlers.terms(stepDeadline);
         if (accepted) readySince = null;
+        if (await handlers.skipOnboarding(stepDeadline)) readySince = null;
         let observed = await handlers.observeStudioDialogs(stepDeadline);
         if (observed.dialogState === "known_hint_only") {
             const previousClicks = handlers.transitionClicks || 0;
@@ -653,10 +654,12 @@ process.on("message", input => {
                 diagnostics: {
                     ...diagnostics,
                     ...interaction?.diagnostics,
+                    ...cause.operationDiagnostics,
                     operation:
-                        handlers?.operation?.startsWith("terms_") && diagnostics.operation === "aistudio_terms"
+                        cause.loginOperation ||
+                        (handlers?.operation?.startsWith("terms_") && diagnostics.operation === "aistudio_terms"
                             ? handlers.operation
-                            : diagnostics.operation,
+                            : diagnostics.operation),
                     operationPart: cause.operationPart || interaction?.diagnostics?.operationPart,
                 },
                 error: reason,
