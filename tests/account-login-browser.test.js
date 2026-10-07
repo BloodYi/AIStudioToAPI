@@ -422,6 +422,84 @@ test(
         }
     }
 );
+test(
+    "real browser: onboarding waits for delayed navigation and clicks only once",
+    { skip: !executablePath },
+    async t => {
+        const { handler, page } = await handlerFixture(
+            t,
+            "<main><h1>您为何选择使用 Google AI Studio？</h1><button onclick=\"document.body.dataset.clicks=Number(document.body.dataset.clicks||0)+1;setTimeout(()=>this.closest('main').remove(),350)\">跳过</button></main>"
+        );
+        assert.equal(await handler.skipOnboarding(), true);
+        assert.equal(await page.locator("body").getAttribute("data-clicks"), "1");
+        assert.equal(handler.onboardingSkips, 1);
+        assert.equal(await handler.skipOnboarding(), false);
+    }
+);
+test(
+    "real browser: unchanged onboarding times out with diagnostics and cannot renew its budget",
+    { skip: !executablePath },
+    async t => {
+        const { handler, page } = await handlerFixture(
+            t,
+            '<main><h1>您为何选择使用 Google AI Studio？</h1><button onclick="document.body.dataset.clicks=Number(document.body.dataset.clicks||0)+1">跳过</button></main>'
+        );
+        handler.stepTimeout = 250;
+        await assert.rejects(handler.skipOnboarding(), error => {
+            assert.equal(error.reason, "onboarding_timeout");
+            assert.equal(error.retryable, true);
+            assert.equal(error.loginOperation, "onboarding_wait");
+            assert.equal(error.operationPart, "wait");
+            assert.equal(error.onboardingDiagnostics.stepRemainingMs, 0);
+            assert.ok(error.onboardingDiagnostics.remainingMs > 0);
+            assert.equal(error.onboardingDiagnostics.onboardingClickCount, 1);
+            return true;
+        });
+        const deadline = handler.onboardingDeadline;
+        await assert.rejects(handler.skipOnboarding(), { reason: "onboarding_timeout" });
+        assert.equal(handler.onboardingDeadline, deadline);
+        assert.equal(await page.locator("body").getAttribute("data-clicks"), "1");
+    }
+);
+test(
+    "real browser: budget expiry during survey reading does not count as a click",
+    { skip: !executablePath },
+    async t => {
+        const { handler } = await handlerFixture(
+            t,
+            "<main><h1>您为何选择使用 Google AI Studio？</h1><button>跳过</button></main>"
+        );
+        handler.stepTimeout = 100;
+        const snapshot = handler.snapshot.bind(handler);
+        handler.snapshot = async (...args) => {
+            await new Promise(resolve => setTimeout(resolve, 150));
+            return snapshot(...args);
+        };
+        await assert.rejects(handler.skipOnboarding(), error => {
+            assert.equal(error.reason, "onboarding_timeout");
+            assert.equal(error.loginOperation, "onboarding_read");
+            assert.equal(error.operationPart, "budget_check");
+            assert.equal(error.onboardingDiagnostics.onboardingClickCount, 0);
+            return true;
+        });
+    }
+);
+test(
+    "real browser: attempt deadline takes precedence during onboarding navigation",
+    { skip: !executablePath },
+    async t => {
+        const { handler, interaction } = await handlerFixture(
+            t,
+            "<main><h1>您为何选择使用 Google AI Studio？</h1><button>跳过</button></main>"
+        );
+        handler.deadline = performance.now() + 200;
+        handler.guard = interaction.guard = () => {
+            if (performance.now() >= handler.deadline)
+                throw Object.assign(new Error("attempt_timeout"), { reason: "attempt_timeout", retryable: true });
+        };
+        await assert.rejects(handler.skipOnboarding(), { reason: "attempt_timeout" });
+    }
+);
 
 test("real browser: observed optional cost hint never opens spending settings", { skip: !executablePath }, async t => {
     const html = `<div role="dialog" style="width:230px;height:120px"><p>新功能：控制 API 费用</p><p>设置每月支出上限，以防止意外超支</p><button onclick="throw Error('settings action')">创建支出上限</button><button aria-label="Close" onclick="this.parentNode.remove()">X</button></div><textarea></textarea>`;

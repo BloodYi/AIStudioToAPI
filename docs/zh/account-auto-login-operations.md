@@ -80,7 +80,7 @@ CSV 必须有表头，支持 `email,password,totpSecret` 和 `email,password,rec
 
 恢复邮箱是可选凭据，仅用于 Google 明确要求确认已登记恢复邮箱地址的挑战，不读取邮件验证码。可新增、编辑或通过「清除恢复邮箱」显式移除；留空及导入空列保留原值。普通列表和导入预览仅显示是否配置及冲突状态，完整地址通过受鉴权的凭据读取入口查看。修改会更新凭据版本并取消旧任务；恢复邮箱不会写入 Cookie JSON。
 
-对明确识别的“您为何选择使用 Google AI Studio？”可选用途问卷，仅点击同一内容范围内的“跳过”，最多两次；不选择用途或处理其他未知问卷。
+对明确识别的“您为何选择使用 Google AI Studio？”可选用途问卷，仅点击同一内容范围内的“跳过”，最多两次；不选择用途或处理其他未知问卷。识别问卷后独立计算步骤预算，重复检查不会续期，且始终受整次登录的总期限约束。点击后必须确认当前问题消失，再重新等待编辑器就绪。问卷步骤超时记录为可重试的 `onboarding_timeout`，整次登录到期仍优先记录为 `attempt_timeout`。失败诊断区分 `onboarding_read`、`onboarding_skip` 和 `onboarding_wait`，并记录步骤剩余时间、整次登录剩余时间及成功执行的点击次数。
 
 CSV 必须提供表头。继续支持 `email,password,totpSecret`，新导出（含 ZIP 中的 `credentials.csv`）采用 `email,password,recovery_email,totp_secret`。可使用 `recoveryEmail` / `recovery_email` 和 `totpSecret` / `totp_secret`；同一字段别名列内容不一致时该行失败。表头允许 BOM 和首尾空白，密码保持原样，包括空格、引号、逗号及换行。覆盖不同恢复邮箱、密码或密钥仍须显式选择。批量 CLI 支持这两种带表头格式及带换行的引用字段。
 

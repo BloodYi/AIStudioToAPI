@@ -222,7 +222,27 @@ async function simulate(options = {}) {
                         }
                       : name === "node:perf_hooks"
                         ? { performance: { now: () => clock - 30000 } }
-                        : workerRequire(name),
+                        : name === "./LoginPageHandlers" && options.termsNearDeadline
+                          ? class extends workerRequire(name) {
+                                async terms(...args) {
+                                    if (this.testTermsCompleted) return super.terms(...args);
+                                    this.testTermsCompleted = true;
+                                    clock += (options.stepTimeout || 30000) - 1;
+                                    this.guard();
+                                    this.termsOutcome = "completed";
+                                    return true;
+                                }
+                                async skipOnboarding(limit) {
+                                    this.guard();
+                                    if (this.testOnboardingCompleted) return false;
+                                    assert.equal(limit, undefined, "survey must not inherit the editor deadline");
+                                    this.testOnboardingCompleted = true;
+                                    clock += 1000;
+                                    this.guard();
+                                    return true;
+                                }
+                            }
+                          : workerRequire(name),
             setTimeout: (callback, ms) =>
                 setImmediate(() => {
                     clock += ms;
@@ -254,6 +274,14 @@ test("no two-step login verifies account and target app before saving complete s
     assert.ok(result.storageState);
     assert.equal(result.email, "user@example.com");
     assert.ok(phases.includes("target_service_initialization"));
+});
+test("near-limit terms leave independent survey and editor budgets without extending the attempt", async () => {
+    const success = await simulate({ termsNearDeadline: true });
+    assert.ok(success.result.storageState, JSON.stringify(success.result));
+    assert.equal(success.result.termsOutcome, "completed");
+    const expired = await simulate({ attemptTimeout: 30000, termsNearDeadline: true });
+    assert.equal(expired.result.error, "attempt_timeout");
+    assert.ok(!expired.result.storageState);
 });
 test("choice click timeout is accepted only after TOTP readiness is confirmed", async () => {
     const changed = await simulate({ choiceTimeout: true, choose: true, totp: true });

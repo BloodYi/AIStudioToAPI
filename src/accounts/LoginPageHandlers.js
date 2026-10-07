@@ -16,8 +16,8 @@ class LoginPageHandlers {
     constructor({ page, interaction, guard, stepTimeout, deadline, phase }) {
         Object.assign(this, { deadline, guard, interaction, page, phase, stepTimeout });
     }
-    async snapshot(locator) {
-        this.operation = "terms_read";
+    async snapshot(locator, operation = "terms_read") {
+        this.operation = operation;
         // One DOM snapshot: missing containers never enter Playwright's locator retry.
         return this.interaction.operation("text_read", () =>
             locator.evaluateAll(nodes => {
@@ -195,7 +195,10 @@ class LoginPageHandlers {
     }
     async skipOnboarding(limit = this.deadline) {
         this.guard();
-        if ((this.onboardingSkips || 0) >= 2) return false;
+        if (this.onboardingPage !== this.page) {
+            this.onboardingPage = this.page;
+            this.onboardingDeadline = null;
+        }
         const title =
             /^(Why (?:are you using|did you choose to use) Google AI Studio\s*\?|您为何选择使用 Google AI Studio\s*[？?])$/i;
         for (const frame of this.page.frames().slice(0, 10)) {
@@ -207,22 +210,66 @@ class LoginPageHandlers {
                 continue;
             }
             if (host !== "aistudio.google.com") continue;
-            const heading = frame.getByRole("heading", { name: title });
-            if (!(await heading.first().isVisible())) continue;
-            const skip = frame.getByRole("button", { name: /^(Skip|跳过|跳過)$/i });
-            const scope = frame
-                .locator("main, section, article, div")
-                .filter({ has: heading })
-                .filter({ has: skip })
-                .last();
-            const text = await this.snapshot(scope);
-            if (text === null || termsText.test(text)) continue;
-            const button = scope.getByRole("button", { name: /^(Skip|跳过|跳過)$/i }).first();
-            if (!(await button.isVisible())) continue;
-            this.phase("aistudio_onboarding");
-            this.onboardingSkips = (this.onboardingSkips || 0) + 1;
-            await this.interaction.click(button, { timeout: this.remaining(Math.min(limit, this.deadline)) });
-            return true;
+            const heading = frame.getByRole("heading", { name: title }).first();
+            if (!(await heading.isVisible())) continue;
+            // Start once for this page. Polls and repeated clicks cannot renew it.
+            this.onboardingDeadline ??= Math.min(this.deadline, performance.now() + this.stepTimeout);
+            const end = Math.min(limit, this.deadline, this.onboardingDeadline);
+            const check = () => {
+                this.guard();
+                if (performance.now() >= end) throw Object.assign(failure("onboarding_timeout"), { retryable: true });
+            };
+            try {
+                this.phase("aistudio_onboarding");
+                this.operation = "onboarding_read";
+                check();
+                const skip = frame.getByRole("button", { name: /^(Skip|跳过|跳過)$/i });
+                const scope = frame
+                    .locator("main, section, article, div")
+                    .filter({ has: heading })
+                    .filter({ has: skip })
+                    .last();
+                const text = await this.snapshot(scope, "onboarding_read");
+                check();
+                if (text === null || termsText.test(text)) continue;
+                const button = scope.getByRole("button", { name: /^(Skip|跳过|跳過)$/i }).first();
+                if (!(await button.isVisible())) continue;
+                check();
+                if ((this.onboardingSkips || 0) >= 2)
+                    throw Object.assign(failure("onboarding_timeout"), { retryable: true });
+                this.operation = "onboarding_skip";
+                await this.interaction.click(button, {
+                    check,
+                    timeout: Math.max(1, Math.floor(end - performance.now())),
+                });
+                this.onboardingSkips = (this.onboardingSkips || 0) + 1;
+                this.operation = "onboarding_wait";
+                await this.interaction.operation("wait", async () => {
+                    while (performance.now() < end) {
+                        check();
+                        const visible = await heading.isVisible();
+                        check();
+                        if (!visible) return;
+                        await new Promise(resolve => setTimeout(resolve, 100));
+                    }
+                    check();
+                });
+                return true;
+            } catch (cause) {
+                this.guard();
+                if (cause.name === "TimeoutError") {
+                    cause.reason = "onboarding_timeout";
+                    cause.retryable = true;
+                }
+                cause.loginOperation = this.operation;
+                cause.operationPart ||= "budget_check";
+                cause.onboardingDiagnostics = {
+                    onboardingClickCount: this.onboardingSkips || 0,
+                    remainingMs: Math.max(0, Math.floor(this.deadline - performance.now())),
+                    stepRemainingMs: Math.max(0, Math.floor(end - performance.now())),
+                };
+                throw cause;
+            }
         }
         return false;
     }

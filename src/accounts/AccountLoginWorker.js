@@ -69,10 +69,11 @@ async function visible(selector) {
     return page.locator(selector).filter({ visible: true }).first().isVisible();
 }
 async function waitForPage(predicate) {
-    const deadline = Math.min(attemptDeadline, performance.now() + config.stepTimeout);
+    let deadline = Math.min(attemptDeadline, performance.now() + config.stepTimeout);
+    const nextStep = () => (deadline = Math.min(attemptDeadline, performance.now() + config.stepTimeout));
     while (performance.now() < deadline) {
         guard();
-        if (await predicate(deadline)) return;
+        if (await predicate(deadline, nextStep)) return;
         await wait(250);
     }
     fail("page_transition_timeout", true);
@@ -172,10 +173,17 @@ async function validateStudio(credentials) {
         await page.goto("https://aistudio.google.com/u/0/prompts/new_chat", { waitUntil: "domcontentloaded" });
     let readySince = null,
         unknownRecheckCount = null;
-    await waitForPage(async stepDeadline => {
+    await waitForPage(async (stepDeadline, nextStep) => {
         const accepted = await handlers.terms(stepDeadline);
-        if (accepted) readySince = null;
-        if (await handlers.skipOnboarding(stepDeadline)) readySince = null;
+        if (accepted) {
+            readySince = null;
+            stepDeadline = nextStep();
+        }
+        // The recognized survey owns one bounded budget, independent of terms.
+        if (await handlers.skipOnboarding()) {
+            readySince = null;
+            stepDeadline = nextStep();
+        }
         let observed = await handlers.observeStudioDialogs(stepDeadline);
         if (observed.dialogState === "known_hint_only") {
             const previousClicks = handlers.transitionClicks || 0;
@@ -655,6 +663,7 @@ process.on("message", input => {
                     ...diagnostics,
                     ...interaction?.diagnostics,
                     ...cause.operationDiagnostics,
+                    ...cause.onboardingDiagnostics,
                     operation:
                         cause.loginOperation ||
                         (handlers?.operation?.startsWith("terms_") && diagnostics.operation === "aistudio_terms"
