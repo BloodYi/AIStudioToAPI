@@ -566,6 +566,12 @@ class AccountLoginService {
         this.state.commits = this.state.commits.filter(item => item !== commit);
         if (task) Object.assign(task, { finishedAt: Date.now(), status: "succeeded" });
         await this.save();
+        if (!preserveExpired && this.system.scheduler?.account) {
+            const scheduledAccount = this.system.scheduler.account(index);
+            scheduledAccount.healthy = true;
+            scheduledAccount.last_error = null;
+            this.system.scheduler.saveSoon();
+        }
         this.system.browserManager?.rebalanceContextPool().catch(() => {});
         return index;
     }

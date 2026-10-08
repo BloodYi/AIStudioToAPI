@@ -77,7 +77,7 @@ class ScheduledRequestHandler extends RequestHandler {
                                     dequeue = activeQueue.dequeue.bind(activeQueue);
                                 }
                             }
-                            if (message.event_type === "error") this.scheduler.failure(this.lease, message);
+                            if (message.event_type === "error") await this.scheduler.failure(this.lease, message);
                             if (message.metrics?.upstream_ttfb_ms != null)
                                 this.scheduler.observe("upstream_ttfb_ms", message.metrics.upstream_ttfb_ms);
                             if (this.lease.model === "__files__") {
@@ -192,7 +192,7 @@ class ScheduledRequestHandler extends RequestHandler {
 
     async _prepareImmediateStatusRetry(error, requestId, tracker, sourceAuthIndex) {
         if (this.lease?.account.index !== sourceAuthIndex) return false;
-        this.scheduler.failure(this.lease, error);
+        await this.scheduler.failure(this.lease, error);
         if (
             !this._shouldRetryError(error) ||
             this.controller.signal.aborted ||
@@ -231,7 +231,7 @@ class ScheduledRequestHandler extends RequestHandler {
     async _readInitialMessage(queue, timeout = this.timeouts.FAKE_STREAM) {
         try {
             const message = await queue.dequeue(timeout);
-            if (message.event_type === "error") this.scheduler.failure(this.lease, message);
+            if (message.event_type === "error") await this.scheduler.failure(this.lease, message);
             return message;
         } catch (error) {
             return {

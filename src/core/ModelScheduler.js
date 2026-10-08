@@ -528,6 +528,7 @@ class ModelScheduler {
                 model: item.model,
                 recorded: false,
                 released: false,
+                sessionVersion: this._requestSessionVersion(account.index),
                 slot,
                 worker,
             };
@@ -558,6 +559,7 @@ class ModelScheduler {
         if (!lease || lease.attempted || lease.released) return;
         const now = Date.now();
         lease.attempted = true;
+        lease.sessionVersion = this._requestSessionVersion(lease.account.index);
         this.rolloverDailyUsage(lease.slot, now);
         lease.slot.daily_request_count++;
         lease.slot.request_count++;
@@ -566,8 +568,18 @@ class ModelScheduler {
         this.saveSoon();
     }
 
+    _requestSessionVersion(index) {
+        const context = this.browserManager?.contexts?.get(index);
+        return (
+            context?.page?.accountSessionVersion ??
+            context?.sessionVersion ??
+            this.authSource.accountLoginService?.state?.accounts.find(account => account.authIndex === index)
+                ?.sessionVersion
+        );
+    }
+
     failure(lease, error) {
-        if (!lease || lease.recorded) return;
+        if (!lease || lease.recorded) return lease?.expirationPromise;
         const kind = classifyError(error);
         if (kind === "aborted") return;
         if (kind === "transport") {
@@ -575,6 +587,17 @@ class ModelScheduler {
             lease.account.local_transport_failures = (lease.account.local_transport_failures || 0) + 1;
             lease.account.last_transport_failure_at = Date.now();
             this.metrics.local_transport++;
+            return;
+        }
+        const upstreamAuthExpired =
+            kind === "account" &&
+            /Google API returned error:\s*401\s+UNAUTHENTICATED\b/i.test(String(error.message || ""));
+        const currentSession = this.authSource.accountLoginService?.state?.accounts.find(
+            account => account.authIndex === lease.account.index
+        );
+        if (upstreamAuthExpired && currentSession && lease.sessionVersion !== currentSession.sessionVersion) {
+            // A late response from a retired Context must not disable its replacement.
+            lease.recorded = true;
             return;
         }
         lease.recorded = true;
@@ -622,6 +645,17 @@ class ModelScheduler {
         this.sequence++;
         this.saveSoon();
         this.coordinateContextPool();
+        if (upstreamAuthExpired && this.authSource.markAsExpired) {
+            // Keep failure accounting synchronous; callers can await the durable session update.
+            lease.expirationPromise = Promise.resolve()
+                .then(() => this.authSource.markAsExpired(account.index, lease.sessionVersion))
+                .catch(cause => {
+                    this.logger.error?.(
+                        `[Scheduler] Failed to expire auth #${account.index} after upstream 401: ${cause.message}`
+                    );
+                });
+            return lease.expirationPromise;
+        }
     }
 
     release(lease, success = false) {

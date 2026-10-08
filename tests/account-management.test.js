@@ -14,6 +14,7 @@ const ProxyPoolStore = require("../src/proxy/ProxyPoolStore");
 const ProxyPoolRoutes = require("../src/routes/ProxyPoolRoutes");
 const { ModelScheduler } = require("../src/core/ModelScheduler");
 const schedulerConfig = require("../src/core/SchedulerConfig");
+const AuthSource = require("../src/auth/AuthSource");
 const logger = { debug() {}, error() {}, info() {}, warn() {} };
 const secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -272,6 +273,58 @@ test("late success after credential mutation or cancellation cannot write auth f
     await until(() => !service.queue.running.size);
     assert.deepEqual(await fs.readdir(path.join(directory, "auth")), []);
 });
+test("upstream 401 persists expiration, queues recovery and restores scheduler health on session commit", async t => {
+    const { service, system } = await fixture(t, 1);
+    const auth = system.authSource;
+    auth.accountNameMap = new Map([[0, "user0@example.com"]]);
+    auth.accountLoginService = service;
+    auth.markAsExpired = AuthSource.prototype.markAsExpired.bind(auth);
+    auth.getRotationIndices = () =>
+        service.state.accounts.filter(a => a.sessionState === "valid").map(a => a.authIndex);
+    const scheduler = new ModelScheduler(
+        { ...schedulerConfig({ SCHEDULER_DAILY_RESET_ENABLED: "false" }), statePath: null },
+        auth,
+        logger
+    );
+    system.scheduler = scheduler;
+    t.after(() => scheduler.close());
+    const account = service.state.accounts[0];
+    await service.edit(account.accountId, { credentialVersion: 1, password: "synthetic" });
+    service.state.config.autoRecovery = true;
+    const lease = await scheduler.acquire("flash");
+    scheduler.startAttempt(lease);
+    await scheduler.failure(lease, {
+        message: "Proxy browser error: Google API returned error: 401 UNAUTHENTICATED",
+    });
+    assert.equal((await service.readAuth(0)).expired, true);
+    assert.equal(service.list()[0].sessionState, "expired");
+    assert.deepEqual(auth.getRotationIndices(), []);
+    assert.equal(service.state.tasks.length, 1);
+    assert.equal(service.state.tasks[0].source, "expired");
+    scheduler.release(lease);
+    scheduler.disable(0);
+    lease.slot.unsupported = true;
+    await service.exclusive(() =>
+        service.commitSession(
+            account,
+            {
+                accountName: account.email,
+                cookies: [],
+                origins: [],
+            },
+            service.state.tasks[0]
+        )
+    );
+    assert.equal(account.sessionState, "valid");
+    assert.equal((await service.readAuth(0)).expired, undefined);
+    assert.equal(scheduler.account(0).healthy, true);
+    assert.equal(scheduler.account(0).disabled, true);
+    assert.equal(lease.slot.unsupported, true);
+    // Even a write already queued before replacement is rejected by the version guard.
+    assert.equal(await auth.markAsExpired(0, lease.sessionVersion), false);
+    assert.equal(account.sessionState, "valid");
+});
+
 test("old Context refresh and expiration cannot overwrite new Cookie; disabled state survives", async t => {
     const { service, system } = await fixture(t, 1);
     system.scheduler.isAccountManuallyDisabled = () => true;

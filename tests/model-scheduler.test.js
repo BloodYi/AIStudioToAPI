@@ -11,6 +11,10 @@ const {
 } = require("../src/core/ModelScheduler");
 const loadConfig = require("../src/core/SchedulerConfig");
 const logger = { error() {}, warn() {} };
+const upstream401 = {
+    message: "Proxy browser error: Google API returned error: 401 UNAUTHENTICATED",
+    status: 401,
+};
 function setup(overrides = {}, count = 8) {
     const config = { ...loadConfig({ MAX_BROWSER_WORKERS: "6" }), statePath: null, ...overrides };
     const auth = {
@@ -22,6 +26,72 @@ function setup(overrides = {}, count = 8) {
     };
     return new ModelScheduler(config, auth, logger);
 }
+
+test("upstream UNAUTHENTICATED expires the request session once", async t => {
+    const scheduler = setup({}, 1);
+    t.after(() => scheduler.close());
+    scheduler.authSource.accountLoginService = { state: { accounts: [{ authIndex: 0, sessionVersion: 7 }] } };
+    const calls = [];
+    scheduler.authSource.markAsExpired = async (...args) => calls.push(args);
+    const lease = await scheduler.acquire("flash");
+    scheduler.startAttempt(lease);
+    await Promise.all([scheduler.failure(lease, upstream401), scheduler.failure(lease, upstream401)]);
+    assert.deepEqual(calls, [[0, 7]]);
+    assert.equal(lease.account.healthy, false);
+    await assert.rejects(scheduler.acquire("other"));
+    scheduler.release(lease);
+});
+
+test("late upstream 401 cannot disable or expire a replacement session", async t => {
+    const scheduler = setup({}, 1);
+    t.after(() => scheduler.close());
+    const session = { authIndex: 0, sessionVersion: 7 };
+    scheduler.authSource.accountLoginService = { state: { accounts: [session] } };
+    let expired = false;
+    scheduler.authSource.markAsExpired = async () => {
+        expired = true;
+    };
+    const lease = await scheduler.acquire("flash");
+    scheduler.startAttempt(lease);
+    session.sessionVersion++;
+    await scheduler.failure(lease, upstream401);
+    assert.equal(expired, false);
+    assert.equal(lease.account.healthy, true);
+    assert.equal(lease.slot.failure_count, 0);
+    scheduler.release(lease);
+});
+
+test("only Google upstream UNAUTHENTICATED triggers session expiration", async t => {
+    for (const error of [
+        { message: "Invalid API key", status: 401 },
+        { message: "UNAUTHENTICATED", status: 401 },
+        { message: "Google API returned error: 403 PERMISSION_DENIED", status: 403 },
+        { message: "Google API returned error: 429 RESOURCE_EXHAUSTED", status: 429 },
+        { message: upstream401.message, reason: "client_disconnect" },
+        { kind: "transport", message: upstream401.message },
+    ]) {
+        const scheduler = setup({}, 1);
+        t.after(() => scheduler.close());
+        scheduler.authSource.markAsExpired = () => assert.fail("Unexpected session expiration");
+        const lease = await scheduler.acquire("flash");
+        await scheduler.failure(lease, error);
+        scheduler.release(lease);
+    }
+});
+
+test("expiration storage failures are logged without an unhandled rejection", async t => {
+    const scheduler = setup({}, 1);
+    t.after(() => scheduler.close());
+    const errors = [];
+    scheduler.logger = { ...logger, error: message => errors.push(message) };
+    scheduler.authSource.markAsExpired = async () => {
+        throw new Error("storage unavailable");
+    };
+    const lease = await scheduler.acquire("flash");
+    await scheduler.failure(lease, upstream401);
+    assert.match(errors[0], /Failed to expire auth #0.*storage unavailable/);
+    scheduler.release(lease);
+});
 
 test("concurrent reservations isolate accounts and cap global workers", async () => {
     const scheduler = setup();
