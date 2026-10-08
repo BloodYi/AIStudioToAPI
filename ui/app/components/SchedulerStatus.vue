@@ -250,7 +250,7 @@
                     </svg>
                     <strong>Context 浏览器池详情</strong>
                     <span class="capacity-pill font-mono">
-                        {{ contextSummary.busy || 0 }} / {{ contextSummary.max || 0 }}
+                        {{ contextOccupied }} / {{ contextSummary.max || 0 }}
                         {{ t("contextCapacityInUse") }}
                     </span>
                 </div>
@@ -261,6 +261,14 @@
                     </span>
                     <span class="status-pill pill-ready">
                         <span class="dot dot-ready"></span> {{ t("contextReady") }} {{ contextSummary.ready || 0 }}
+                    </span>
+                    <span v-if="(contextSummary.draining || 0) > 0" class="status-pill pill-draining">
+                        <span class="dot dot-draining"></span> {{ t("contextDraining") }}
+                        {{ contextSummary.draining }}
+                    </span>
+                    <span v-if="(contextSummary.closing || 0) > 0" class="status-pill pill-closing">
+                        <span class="dot dot-closing"></span> {{ t("contextClosing") }}
+                        {{ contextSummary.closing }}
                     </span>
                     <span v-if="(contextSummary.initializing || 0) > 0" class="status-pill pill-init">
                         <span class="dot dot-init"></span> {{ t("contextInitializing") }}
@@ -289,6 +297,21 @@
                         :title="`${t('contextBusy')} ${contextSummary.busy || 0}`"
                     ></div>
                     <div
+                        class="slot-fill slot-ready"
+                        :style="{ width: getContextRatio(contextSummary.ready) + '%' }"
+                        :title="`${t('contextReady')} ${contextSummary.ready || 0}`"
+                    ></div>
+                    <div
+                        class="slot-fill slot-draining"
+                        :style="{ width: getContextRatio(contextSummary.draining) + '%' }"
+                        :title="`${t('contextDraining')} ${contextSummary.draining || 0}`"
+                    ></div>
+                    <div
+                        class="slot-fill slot-closing"
+                        :style="{ width: getContextRatio(contextSummary.closing) + '%' }"
+                        :title="`${t('contextClosing')} ${contextSummary.closing || 0}`"
+                    ></div>
+                    <div
                         class="slot-fill slot-init"
                         :style="{ width: getContextRatio(contextSummary.initializing) + '%' }"
                         :title="`${t('contextInitializing')} ${contextSummary.initializing || 0}`"
@@ -300,8 +323,8 @@
                     ></div>
                     <div
                         class="slot-fill slot-unavailable"
-                        :style="{ width: getContextRatio(contextSummary.unavailable) + '%' }"
-                        :title="`${t('contextUnavailable')} ${contextSummary.unavailable || 0}`"
+                        :style="{ width: getContextRatio(contextSummary.unavailable_occupied) + '%' }"
+                        :title="`${t('contextUnavailable')} ${contextSummary.unavailable_occupied || 0}`"
                     ></div>
                 </div>
             </div>
@@ -358,15 +381,11 @@
                         >
                             <div class="node-header">
                                 <span class="node-id font-mono">#{{ context.auth_index }}</span>
-                                <span class="node-state-tag">{{ context.state }}</span>
+                                <span class="node-state-tag">{{ contextStateLabel(context.state) }}</span>
                             </div>
                             <div class="node-body">
                                 <span v-if="context.draining" class="node-sub-text">
-                                    {{
-                                        context.drain_reason === "visible_models_rate_limited"
-                                            ? t("schedulerPoolQuotaDraining")
-                                            : context.drain_reason
-                                    }}
+                                    {{ contextDrainLabel(context.drain_reason) }}
                                 </span>
                                 <span
                                     v-else-if="context.last_disconnect_reason"
@@ -376,7 +395,7 @@
                                     ⚠️ {{ context.last_disconnect_reason }}
                                 </span>
                                 <span v-else class="node-sub-text">
-                                    {{ context.state === "READY" ? "运行就绪" : "待命闲置" }}
+                                    {{ contextDescription(context.state) }}
                                 </span>
                             </div>
                             <div class="node-footer font-mono">
@@ -439,14 +458,10 @@
                                 <td class="font-mono font-bold">#{{ context.auth_index }}</td>
                                 <td>
                                     <span class="status-badge" :class="'badge-' + (context.state || '').toLowerCase()">
-                                        {{ context.state }}
+                                        {{ contextStateLabel(context.state) }}
                                     </span>
                                     <span v-if="context.draining" class="node-sub-text">
-                                        {{
-                                            context.drain_reason === "visible_models_rate_limited"
-                                                ? t("schedulerPoolQuotaDraining")
-                                                : context.drain_reason
-                                        }}
+                                        {{ contextDrainLabel(context.drain_reason) }}
                                     </span>
                                 </td>
                                 <td class="font-mono">{{ context.inflight }}</td>
@@ -836,6 +851,8 @@ const activeContexts = computed(() => {
             state === "INITIALIZING" ||
             state === "BUSY" ||
             state === "RECONNECTING" ||
+            state === "DRAINING" ||
+            state === "CLOSING" ||
             state === "UNAVAILABLE" ||
             c.inflight > 0
         );
@@ -850,6 +867,8 @@ const coldContexts = computed(() => {
             state === "INITIALIZING" ||
             state === "BUSY" ||
             state === "RECONNECTING" ||
+            state === "DRAINING" ||
+            state === "CLOSING" ||
             state === "UNAVAILABLE" ||
             c.inflight > 0
         );
@@ -864,6 +883,41 @@ const displayedMatrixContexts = computed(() => {
 });
 
 const contextSummary = computed(() => props.data?.contexts_summary || {});
+const contextOccupied = computed(
+    () =>
+        contextSummary.value.occupied ??
+        ["busy", "ready", "initializing", "reconnecting", "draining", "closing"].reduce(
+            (total, state) => total + (contextSummary.value[state] || 0),
+            0
+        )
+);
+
+function contextStateLabel(state) {
+    return state === "DRAINING" ? props.t("contextDraining") : state === "CLOSING" ? props.t("contextClosing") : state;
+}
+
+function contextDrainLabel(reason) {
+    const key = {
+        account_disabled: "schedulerPoolDisabledDraining",
+        context_capacity: "schedulerPoolCapacityDraining",
+        visible_models_rate_limited: "schedulerPoolQuotaDraining",
+    }[reason];
+    return props.t(key || "schedulerPoolDraining");
+}
+
+function contextDescription(state) {
+    const key = {
+        BUSY: "contextBusyDescription",
+        CLOSING: "contextClosingDescription",
+        COLD: "contextColdDescription",
+        DRAINING: "schedulerPoolDraining",
+        INITIALIZING: "contextInitializingDescription",
+        READY: "contextReadyDescription",
+        RECONNECTING: "contextReconnectingDescription",
+        UNAVAILABLE: "contextUnavailableDescription",
+    }[state];
+    return key ? props.t(key) : state || "—";
+}
 const totalCapacity = computed(() => (props.data?.active_workers || 0) + (props.data?.idle_workers || 0));
 const slotUsagePercent = computed(() => {
     const total = totalCapacity.value;
@@ -1943,6 +1997,18 @@ async function sendReset(url, body) {
     border: 1px solid #a7f3d0;
 }
 
+.pill-draining {
+    background: #fff7ed;
+    color: #c2410c;
+    border: 1px solid #fed7aa;
+}
+
+.pill-closing {
+    background: #f1f5f9;
+    color: #475569;
+    border: 1px solid #cbd5e1;
+}
+
 .pill-init {
     background: #fffbeb;
     color: #b45309;
@@ -1985,6 +2051,17 @@ async function sendReset(url, body) {
 
 .dot-busy {
     background: #10b981;
+}
+
+.dot-draining,
+.slot-draining {
+    background: #f97316;
+}
+
+.dot-closing,
+.slot-closing,
+.slot-ready {
+    background: #94a3b8;
 }
 
 .dot-init {
@@ -2138,6 +2215,17 @@ async function sendReset(url, body) {
     background: #fef2f2;
 }
 
+.node-draining {
+    border-color: #fed7aa;
+    background: #fff7ed;
+}
+
+.node-closing {
+    border-color: #cbd5e1;
+    background: #f8fafc;
+}
+
+.node-busy,
 .node-ready {
     border-color: #d1fae5;
 }
@@ -2162,6 +2250,12 @@ async function sendReset(url, body) {
     color: #475569;
 }
 
+.node-draining .node-state-tag {
+    background: #ffedd5;
+    color: #9a3412;
+}
+
+.node-busy .node-state-tag,
 .node-ready .node-state-tag {
     background: #d1fae5;
     color: #065f46;

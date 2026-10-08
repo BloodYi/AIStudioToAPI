@@ -1,3 +1,4 @@
+/* eslint-env browser */
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");
@@ -386,3 +387,84 @@ test("scheduler model visibility routes authenticate and return stable results",
         success: true,
     });
 });
+
+const { chromium } = require("playwright");
+const { createServer } = require("vite");
+
+test(
+    "context panel counts draining capacity and explains states in matrix and table",
+    {
+        skip: !fs.existsSync(chromium.executablePath()),
+    },
+    async t => {
+        const server = await createServer({
+            configFile: path.resolve(__dirname, "../vite.config.js"),
+            logLevel: "error",
+            server: { host: "127.0.0.1", port: 0, strictPort: false },
+        });
+        t.after(() => server.close());
+        await server.listen();
+        const component = await server.transformRequest("/components/SchedulerStatus.vue");
+        const vueImport = component.code.match(/from ["']([^"']*vue[^"']*)["']/)[1];
+        const browser = await chromium.launch({ args: ["--no-sandbox"] });
+        t.after(() => browser.close());
+        const page = await browser.newPage();
+        const errors = [];
+        page.on("pageerror", error => errors.push(error.message));
+        const contexts = Array.from({ length: 9 }, (_, index) => ({
+            auth_index: index,
+            inflight: 3,
+            state: "BUSY",
+        }));
+        contexts.push({
+            auth_index: 95,
+            drain_reason: "context_capacity",
+            draining: true,
+            inflight: 1,
+            state: "DRAINING",
+        });
+        const data = {
+            contexts_summary: { busy: 9, draining: 1, max: 10, occupied: 10, ready: 0 },
+            models: [],
+        };
+        const messages = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../ui/locales/zh.json"), "utf8"));
+        await page.route("**/api/**", route =>
+            route.fulfill({
+                body: JSON.stringify({ contexts, models: [] }),
+                contentType: "application/json",
+            })
+        );
+        await page.route("**/__context_display_test", route =>
+            route.fulfill({
+                body: `<meta charset="utf-8"><div id="app"></div><script type="module">
+            import { createApp, h, reactive } from '${vueImport}';
+            import Panel from '/components/SchedulerStatus.vue';
+            const data = reactive(${JSON.stringify(data)});
+            const messages = ${JSON.stringify(messages)};
+            window.panelData = data;
+            createApp({ render: () => h(Panel, { data, t: key => messages[key] || key }) }).mount('#app');
+        </script>`,
+                contentType: "text/html",
+            })
+        );
+        await page.goto(`${server.resolvedUrls.local[0]}__context_display_test`);
+        await page.waitForSelector(".capacity-pill");
+        assert.match(await page.locator(".context-pool-card .capacity-pill").innerText(), /10\s*\/\s*10/);
+        assert.match(await page.locator(".pill-draining").innerText(), /排空中\s*1/);
+        await page.locator(".context-pool-card .collapsible-header").click();
+        await page.waitForSelector(".node-draining");
+        assert.match(await page.locator(".node-draining").innerText(), /#95[\s\S]*排空中[\s\S]*等待腾位[\s\S]*在途: 1/);
+        assert.match(await page.locator(".node-busy").first().innerText(), /正在处理请求/);
+        await page.getByRole("button", { exact: true, name: messages.schedulerViewTable }).click();
+        assert.match(
+            await page.locator(".context-pool-card tbody tr").last().innerText(),
+            /#95[\s\S]*排空中[\s\S]*等待腾位/
+        );
+        await page.evaluate(() => {
+            Object.assign(window.panelData.contexts_summary, { busy: 8, closing: 1, draining: 0, ready: 1 });
+        });
+        assert.match(await page.locator(".context-pool-card .capacity-pill").innerText(), /10\s*\/\s*10/);
+        assert.match(await page.locator(".pill-closing").innerText(), /关闭中\s*1/);
+        assert.deepEqual(errors, []);
+    }
+);

@@ -1376,3 +1376,37 @@ test("direct initialization cannot bypass pooled capacity admission", async () =
     assert.deepEqual(manager.creations, []);
     assert.deepEqual(manager.closedIndices, []);
 });
+
+test("dashboard distinguishes draining and closing capacity from idle READY and cold failures", () => {
+    const { manager, scheduler } = quotaPoolFixture({ contextPoolMinReady: 0 });
+    for (const index of [0, 1]) {
+        manager.contexts.set(index, { page: { isClosed: () => false }, state: "READY" });
+        scheduler.account(index).inflight = 1;
+    }
+    Object.assign(manager.contexts.get(0), { draining: true, drainReason: "context_capacity" });
+    let contexts = manager.getContextPoolSnapshot();
+    const draining = contexts.find(context => context.auth_index === 0);
+    assert.equal(draining.state, "DRAINING");
+    assert.equal(draining.inflight, 1);
+    assert.equal(manager.isContextReady(0), false);
+    let summary = scheduler.summarySnapshot();
+    assert.equal(summary.contexts_summary.occupied, 2);
+    assert.equal(summary.contexts_summary.busy, 1);
+    assert.equal(summary.contexts_summary.ready, 0);
+    assert.equal(summary.contexts_summary.draining, 1);
+    assert.equal(summary.active_browser_workers, 2);
+    assert.equal(scheduler.contextsSnapshot().contexts.find(context => context.auth_index === 0).state, "DRAINING");
+
+    manager._poolClosingContexts = new Set([0]);
+    manager.contexts.delete(0);
+    manager.contextUnavailable.set(2, { reason: "previous initialization failure" });
+    contexts = manager.getContextPoolSnapshot();
+    assert.equal(contexts.find(context => context.auth_index === 0).state, "CLOSING");
+    summary = scheduler.summarySnapshot();
+    assert.equal(summary.contexts_summary.occupied, 2);
+    assert.equal(summary.contexts_summary.closing, 1);
+    assert.equal(summary.contexts_summary.draining, 0);
+    assert.equal(summary.contexts_summary.unavailable, 1);
+    assert.equal(summary.contexts_summary.unavailable_occupied, 0);
+    scheduler.close();
+});

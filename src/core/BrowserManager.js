@@ -1926,10 +1926,17 @@ class BrowserManager {
     }
 
     getContextPoolSnapshot() {
+        const closing = new Set([
+            ...(this._poolClosingContexts || []),
+            ...(this._contextPoolReplacements?.keys() || []),
+            ...(this._contextCapacityClosures?.values() || []),
+        ]);
         const contexts = [...this.contexts.entries()].map(([authIndex, data]) => {
             const inflight = this.scheduler?.account(authIndex).inflight || 0;
             let state = data.state || "READY";
-            if (this.isContextReady(authIndex)) state = inflight > 0 ? "BUSY" : "READY";
+            if (closing.has(authIndex)) state = "CLOSING";
+            else if (data.draining) state = "DRAINING";
+            else if (this.isContextReady(authIndex)) state = inflight > 0 ? "BUSY" : "READY";
             return {
                 auth_index: authIndex,
                 connection_epoch: this.connectionRegistry?.getConnectionEpoch(authIndex) || null,
@@ -1943,6 +1950,10 @@ class BrowserManager {
                 state,
             };
         });
+        for (const authIndex of closing) {
+            if (!contexts.some(item => item.auth_index === authIndex))
+                contexts.push({ auth_index: authIndex, connection_epoch: null, inflight: 0, state: "CLOSING" });
+        }
         for (const authIndex of this.initializingContexts) {
             if (!contexts.some(item => item.auth_index === authIndex))
                 contexts.push({ auth_index: authIndex, connection_epoch: null, inflight: 0, state: "INITIALIZING" });

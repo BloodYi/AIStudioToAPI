@@ -1046,9 +1046,16 @@ class ModelScheduler {
         const contextCount = state => contexts.filter(context => context.state === state).length;
         const busyContexts = contextCount("BUSY");
         const readyContexts = contextCount("READY");
+        const occupiedIndices =
+            this.browserManager?._contextCapacityIndices?.() ||
+            new Set(
+                contexts
+                    .filter(context => !["COLD", "UNAVAILABLE"].includes(context.state))
+                    .map(context => context.auth_index)
+            );
         return {
             accounts_summary: this.accountsOverviewSnapshot().summary,
-            active_browser_workers: busyContexts,
+            active_browser_workers: contexts.filter(context => context.inflight > 0).length,
             active_workers: this.workers.filter(worker => worker.lease).length,
             busy_browser_workers: busyContexts,
             contexts_summary: {
@@ -1057,8 +1064,9 @@ class ModelScheduler {
                     indices.length > 0 &&
                     indices.every(index => this.isAccountQuotaExhausted(this.account(index), now, models)),
                 busy: busyContexts,
+                closing: contextCount("CLOSING"),
                 configured_min_ready: this.config.contextPoolMinReady,
-                draining: contexts.filter(context => context.draining).length,
+                draining: contextCount("DRAINING"),
                 effective_warm_target: Math.min(
                     this.config.contextPoolMinReady,
                     indices.filter(index => this.isAccountPoolResident(index, now, models)).length
@@ -1066,12 +1074,16 @@ class ModelScheduler {
                 initializing: contextCount("INITIALIZING"),
                 max: this.config.maxWorkers,
                 next_cooldown_check_at: this.nextCooldownCheckAt,
+                occupied: occupiedIndices.size,
                 quota_exhausted_accounts: indices.filter(index =>
                     this.isAccountQuotaExhausted(this.account(index), now, models)
                 ).length,
                 ready: readyContexts,
                 reconnecting: contextCount("RECONNECTING"),
                 unavailable: contextCount("UNAVAILABLE"),
+                unavailable_occupied: contexts.filter(
+                    context => context.state === "UNAVAILABLE" && occupiedIndices.has(context.auth_index)
+                ).length,
             },
             idle_browser_workers: readyContexts,
             idle_workers: this.workers.filter(worker => !worker.lease).length,
