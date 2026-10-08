@@ -74,6 +74,9 @@ class BrowserManager {
         this.contextUnavailable = new Map();
         this.closingContexts = new Set();
         this._contextInitTasks = new Map();
+        this.contextCapacityReservations = new Map();
+        this._contextPoolReplacements = new Map();
+        this._contextCapacityClosures = new Map();
         this._contextInitAttempts = new Map();
         this._contextInitSequence = 0;
         this._contextPoolRunning = false;
@@ -189,6 +192,7 @@ class BrowserManager {
         this.connectionRegistry = connectionRegistry;
         if (this.connectionRegistry) {
             this._onAuthQueuesDrained = authIndex => {
+                this.scheduler?.coordinateContextPool?.();
                 this._closePendingContextIfIdle(authIndex).catch(error => {
                     this.logger.error(
                         `[ContextPool] Failed to close pending context #${authIndex} after queue drain: ${error.message}`
@@ -366,10 +370,19 @@ class BrowserManager {
         const startedAt = Date.now();
         const cleanupTimeoutMs = this.contextCleanupTimeoutMs || 5000;
         attempt.cleanupTask = (async () => {
+            this._contextCapacityClosures ??= new Map();
+            this._contextCapacityClosures.set(attempt, attempt.authIndex);
             const closeTask = Promise.resolve()
                 .then(() => attempt.context.close())
                 .then(() => ({ closed: true }))
-                .catch(error => ({ closed: false, error }));
+                .catch(error => ({ closed: false, error }))
+                .finally(() => {
+                    // A cleanup watchdog may finish before the physical close does.
+                    // Retain capacity until that close actually settles or the browser resets.
+                    if (!this._contextCapacityClosures.delete(attempt)) return;
+                    this.scheduler?.coordinateContextPool?.();
+                    this._pumpContextPool();
+                });
             let cleanupTimer;
             const result = await Promise.race([
                 closeTask,
@@ -1987,6 +2000,7 @@ class BrowserManager {
     }
 
     _canKeepPooledContext(authIndex) {
+        if (this.scheduler.closed) return false;
         return (
             (this.scheduler.isAccountPoolResident?.(authIndex) ??
                 this.scheduler.isAccountManuallyDisabled?.(authIndex) !== true) ||
@@ -2046,6 +2060,11 @@ class BrowserManager {
 
     _poolCandidates() {
         const rotation = this.authSource.getRotationIndices();
+        const closing = new Set([
+            ...(this._poolClosingContexts || []),
+            ...(this._contextPoolReplacements?.keys() || []),
+            ...(this._contextCapacityClosures?.values() || []),
+        ]);
         const enabled = index => this.scheduler.isAccountManuallyDisabled?.(index) !== true;
         const now = this.scheduler.now?.() ?? Date.now();
         const models = this.scheduler.getVisibleModels?.();
@@ -2074,8 +2093,9 @@ class BrowserManager {
                           !demanded.includes(index) &&
                           !this.isContextReady(index) &&
                           !this.initializingContexts.has(index) &&
+                          (!this.contexts.has(index) || this._isContextIdle(index)) &&
                           !this.contexts.get(index)?.draining &&
-                          !this._poolClosingContexts?.has(index) &&
+                          !closing.has(index) &&
                           (!unavailable?.retryAt || unavailable.retryAt <= Date.now())
                       );
                   })
@@ -2087,21 +2107,109 @@ class BrowserManager {
                 enabled(index) &&
                 !this.isContextReady(index) &&
                 !this.initializingContexts.has(index) &&
+                (!this.contexts.has(index) || this._isContextIdle(index)) &&
                 !this.contexts.get(index)?.draining &&
-                !this._poolClosingContexts?.has(index) &&
+                !closing.has(index) &&
                 (!unavailable?.retryAt || unavailable.retryAt <= Date.now())
             );
         });
     }
 
     _pumpContextPool() {
-        if (!this.scheduler || this.scheduler.closed) return;
-        const limit = this.scheduler.config.contextInitConcurrency;
-        let available = limit - (this._contextInitTasks?.size || 0);
-        for (const authIndex of this._poolCandidates()) {
-            if (available-- <= 0) break;
-            this._startPooledContext(authIndex);
+        if (!this.scheduler || this.scheduler.closed || this._pumpingContextPool) return;
+        this._pumpingContextPool = true;
+        try {
+            for (const authIndex of this._poolCandidates()) {
+                if (this._contextInitTasks.size >= this.scheduler.config.contextInitConcurrency) break;
+                this._startPooledContext(authIndex);
+                // No capacity was admitted. Wait for a lease, close or init to finish.
+                if (!this._contextInitTasks.has(authIndex)) break;
+            }
+        } finally {
+            this._pumpingContextPool = false;
         }
+    }
+
+    _contextCapacityIndices() {
+        return new Set([
+            ...this.contexts.keys(),
+            ...this.initializingContexts,
+            ...(this.contextCapacityReservations?.keys() || []),
+            ...(this._poolClosingContexts || []),
+            ...(this._contextPoolReplacements?.keys() || []),
+            ...(this._contextCapacityClosures?.values() || []),
+        ]);
+    }
+
+    _reserveContextCapacity(authIndex) {
+        this.contextCapacityReservations ??= new Map();
+        if (
+            this.scheduler.closed ||
+            this._contextInitTasks.size >= this.scheduler.config.contextInitConcurrency ||
+            this.contextCapacityReservations.has(authIndex) ||
+            this._poolClosingContexts?.has(authIndex) ||
+            this._contextPoolReplacements?.has(authIndex) ||
+            [...(this._contextCapacityClosures?.values() || [])].includes(authIndex) ||
+            (this.contexts.has(authIndex) && !this._isContextIdle(authIndex))
+        )
+            return null;
+        const occupied = this._contextCapacityIndices();
+        if (!occupied.has(authIndex) && occupied.size >= this.scheduler.config.maxWorkers) {
+            const status = `${occupied.size}:${this.scheduler.config.maxWorkers}:${this.contextCapacityReservations.size}`;
+            if (this._lastContextCapacityWait !== status) {
+                this._lastContextCapacityWait = status;
+                this.logger.debug(
+                    `[ContextPool] Waiting for capacity: occupied=${occupied.size}, max=${this.scheduler.config.maxWorkers}, reserved=${this.contextCapacityReservations.size}`
+                );
+            }
+            this._replaceIdlePooledContext(authIndex);
+            return null;
+        }
+        // This synchronous claim precedes both init registration and every await.
+        const reservation = { authIndex };
+        this.contextCapacityReservations.set(authIndex, reservation);
+        this._lastContextCapacityWait = null;
+        return reservation;
+    }
+
+    _releaseContextCapacity(authIndex, reservation) {
+        if (!reservation || this.contextCapacityReservations?.get(authIndex) !== reservation) return;
+        this.contextCapacityReservations.delete(authIndex);
+    }
+
+    _replaceIdlePooledContext(authIndex) {
+        this._contextPoolReplacements ??= new Map();
+        // Finish one replacement before selecting another victim for the same demand.
+        if (this._contextPoolReplacements.size || this._poolClosingContexts?.size) return;
+        const idle = [...this.contexts.keys()]
+            .filter(
+                index =>
+                    index !== authIndex &&
+                    !this.initializingContexts.has(index) &&
+                    !this.contextCapacityReservations?.has(index) &&
+                    this._isContextIdle(index)
+            )
+            .sort((a, b) => this._compareContextEviction(a, b))[0];
+        if (idle === undefined) return;
+        const owner = {};
+        this._contextPoolReplacements.set(idle, owner);
+        Object.assign(this.contexts.get(idle), { draining: true, drainReason: "context_capacity" });
+        this.logger.info(
+            `[ContextPool] Evicting context #${idle} for #${authIndex} (${this.contextEvictionReason(idle)})`
+        );
+        // Mark synchronously, then close. Closing capacity is retained until settlement.
+        Promise.resolve()
+            .then(() => {
+                if (this._contextPoolReplacements.get(idle) !== owner) return;
+                return this.closeContext(idle, { keepBrowser: true });
+            })
+            .catch(error => this.logger.error(`[ContextPool] Replacement close #${idle} failed: ${error.message}`))
+            .finally(() => {
+                if (this._contextPoolReplacements.get(idle) !== owner) return;
+                this._contextPoolReplacements.delete(idle);
+                this.scheduler?.coordinateContextPool?.();
+                this._pumpContextPool();
+            });
     }
 
     async _ensureBrowserForPool() {
@@ -2262,80 +2370,61 @@ class BrowserManager {
 
     _startPooledContext(authIndex) {
         if (this._contextInitTasks.has(authIndex)) return this._contextInitTasks.get(authIndex);
-        let blockedByCapacity = false;
+        if (!this.scheduler || this.scheduler.closed || this.isContextReady(authIndex)) return Promise.resolve();
+        const reservation = this._reserveContextCapacity(authIndex);
+        if (!reservation) return Promise.resolve();
         return this._getOrStartContextInit(authIndex, {
+            capacityReservation: reservation,
             isBackgroundTask: true,
+            onError: error => {
+                if (isContextAbortedError(error)) return;
+                const retryAt = Date.now() + 5000;
+                this.contextUnavailable.set(authIndex, { at: Date.now(), error, reason: error.reason, retryAt });
+                this.contextDemand.delete(authIndex);
+                this.logger.error(`[ContextPool] Context #${authIndex} unavailable: ${error.message}`);
+                const retryTimer = setTimeout(() => this._pumpContextPool(), 5000);
+                retryTimer.unref?.();
+            },
             onSettledAfterRelease: () => {
-                if (blockedByCapacity) return;
                 this.scheduler?.coordinateContextPool?.();
                 this.scheduler?.drain();
                 this._pumpContextPool();
             },
             runner: async attempt => {
-                try {
-                    await this._ensureBrowserForPool();
-                    if (this.scheduler.closed) throw new Error("Scheduler is shutting down");
-                    if (!this._canKeepPooledContext(authIndex))
-                        throw new ContextAbortedError(authIndex, "account not eligible for pool");
-                    const stale = this.contexts.get(authIndex);
-                    if (stale) {
-                        if (!this._isContextIdle(authIndex)) {
-                            blockedByCapacity = true;
-                            return;
-                        }
-                        await this.closeContext(authIndex, { keepBrowser: true, skipInitWait: true });
-                    }
-                    const occupancy =
-                        new Set([
-                            ...this.contexts.keys(),
-                            ...this.initializingContexts,
-                            ...(this._poolClosingContexts || []),
-                        ]).size - 1;
-                    if (occupancy >= this.scheduler.config.maxWorkers) {
-                        const idle = [...this.contexts.keys()]
-                            .filter(index => index !== authIndex && this._isContextIdle(index))
-                            .sort((a, b) => this._compareContextEviction(a, b))[0];
-                        if (idle === undefined) {
-                            blockedByCapacity = true;
-                            return;
-                        }
-                        this.logger.info(
-                            `[ContextPool] Evicting context #${idle} for #${authIndex} (${this.contextEvictionReason(idle)})`
-                        );
-                        await this.closeContext(idle, { keepBrowser: true });
-                    }
-                    await this._initializeContext(authIndex, true, attempt);
-                    if (!this._canKeepPooledContext(authIndex)) {
-                        await this.closeContext(authIndex, { keepBrowser: true, skipInitWait: true });
-                        throw new ContextAbortedError(authIndex, "account not eligible after initialization");
-                    }
-                    const data = this.contexts.get(authIndex);
-                    if (!data || !this.connectionRegistry.getConnectionByAuth(authIndex, false))
-                        throw Object.assign(new Error("WebSocket not ready after context initialization"), {
-                            reason: "connection_lost",
-                        });
-                    Object.assign(data, { lastDisconnectReason: null, noButtonCount: 0, state: "READY" });
-                    this.contextDemand.delete(authIndex);
-                    this.contextUnavailable.delete(authIndex);
-                    this._startHealthMonitor(authIndex);
-                    this._startBackgroundWakeup(data).catch(error => {
-                        this.logger.warn(`[Worker#${authIndex}] Wakeup stopped: ${error.message}`);
-                    });
-                } catch (error) {
-                    if (!isContextAbortedError(error)) {
-                        const retryAt = Date.now() + 5000;
-                        this.contextUnavailable.set(authIndex, {
-                            at: Date.now(),
-                            error,
-                            reason: error.reason,
-                            retryAt,
-                        });
-                        this.contextDemand.delete(authIndex);
-                        this.logger.error(`[ContextPool] Context #${authIndex} unavailable: ${error.message}`);
-                        const retryTimer = setTimeout(() => this._pumpContextPool(), 5000);
-                        retryTimer.unref?.();
-                    }
+                await this._ensureBrowserForPool();
+                this._assertCurrentInitAttempt(attempt);
+                if (this.scheduler.closed) throw new ContextAbortedError(authIndex, "scheduler closed");
+                if (this.contextCapacityReservations.get(authIndex) !== reservation)
+                    throw new ContextAbortedError(authIndex, "capacity reservation lost");
+                if (!this._canKeepPooledContext(authIndex))
+                    throw new ContextAbortedError(authIndex, "account not eligible for pool");
+                const stale = this.contexts.get(authIndex);
+                if (stale) {
+                    // Admission prevents leasing a stale context while it is rebuilt.
+                    if (!this._isContextIdle(authIndex))
+                        throw new ContextAbortedError(authIndex, "context acquired before rebuild");
+                    await this.closeContext(authIndex, { keepBrowser: true, skipInitWait: true });
                 }
+                this._assertCurrentInitAttempt(attempt);
+                await this._initializeContext(authIndex, true, attempt);
+                this._assertCurrentInitAttempt(attempt);
+                if (!this._canKeepPooledContext(authIndex)) {
+                    await this.closeContext(authIndex, { keepBrowser: true, skipInitWait: true });
+                    throw new ContextAbortedError(authIndex, "account not eligible after initialization");
+                }
+                const data = this.contexts.get(authIndex);
+                if (!data || !this.connectionRegistry.getConnectionByAuth(authIndex, false))
+                    throw Object.assign(new Error("WebSocket not ready after context initialization"), {
+                        reason: "connection_lost",
+                    });
+                Object.assign(data, { lastDisconnectReason: null, noButtonCount: 0, state: "READY" });
+                this.contextDemand.delete(authIndex);
+                this.contextUnavailable.delete(authIndex);
+                this._startHealthMonitor(authIndex);
+                this._startBackgroundWakeup(data).catch(error => {
+                    this.logger.warn(`[Worker#${authIndex}] Wakeup stopped: ${error.message}`);
+                });
+                return { context: data.context, page: data.page };
             },
         });
     }
@@ -2926,6 +3015,16 @@ class BrowserManager {
         const existing = this._contextInitTasks.get(authIndex);
         if (existing) return existing;
 
+        // Legacy callers must use the same admission rule when the scheduler is active.
+        if (this.scheduler?.config?.readyContextOnly && !options.capacityReservation) {
+            const reservation = this._reserveContextCapacity(authIndex);
+            if (!reservation)
+                return Promise.reject(
+                    new ContextAbortedError(authIndex, "waiting for context capacity; use ensureWorkerContext")
+                );
+            options = { ...options, capacityReservation: reservation };
+        }
+
         this._contextInitSequence = (this._contextInitSequence || 0) + 1;
         const startedAt = Date.now();
         const attempt = {
@@ -2956,6 +3055,13 @@ class BrowserManager {
         this._wsInitState.set(authIndex, attempt.ws); // Observability only; never read for correctness.
         this.logger.info(`[Context#${authIndex}] init_started attempt=${attempt.id}`);
         const runnerTask = Promise.resolve().then(() => runner(attempt));
+        const cancellationTask = new Promise((_, reject) => {
+            attempt.cancel = reason => {
+                attempt.aborted = true;
+                attempt.abortReason = reason;
+                reject(new ContextAbortedError(authIndex, reason));
+            };
+        });
         runnerTask.catch(() => {});
         runnerTask.then(
             () => {
@@ -2983,29 +3089,36 @@ class BrowserManager {
                 reject(error);
             }, this.contextInitTotalTimeoutMs || 180000);
         });
-        const task = Promise.race([runnerTask, watchdogTask]).finally(() => {
-            clearTimeout(watchdogTimer);
-            attempt.settled = true;
-            let released = false;
-            if (
-                this._contextInitTasks.get(authIndex) === task &&
-                this._contextInitAttempts.get(authIndex) === attempt
-            ) {
-                this._contextInitTasks.delete(authIndex);
-                this._contextInitAttempts.delete(authIndex);
-                this.initializingContexts.delete(authIndex);
-                this.abortedContexts.delete(authIndex);
-                released = true;
-            }
-            this.logger.info(
-                `[Context#${authIndex}] init_finished attempt=${attempt.id} released=${released} initializing_count=${this.initializingContexts.size} pending_init=${this._contextInitTasks.size}`
-            );
-            if (released) {
-                // Pool callbacks decide whether capacity permits another scheduling pass.
-                if (options.onSettledAfterRelease) options.onSettledAfterRelease();
-                else this.scheduler?.drain?.();
-            }
-        });
+        const task = Promise.race([runnerTask, watchdogTask, cancellationTask])
+            .catch(error => {
+                if (!options.onError) throw error;
+                options.onError(error);
+            })
+            .finally(() => {
+                clearTimeout(watchdogTimer);
+                attempt.cancel = null;
+                attempt.settled = true;
+                let released = false;
+                if (
+                    this._contextInitTasks.get(authIndex) === task &&
+                    this._contextInitAttempts.get(authIndex) === attempt
+                ) {
+                    this._contextInitTasks.delete(authIndex);
+                    this._contextInitAttempts.delete(authIndex);
+                    this.initializingContexts.delete(authIndex);
+                    this.abortedContexts.delete(authIndex);
+                    this._releaseContextCapacity(authIndex, options.capacityReservation);
+                    released = true;
+                }
+                this.logger.info(
+                    `[Context#${authIndex}] init_finished attempt=${attempt.id} released=${released} initializing_count=${this.initializingContexts.size} pending_init=${this._contextInitTasks.size}`
+                );
+                if (released) {
+                    // Pool callbacks decide whether capacity permits another scheduling pass.
+                    if (options.onSettledAfterRelease) options.onSettledAfterRelease();
+                    else this.scheduler?.drain?.();
+                }
+            });
         this._contextInitTasks.set(authIndex, task);
         return task;
     }
@@ -3290,6 +3403,12 @@ class BrowserManager {
             this.logger.error(`[Browser] Invalid authIndex: ${authIndex}. authIndex must be >= 0.`);
             this._currentAuthIndex = -1;
             throw new Error(`Invalid authIndex: ${authIndex}. Must be >= 0.`);
+        }
+
+        if (this.scheduler) {
+            await this.ensureWorkerContext(authIndex);
+            const data = this.contexts.get(authIndex);
+            return { context: data.context, page: data.page };
         }
 
         this._cancelPendingContextClosure(authIndex, "context_reused");
@@ -3744,7 +3863,12 @@ class BrowserManager {
         }
 
         // Reset all references
+        for (const attempt of this._contextInitAttempts?.values() || []) attempt.cancel?.("browser reset");
         this.contexts.clear();
+        this.contextCapacityReservations?.clear();
+        this._contextPoolReplacements?.clear();
+        this._contextCapacityClosures?.clear();
+        this._poolClosingContexts?.clear();
         this.initializingContexts.clear();
         this.abortedContexts.clear();
         this.pendingContextClosures.clear();

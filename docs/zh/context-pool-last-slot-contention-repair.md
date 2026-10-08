@@ -11,7 +11,7 @@
 
 排查结论：**多个冷账号初始化任务先登记占位，再分别检查容量，互相把对方算成已经占用最后空位，导致全部退出。** 后续事件再次调度时，可能重复相同过程。
 
-本问题已通过生产日志和本地同版代码模拟交叉验证。排查期间只读取生产日志、配置及代码校验值，没有修改代码或配置，没有重启服务、关闭 context 或操作在途请求。本文是后续修复方案，尚未实施。
+本问题已通过生产日志和本地同版代码模拟交叉验证。排查期间只读取生产日志、配置及代码校验值，没有修改代码或配置，没有重启服务、关闭 context 或操作在途请求。后续已按本文完成本地代码修复，实施及验证结果见第 7 节；尚未部署生产。第 2、3 节记录修复前的版本与行为。
 
 ## 2. 生产证据
 
@@ -69,13 +69,13 @@ ModelScheduler.js a2bb4aea3d8e569e7c92efecca42d2f22665233d0b3b8f8daee1651fafaf78
 
 涉及文件与方法：
 
-| 文件 | 方法 | 当前作用 |
-| --- | --- | --- |
-| `src/core/ModelScheduler.js` | `_signalContextDemand()` | 为排队请求选择冷账号并发出 context 需求 |
-| `src/core/BrowserManager.js` | `_poolCandidates()` | 合并有效需求与预热候选 |
-| `src/core/BrowserManager.js` | `_pumpContextPool()` | 依据初始化并发名额启动任务 |
-| `src/core/BrowserManager.js` | `_getOrStartContextInit()` | 同步登记初始化状态，异步执行 runner |
-| `src/core/BrowserManager.js` | `_startPooledContext()` | 在 runner 内检查容量、替换或创建 context |
+| 文件                         | 方法                       | 当前作用                                 |
+| ---------------------------- | -------------------------- | ---------------------------------------- |
+| `src/core/ModelScheduler.js` | `_signalContextDemand()`   | 为排队请求选择冷账号并发出 context 需求  |
+| `src/core/BrowserManager.js` | `_poolCandidates()`        | 合并有效需求与预热候选                   |
+| `src/core/BrowserManager.js` | `_pumpContextPool()`       | 依据初始化并发名额启动任务               |
+| `src/core/BrowserManager.js` | `_getOrStartContextInit()` | 同步登记初始化状态，异步执行 runner      |
+| `src/core/BrowserManager.js` | `_startPooledContext()`    | 在 runner 内检查容量、替换或创建 context |
 
 ### 3.1 启动任务时没有先分配物理容量
 
@@ -84,8 +84,8 @@ ModelScheduler.js a2bb4aea3d8e569e7c92efecca42d2f22665233d0b3b8f8daee1651fafaf78
 ```js
 let available = limit - (this._contextInitTasks?.size || 0);
 for (const authIndex of this._poolCandidates()) {
-    if (available-- <= 0) break;
-    this._startPooledContext(authIndex);
+  if (available-- <= 0) break;
+  this._startPooledContext(authIndex);
 }
 ```
 
@@ -103,11 +103,8 @@ const runnerTask = Promise.resolve().then(() => runner(attempt));
 runner 在 `await this._ensureBrowserForPool()` 之后计算：
 
 ```js
-const occupancy = new Set([
-    ...this.contexts.keys(),
-    ...this.initializingContexts,
-    ...(this._poolClosingContexts || []),
-]).size - 1;
+const occupancy =
+  new Set([...this.contexts.keys(), ...this.initializingContexts, ...(this._poolClosingContexts || [])]).size - 1;
 ```
 
 当 9 个已有 context 均忙，两个冷账号都已登记时，两者看到的结果都是：
@@ -167,17 +164,17 @@ if (blockedByCapacity) return;
 
 ```js
 for (const candidate of orderedCandidates) {
-    if (!hasInitConcurrency()) break;
-    if (hasAttemptOrReservation(candidate)) continue;
+  if (!hasInitConcurrency()) break;
+  if (hasAttemptOrReservation(candidate)) continue;
 
-    const reservation = tryReserveCapacity(candidate); // 同步检查、同步预留
-    if (reservation) {
-        startReservedInitialization(candidate, reservation);
-        continue;
-    }
+  const reservation = tryReserveCapacity(candidate); // 同步检查、同步预留
+  if (reservation) {
+    startReservedInitialization(candidate, reservation);
+    continue;
+  }
 
-    scheduleOneSafeIdleReplacementIfPossible();
-    break; // 等待关闭或其他容量释放事件，保留需求
+  scheduleOneSafeIdleReplacementIfPossible();
+  break; // 等待关闭或其他容量释放事件，保留需求
 }
 ```
 
@@ -210,10 +207,10 @@ for (const candidate of orderedCandidates) {
 
 使用 `Object.create(BrowserManager.prototype)` 调用实际池方法，将浏览器初始化替换为内存模拟；设置 9 个忙 context、上限 10、初始化并发 2，并提前放入冷账号需求后调用 pump。没有启动真实浏览器或发起上游请求。
 
-| 初始状态 | 冷账号需求数 | 实际进入 `_initializeContext()` 次数 | 最终 context 数 |
-| --- | ---: | ---: | ---: |
-| 9 个忙 context，上限 10 | 2 | 0 | 9 |
-| 9 个忙 context，上限 10 | 1 | 1 | 10 |
+| 初始状态                | 冷账号需求数 | 实际进入 `_initializeContext()` 次数 | 最终 context 数 |
+| ----------------------- | -----------: | -----------------------------------: | --------------: |
+| 9 个忙 context，上限 10 |            2 |                                    0 |               9 |
+| 9 个忙 context，上限 10 |            1 |                                    1 |              10 |
 
 上述结果是当前代码的故障复现，不是修复后的测试结果。
 
@@ -237,7 +234,7 @@ for (const candidate of orderedCandidates) {
 node --test tests/browser-workers.test.js tests/model-scheduler.test.js tests/scheduled-request.test.js
 ```
 
-根据实际修改范围再执行项目要求的 lint 和其他相关检查。本文编写阶段没有实施修复，也没有运行上述修复验收测试。
+根据实际修改范围再执行项目要求的 lint 和其他相关检查。初次编写本文时尚未实施修复；后续执行情况见第 7 节。
 
 ## 6. 日志与上线观察
 
@@ -253,3 +250,35 @@ node --test tests/browser-workers.test.js tests/model-scheduler.test.js tests/sc
 - 现有流式请求完整结束，未因补池被主动关闭。
 
 不得通过提高 `MAX_BROWSER_WORKERS`、关闭忙 context、重置所有账号 429 或重启共享浏览器代替本次容量准入修复。生产部署应另行安排，本排查及文档编写不包含部署操作。
+
+## 7. 本地实施与验证结果
+
+### 7.1 已实现的变更
+
+`src/core/BrowserManager.js`：
+
+- 增加按账号持有、按所有者校验释放的 `contextCapacityReservations`，在登记初始化任务之前同步准入。
+- 容量计算覆盖现有 context、已登记初始化、容量预留、替换关闭和初始化失败后的底层关闭任务，并按账号去重。
+- 满池候选继续保留需求，不再创建空跑的初始化 attempt；初始化并发仍独立受配置限制。
+- 空闲替换同步标记 draining，并持有关闭容量，等关闭完成后重新调度；避免重复选择同一 victim。
+- single-flight 的失败处理覆盖 runner 异常与总 watchdog，清理标记、释放预留后再补池，保留原有失败退避。
+- 初始化清理 watchdog 超时后仍保留底层关闭任务的容量，直到实际关闭结束或浏览器重置。
+- 浏览器重置主动取消旧 attempt，旧任务延迟完成不能覆盖新 context 或释放新预留。
+- 前台切换接入 `ensureWorkerContext()`；调度模式中的直接初始化也经过相同容量准入。
+- 消息队列释放时触发池协调，即使该账号没有 pending closure，也能唤醒容量等待。
+- 增加状态变化时的 debug 容量等待日志，不逐请求重复输出相同状态。
+
+### 7.2 回归验证
+
+`tests/browser-workers.test.js` 新增覆盖：最后一个空位竞争、初始化并发与剩余容量的组合、真实调度器 Pro/Flash 联动、延迟关闭与重复淘汰防护、失败释放、watchdog 后的关闭容量、旧 attempt 隔离、浏览器重置、关闭调度器、账号禁用、队列释放唤醒及直接初始化的准入约束。
+
+原有“满池不立即 repump”测试保留；真实满池场景现在断言初始化 attempt 数为 0。调度器关闭期间完成的初始化会被回收，不再留作 READY context。
+
+验证结果：
+
+- 最终相关测试命令通过：`node --test tests/browser-workers.test.js tests/model-scheduler.test.js tests/scheduled-request.test.js`，142 项通过，无失败或跳过。
+- `npm test` 完整执行通过：该次运行统计 254 项，222 项通过，32 项按环境条件跳过。此后新增的队列释放与直接初始化两项回归，已包含在上述最终相关测试中。
+- `npm run lint` 通过；存在项目原有的 `ui/app/pages/StatusPage.vue` 中一条 `vue/no-v-html` warning，无 error。
+- 首轮完整测试中的账号登录临时失败重试用例出现一次等待超时；单独复跑与随后完整复跑均通过。未修改该用例及账号登录实现。
+
+以上验证使用本地模拟和项目测试，未连接生产验证修复后的调度行为，未部署、重启生产或操作生产在途请求。

@@ -207,7 +207,7 @@ test("real scheduler waits for capacity release without an initialization microt
             waiting.catch(() => {});
             await new Promise(resolve => setImmediate(resolve));
 
-            assert.equal(attempts, 1);
+            assert.equal(attempts, 0);
             assert.equal(creations, 0);
             assert.equal(scheduler.pending.length, 1);
             assert.equal(scheduler.account(0).inflight, 1);
@@ -242,9 +242,10 @@ test("release callback cannot restart the pool after scheduler shutdown", async 
     };
 
     manager.startContextPool();
-    await waitForPool(manager, 1);
+    await waitForPool(manager, 0);
 
-    assert.equal(manager.contexts.size, 1);
+    assert.equal(manager.contexts.size, 0);
+    assert.equal(manager.contextCapacityReservations.size, 0);
     assert.equal(manager._contextInitTasks.size, 0);
     assert.equal(manager.initializingContexts.size, 0);
 });
@@ -1059,4 +1060,319 @@ test("an actual 429 triggers retirement automatically while a usable Flash keeps
     await waitForPool(manager, 2);
     assert.equal(manager.contexts.has(flash.account.index), false);
     scheduler.close();
+});
+
+function capacityFixture({ busy = 9, concurrency = 2, limit = 10, demands = 3 } = {}) {
+    const manager = browserFixture(limit);
+    const accounts = new Map();
+    const indices = Array.from({ length: busy + demands }, (_, index) => index);
+    manager.authSource.getRotationIndices = () => indices;
+    manager.scheduler.config.contextInitConcurrency = concurrency;
+    manager.scheduler.account = index => {
+        if (!accounts.has(index)) accounts.set(index, { healthy: true, inflight: index < busy ? 1 : 0 });
+        return accounts.get(index);
+    };
+    manager._hasActiveQueueForAuth = index => manager.scheduler.account(index).inflight > 0;
+    for (let index = 0; index < busy; index++)
+        manager.contexts.set(index, { page: { isClosed: () => false }, state: "READY" });
+    for (let index = busy; index < busy + demands; index++) manager.contextDemand.set(index, { model: null });
+    manager.creations = [];
+    manager.closedIndices = [];
+    const initialize = manager._initializeContext;
+    manager._initializeContext = async function (index, ...args) {
+        this.creations.push(index);
+        assert.ok(this._contextCapacityIndices().size <= limit);
+        await initialize.call(this, index, ...args);
+        // Keep every new context busy, as a dispatched request would.
+        this.scheduler.account(index).inflight = 1;
+        assert.ok(this._contextCapacityIndices().size <= limit);
+    };
+    const close = manager.closeContext;
+    manager.closeContext = async function (index, options) {
+        assert.equal(this._isContextIdle(index), true);
+        this.closedIndices.push(index);
+        await close.call(this, index, options);
+    };
+    return manager;
+}
+
+test("two cold demands use the last slot while all nine existing contexts stay busy", async () => {
+    const manager = capacityFixture({ demands: 2 });
+    manager._pumpContextPool();
+    // The second candidate waits without registering a phantom initialization.
+    assert.deepEqual([...manager.initializingContexts], [9]);
+    assert.equal(manager.contextCapacityReservations.size, 1);
+    await waitForPool(manager, 10);
+    assert.deepEqual(manager.creations, [9]);
+    assert.equal(manager.contexts.size, 10);
+    assert.equal(manager.contextCapacityReservations.size, 0);
+    assert.equal(manager.contextDemand.has(10), true);
+    assert.deepEqual(manager.closedIndices, []);
+});
+
+test("capacity and initialization concurrency independently bound cold demand admission", async t => {
+    for (const concurrency of [1, 2, 4]) {
+        for (const free of [0, 1, 2]) {
+            await t.test(`concurrency=${concurrency}, free=${free}`, async () => {
+                const manager = capacityFixture({ busy: 10 - free, concurrency, demands: 5 });
+                manager._pumpContextPool();
+                assert.equal(manager._contextInitTasks.size, Math.min(concurrency, free));
+                await waitForPool(manager, 10);
+                assert.equal(manager.contexts.size, 10);
+                assert.equal(manager.creations.length, free);
+                assert.ok((manager.peakInitializations || 0) <= concurrency);
+                assert.equal(manager.contextCapacityReservations?.size || 0, 0);
+                assert.deepEqual(manager.closedIndices, []);
+                // Repeated admission attempts at full capacity cannot create empty attempts.
+                const attempts = manager._contextInitSequence;
+                for (let index = 0; index < 5; index++) manager._pumpContextPool();
+                assert.equal(manager._contextInitSequence, attempts);
+            });
+        }
+    }
+});
+
+test("real scheduler dispatches queued Pro through the last slot without interrupting Flash leases", async t => {
+    const manager = browserFixture(10);
+    manager.authSource.accountNameMap = new Map();
+    manager.authSource.getRotationIndices = () => Array.from({ length: 13 }, (_, index) => index);
+    const scheduler = new ModelScheduler(
+        {
+            ...loadSchedulerConfig({
+                CONTEXT_MAX_CONCURRENCY: "10",
+                GLOBAL_MAX_CONCURRENCY: "100",
+                MAX_BROWSER_WORKERS: "10",
+                SCHEDULER_DAILY_RESET_ENABLED: "false",
+            }),
+            contextPoolMinReady: 0,
+            queueTimeoutMs: 2000,
+            statePath: null,
+        },
+        manager.authSource,
+        logger
+    );
+    manager.scheduler = scheduler;
+    scheduler.browserManager = manager;
+    t.after(() => scheduler.close());
+    const leases = [];
+    t.after(() => leases.forEach(lease => scheduler.release(lease)));
+    const closed = [];
+    manager.closeContext = async index => {
+        assert.equal(scheduler.account(index).inflight, 0);
+        closed.push(index);
+        manager.contexts.delete(index);
+    };
+    for (let index = 0; index < 9; index++) {
+        manager.contexts.set(index, { page: { isClosed: () => false }, state: "READY" });
+        Object.assign(scheduler.slot(scheduler.account(index), "pro"), {
+            cooldown_until: Date.now() + 3600000,
+            rate_limited: true,
+        });
+        const excluded = new Set(
+            manager.authSource
+                .getRotationIndices()
+                .filter(other => other !== index)
+                .map(other => scheduler.account(other).key)
+        );
+        leases.push(await scheduler.acquire("flash", excluded));
+    }
+    const pro = [scheduler.acquire("pro"), scheduler.acquire("pro"), scheduler.acquire("pro")];
+    const proLeases = await Promise.all(pro);
+    leases.push(...proLeases);
+    assert.equal(manager.contexts.size, 10);
+    assert.equal(scheduler.pending.length, 0);
+    assert.ok(proLeases.every(lease => lease.account.index === 9));
+    assert.ok(leases.slice(0, 9).every(lease => !lease.released && lease.account.inflight === 1));
+    assert.deepEqual(closed, []);
+});
+
+test("replacement retains capacity until close settles and selects each victim only once", async () => {
+    const manager = capacityFixture({ busy: 1, demands: 2, limit: 1 });
+    manager.scheduler.account(0).inflight = 0;
+    let finishClose;
+    const closing = new Promise(resolve => {
+        finishClose = resolve;
+    });
+    const close = manager.closeContext;
+    manager.closeContext = async function (index, options) {
+        await close.call(this, index, options);
+        await closing;
+    };
+    manager._pumpContextPool();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contexts.size, 0);
+    assert.equal(manager._contextCapacityIndices().size, 1);
+    for (let index = 0; index < 5; index++) manager._pumpContextPool();
+    assert.deepEqual(manager.closedIndices, [0]);
+    assert.deepEqual(manager.creations, []);
+    finishClose();
+    await waitForPool(manager, 1);
+    assert.equal(manager.contexts.size, 1);
+    assert.deepEqual(manager.creations, [1]);
+    assert.deepEqual(manager.closedIndices, [0]);
+});
+
+test("failed initialization releases its reservation for a different waiting account", async () => {
+    const manager = capacityFixture({ busy: 0, demands: 2, limit: 1 });
+    const initialize = manager._initializeContext;
+    manager._initializeContext = async function (index, ...args) {
+        if (index === 0) throw new Error("expected failure");
+        return initialize.call(this, index, ...args);
+    };
+    manager._pumpContextPool();
+    await waitForPool(manager, 1);
+    assert.deepEqual(manager.creations, [1]);
+    assert.equal(manager.contexts.has(1), true);
+    assert.equal(manager.contextCapacityReservations.size, 0);
+    assert.equal(manager.contextUnavailable.get(0).error.message, "expected failure");
+});
+
+test("pooled watchdog holds closing capacity and an old attempt cannot release a newer reservation", async () => {
+    const manager = capacityFixture({ busy: 0, demands: 2, limit: 1 });
+    manager.contextInitTotalTimeoutMs = 10;
+    manager.contextCleanupTimeoutMs = 5;
+    let finishClose;
+    const closing = new Promise(resolve => {
+        finishClose = resolve;
+    });
+    let finishOld;
+    const oldRunner = new Promise(resolve => {
+        finishOld = resolve;
+    });
+    const initialize = manager._initializeContext;
+    manager._initializeContext = async function (index, _background, attempt) {
+        if (index === 0) {
+            attempt.context = { close: () => closing };
+            await oldRunner;
+            return;
+        }
+        return initialize.call(this, index);
+    };
+    manager._pumpContextPool();
+    const oldTask = manager._contextInitTasks.get(0);
+    await oldTask;
+    assert.equal(manager.contextCapacityReservations.size, 0);
+    assert.equal(manager.contextUnavailable.get(0).error.code, "CONTEXT_INIT_TOTAL_TIMEOUT");
+    assert.equal(manager._contextCapacityIndices().size, 1);
+    assert.deepEqual(manager.creations, []);
+    manager.contextInitTotalTimeoutMs = 1000;
+    finishClose();
+    // Hold the next attempt after it has acquired the released capacity.
+    let finishNew;
+    const newRunner = new Promise(resolve => {
+        finishNew = resolve;
+    });
+    manager._initializeContext = async function (index, ...args) {
+        await newRunner;
+        return initialize.call(this, index, ...args);
+    };
+    await new Promise(resolve => setImmediate(resolve));
+    const reservation = manager.contextCapacityReservations.get(1);
+    assert.ok(reservation);
+    finishOld();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.contextCapacityReservations.get(1), reservation);
+    finishNew();
+    await waitForPool(manager, 1);
+    assert.equal(manager.contexts.has(1), true);
+    assert.equal(manager.contexts.has(0), false);
+    assert.equal(manager.contextCapacityReservations.size, 0);
+});
+
+test("browser reset cancels pooled ownership and late completion preserves the replacement attempt", async () => {
+    const manager = capacityFixture({ busy: 0, demands: 1, limit: 1 });
+    manager.closingContexts = new Set();
+    manager.contextInitTotalTimeoutMs = 1000;
+    let finishOld;
+    const oldRunner = new Promise(resolve => {
+        finishOld = resolve;
+    });
+    let finishNew;
+    const newRunner = new Promise(resolve => {
+        finishNew = resolve;
+    });
+    let calls = 0;
+    const initialize = manager._initializeContext;
+    manager._initializeContext = async function (index, ...args) {
+        calls++;
+        if (calls === 1) {
+            await oldRunner;
+            return;
+        }
+        await newRunner;
+        return initialize.call(this, index, ...args);
+    };
+    manager._pumpContextPool();
+    const oldTask = manager._contextInitTasks.get(0);
+    await new Promise(resolve => setImmediate(resolve));
+    manager._cleanupAllContexts();
+    await oldTask;
+    const replacement = manager._contextInitTasks.get(0);
+    const reservation = manager.contextCapacityReservations.get(0);
+    assert.ok(replacement && replacement !== oldTask);
+    assert.ok(reservation);
+    finishOld();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager._contextInitTasks.get(0), replacement);
+    assert.equal(manager.contextCapacityReservations.get(0), reservation);
+    finishNew();
+    await waitForPool(manager, 1);
+    assert.equal(manager.creations.length, 1);
+    assert.equal(manager.contextCapacityReservations.size, 0);
+});
+
+test("shutdown and account disable during admission release capacity without starting creation", async t => {
+    for (const reason of ["shutdown", "disable"]) {
+        await t.test(reason, async () => {
+            const manager = capacityFixture({ busy: 0, demands: 1, limit: 1 });
+            let finishEnsure;
+            const ensuring = new Promise(resolve => {
+                finishEnsure = resolve;
+            });
+            manager._ensureBrowserForPool = () => ensuring;
+            manager.scheduler.isAccountManuallyDisabled = index => manager.scheduler.account(index).disabled === true;
+            manager._pumpContextPool();
+            const task = manager._contextInitTasks.get(0);
+            await new Promise(resolve => setImmediate(resolve));
+            if (reason === "shutdown") manager.scheduler.closed = true;
+            else manager.scheduler.account(0).disabled = true;
+            finishEnsure();
+            await task;
+            assert.deepEqual(manager.creations, []);
+            assert.equal(manager.contextCapacityReservations.size, 0);
+            assert.equal(manager._contextInitTasks.size, 0);
+            assert.equal(manager.contextUnavailable.size, 0);
+        });
+    }
+});
+
+test("queue drainage wakes capacity admission even without a pending context closure", async () => {
+    const manager = capacityFixture({ busy: 1, demands: 1, limit: 1 });
+    manager.scheduler.account(0).inflight = 0;
+    let queueBusy = true;
+    manager._hasActiveQueueForAuth = index => index === 0 && queueBusy;
+    const registry = new (require("node:events").EventEmitter)();
+    registry.getConnectionByAuth = index => (manager.contexts.has(index) ? {} : null);
+    manager.setConnectionRegistry(registry);
+    manager.scheduler.coordinateContextPool = () => manager._pumpContextPool();
+    manager._pumpContextPool();
+    assert.equal(manager._contextInitTasks.size, 0);
+    assert.equal(manager.pendingContextClosures.size, 0);
+    assert.deepEqual(manager.closedIndices, []);
+    queueBusy = false;
+    registry.emit("authQueuesDrained", 0);
+    await new Promise(resolve => setImmediate(resolve));
+    await waitForPool(manager, 1);
+    assert.deepEqual(manager.creations, [1]);
+    assert.deepEqual(manager.closedIndices, [0]);
+});
+
+test("direct initialization cannot bypass pooled capacity admission", async () => {
+    const manager = capacityFixture({ busy: 1, demands: 1, limit: 1 });
+    manager.scheduler.config.readyContextOnly = true;
+    await assert.rejects(manager._getOrStartContextInit(1), /waiting for context capacity/);
+    assert.equal(manager._contextInitTasks.size, 0);
+    assert.equal(manager.contextCapacityReservations.size, 0);
+    assert.deepEqual(manager.creations, []);
+    assert.deepEqual(manager.closedIndices, []);
 });
