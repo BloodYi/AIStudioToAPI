@@ -95,9 +95,14 @@
                 >{{ l("已选", "Selected") }} {{ selected.length }}
                 {{ text("accountSelectedAcrossPages", "个（含其他页）", "(including other pages)") }}</span
             >
-            <ElButton size="small" @click="selectPage">{{
-                text("accountSelectPage", "全选本页", "Select this page")
-            }}</ElButton>
+            <ElButton
+                size="small"
+                :title="l('选择当前筛选结果中的全部账号（含其他页）', 'Select all matching accounts across pages')"
+                :loading="selectingAll"
+                :disabled="selectingAll"
+                @click="selectAll"
+                >{{ text("accountSelectAll", "全选", "Select all") }}</ElButton
+            >
             <ElButton size="small" @click="clearSelection">{{
                 text("accountClearSelection", "取消全选", "Clear selection")
             }}</ElButton>
@@ -148,114 +153,219 @@
         <p v-for="result in cancelResult?.results.filter(item => item.error) || []" :key="result.accountId">
             {{ result.accountId }}: {{ result.error }}
         </p>
-        <ElTable ref="accountTable" :data="accounts" row-key="accountId" @selection-change="selected = $event">
-            <ElTableColumn type="selection" width="45" reserve-selection />
-            <ElTableColumn :label="l('账号', 'Account')" min-width="210">
-                <template #default="{ row }">
+        <div class="account-mobile-list">
+            <label class="mobile-page-selection">
+                <ElCheckbox
+                    :model-value="pageSelected"
+                    :indeterminate="pagePartial"
+                    :disabled="!accounts.length"
+                    @change="togglePage"
+                    >{{ l("选择本页", "Select this page") }}</ElCheckbox
+                >
+            </label>
+            <article v-for="row in accounts" :key="row.accountId" class="account-mobile-card">
+                <div class="mobile-account-heading">
+                    <ElCheckbox
+                        :model-value="isSelected(row)"
+                        :aria-label="l('选择账号', 'Select account') + ' ' + (row.email || row.displayName)"
+                        @change="value => toggleAccount(row, value)"
+                    />
                     <span class="account-name"
                         >{{ row.authIndex === null ? "—" : `#${row.authIndex}` }}
                         {{ row.email || row.displayName }}</span
                     >
-                    <div class="account-badges">
-                        <ElTag
-                            v-if="
-                                schedulingMode === 'legacy' &&
-                                row.authIndex !== null &&
-                                row.authIndex === currentAuthIndex
-                            "
-                            size="small"
-                            >{{ l("当前", "Current") }}</ElTag
-                        >
-                        <ElTag v-if="row.isDuplicate" size="small" type="warning">{{ l("重复", "Duplicate") }}</ElTag>
-                        <ElTag v-if="row.disabled" size="small" type="danger">{{
-                            l("人工禁用", "Manually disabled")
-                        }}</ElTag>
-                    </div>
-                </template>
-            </ElTableColumn>
-            <ElTableColumn :label="l('会话 / 恢复', 'Session / recovery')" width="150">
-                <template #default="{ row }">
-                    <span :class="['state-text', 'state-' + row.sessionState]">{{ stateLabel(row.sessionState) }}</span
-                    ><br />
+                </div>
+                <div class="account-badges">
+                    <ElTag
+                        v-if="
+                            schedulingMode === 'legacy' && row.authIndex !== null && row.authIndex === currentAuthIndex
+                        "
+                        size="small"
+                        >{{ l("当前", "Current") }}</ElTag
+                    >
+                    <ElTag v-if="row.isDuplicate" size="small" type="warning">{{ l("重复", "Duplicate") }}</ElTag>
+                    <ElTag v-if="row.disabled" size="small" type="danger">{{
+                        l("人工禁用", "Manually disabled")
+                    }}</ElTag>
+                </div>
+                <p>
+                    {{ l("会话 / 恢复", "Session / recovery") }}：
+                    <span :class="['state-text', 'state-' + row.sessionState]">{{ stateLabel(row.sessionState) }}</span>
+                    /
                     <span :class="['state-text', 'state-' + row.recoveryState]">{{
                         stateLabel(row.recoveryState)
                     }}</span>
-                    <small v-if="row.loginStopping">{{
-                        text("accountLoginStopping", "执行器仍在停止", "Executors stopping")
-                    }}</small>
-                    <small v-if="row.lastFailure?.error" class="failure-reason">{{ row.lastFailure.error }}</small>
-                </template>
-            </ElTableColumn>
-            <ElTableColumn :label="l('凭据', 'Credentials')" width="95">
-                <template #default="{ row }"
-                    >{{ row.hasPassword ? "✓" : "—" }} Password<br />{{ row.hasTotpSecret ? "✓" : "—" }} TOTP<br />{{
-                        row.hasRecoveryEmail ? "✓" : "—"
-                    }}
-                    {{ l("恢复邮箱", "Recovery email") }}</template
-                >
-            </ElTableColumn>
-            <ElTableColumn :label="l('自动恢复', 'Auto recovery')" width="95">
-                <template #default="{ row }"
-                    ><ElSwitch
+                </p>
+                <small v-if="row.loginStopping">{{
+                    text("accountLoginStopping", "执行器仍在停止", "Executors stopping")
+                }}</small>
+                <small v-if="row.lastFailure?.error" class="failure-reason">{{ row.lastFailure.error }}</small>
+                <p class="mobile-credentials">
+                    <span>{{ row.hasPassword ? "✓" : "—" }} Password</span
+                    ><span>{{ row.hasTotpSecret ? "✓" : "—" }} TOTP</span
+                    ><span>{{ row.hasRecoveryEmail ? "✓" : "—" }} {{ l("恢复邮箱", "Recovery email") }}</span>
+                </p>
+                <label class="queue-toggle"
+                    >{{ l("自动恢复", "Auto recovery") }}
+                    <ElSwitch
                         :model-value="row.autoRecovery"
                         :disabled="busy"
                         @change="value => toggleRecovery(row, value)"
-                /></template>
-            </ElTableColumn>
-            <ElTableColumn :label="l('操作', 'Actions')" min-width="400">
-                <template #default="{ row }">
-                    <div class="row-actions">
-                        <ElButton size="small" @click="openEdit(row)">{{ l("编辑凭据", "Edit credentials") }}</ElButton>
-                        <ElButton size="small" @click="login(row)">{{ l("重新登录", "Log in") }}</ElButton>
-                        <ElButton
-                            v-if="schedulingMode === 'legacy' && row.authIndex !== null"
-                            size="small"
-                            :disabled="
-                                isBusy ||
-                                row.disabled ||
-                                row.sessionState !== 'valid' ||
-                                row.isDuplicate ||
-                                row.authIndex === currentAuthIndex
-                            "
-                            @click="legacyActions.switchAccount?.(row.authIndex)"
-                            >{{
-                                row.authIndex === currentAuthIndex
-                                    ? l("当前账号", "Current")
-                                    : accountDetails.find(item => item.index === row.authIndex)?.hasContext
-                                      ? l("快速切换", "Quick switch")
-                                      : l("切换", "Switch")
-                            }}</ElButton
+                /></label>
+                <div class="row-actions">
+                    <ElButton size="small" @click="openEdit(row)">{{ l("编辑凭据", "Edit credentials") }}</ElButton>
+                    <ElButton size="small" @click="login(row)">{{ l("重新登录", "Log in") }}</ElButton>
+                    <ElButton
+                        v-if="schedulingMode === 'legacy' && row.authIndex !== null"
+                        size="small"
+                        :disabled="
+                            isBusy ||
+                            row.disabled ||
+                            row.sessionState !== 'valid' ||
+                            row.isDuplicate ||
+                            row.authIndex === currentAuthIndex
+                        "
+                        @click="legacyActions.switchAccount?.(row.authIndex)"
+                        >{{
+                            row.authIndex === currentAuthIndex
+                                ? l("当前账号", "Current")
+                                : accountDetails.find(item => item.index === row.authIndex)?.hasContext
+                                  ? l("快速切换", "Quick switch")
+                                  : l("切换", "Switch")
+                        }}</ElButton
+                    >
+                    <ElButton v-if="row.authIndex !== null" size="small" @click="downloadCookie(row)">{{
+                        l("下载", "Download")
+                    }}</ElButton>
+                    <ElButton v-if="row.currentTaskId" size="small" @click="cancel(row.currentTaskId)">{{
+                        l("取消", "Cancel")
+                    }}</ElButton>
+                    <ElButton size="small" @click="viewHistory(row)">{{ l("任务 / 日志", "Tasks / logs") }}</ElButton>
+                    <ElButton size="small" type="danger" plain :disabled="isBusy || busy" @click="deleteRows([row])">{{
+                        l("删除", "Delete")
+                    }}</ElButton>
+                </div>
+            </article>
+            <p v-if="!accounts.length">{{ l("暂无账号", "No accounts") }}</p>
+        </div>
+        <div class="account-table-scroll">
+            <ElTable ref="accountTable" :data="accounts" row-key="accountId" @selection-change="updatePageSelection">
+                <ElTableColumn type="selection" width="45" reserve-selection />
+                <ElTableColumn :label="l('账号', 'Account')" min-width="210">
+                    <template #default="{ row }">
+                        <span class="account-name"
+                            >{{ row.authIndex === null ? "—" : `#${row.authIndex}` }}
+                            {{ row.email || row.displayName }}</span
                         >
-                        <ElButton v-if="row.authIndex !== null" size="small" @click="downloadCookie(row)">{{
-                            l("下载", "Download")
-                        }}</ElButton>
-                        <ElButton v-if="row.currentTaskId" size="small" @click="cancel(row.currentTaskId)">{{
-                            l("取消", "Cancel")
-                        }}</ElButton>
-                        <ElButton size="small" @click="viewHistory(row)">{{
-                            l("任务 / 日志", "Tasks / logs")
-                        }}</ElButton>
-                        <ElButton
-                            size="small"
-                            type="danger"
-                            plain
-                            :disabled="isBusy || busy"
-                            @click="deleteRows([row])"
-                            >{{ l("删除", "Delete") }}</ElButton
-                        >
-                    </div>
-                </template>
-            </ElTableColumn>
-        </ElTable>
+                        <div class="account-badges">
+                            <ElTag
+                                v-if="
+                                    schedulingMode === 'legacy' &&
+                                    row.authIndex !== null &&
+                                    row.authIndex === currentAuthIndex
+                                "
+                                size="small"
+                                >{{ l("当前", "Current") }}</ElTag
+                            >
+                            <ElTag v-if="row.isDuplicate" size="small" type="warning">{{
+                                l("重复", "Duplicate")
+                            }}</ElTag>
+                            <ElTag v-if="row.disabled" size="small" type="danger">{{
+                                l("人工禁用", "Manually disabled")
+                            }}</ElTag>
+                        </div>
+                    </template>
+                </ElTableColumn>
+                <ElTableColumn :label="l('会话 / 恢复', 'Session / recovery')" width="150">
+                    <template #default="{ row }">
+                        <span :class="['state-text', 'state-' + row.sessionState]">{{
+                            stateLabel(row.sessionState)
+                        }}</span
+                        ><br />
+                        <span :class="['state-text', 'state-' + row.recoveryState]">{{
+                            stateLabel(row.recoveryState)
+                        }}</span>
+                        <small v-if="row.loginStopping">{{
+                            text("accountLoginStopping", "执行器仍在停止", "Executors stopping")
+                        }}</small>
+                        <small v-if="row.lastFailure?.error" class="failure-reason">{{ row.lastFailure.error }}</small>
+                    </template>
+                </ElTableColumn>
+                <ElTableColumn :label="l('凭据', 'Credentials')" width="95">
+                    <template #default="{ row }"
+                        >{{ row.hasPassword ? "✓" : "—" }} Password<br />{{
+                            row.hasTotpSecret ? "✓" : "—"
+                        }}
+                        TOTP<br />{{ row.hasRecoveryEmail ? "✓" : "—" }} {{ l("恢复邮箱", "Recovery email") }}</template
+                    >
+                </ElTableColumn>
+                <ElTableColumn :label="l('自动恢复', 'Auto recovery')" width="95">
+                    <template #default="{ row }"
+                        ><ElSwitch
+                            :model-value="row.autoRecovery"
+                            :disabled="busy"
+                            @change="value => toggleRecovery(row, value)"
+                    /></template>
+                </ElTableColumn>
+                <ElTableColumn :label="l('操作', 'Actions')" min-width="400">
+                    <template #default="{ row }">
+                        <div class="row-actions">
+                            <ElButton size="small" @click="openEdit(row)">{{
+                                l("编辑凭据", "Edit credentials")
+                            }}</ElButton>
+                            <ElButton size="small" @click="login(row)">{{ l("重新登录", "Log in") }}</ElButton>
+                            <ElButton
+                                v-if="schedulingMode === 'legacy' && row.authIndex !== null"
+                                size="small"
+                                :disabled="
+                                    isBusy ||
+                                    row.disabled ||
+                                    row.sessionState !== 'valid' ||
+                                    row.isDuplicate ||
+                                    row.authIndex === currentAuthIndex
+                                "
+                                @click="legacyActions.switchAccount?.(row.authIndex)"
+                                >{{
+                                    row.authIndex === currentAuthIndex
+                                        ? l("当前账号", "Current")
+                                        : accountDetails.find(item => item.index === row.authIndex)?.hasContext
+                                          ? l("快速切换", "Quick switch")
+                                          : l("切换", "Switch")
+                                }}</ElButton
+                            >
+                            <ElButton v-if="row.authIndex !== null" size="small" @click="downloadCookie(row)">{{
+                                l("下载", "Download")
+                            }}</ElButton>
+                            <ElButton v-if="row.currentTaskId" size="small" @click="cancel(row.currentTaskId)">{{
+                                l("取消", "Cancel")
+                            }}</ElButton>
+                            <ElButton size="small" @click="viewHistory(row)">{{
+                                l("任务 / 日志", "Tasks / logs")
+                            }}</ElButton>
+                            <ElButton
+                                size="small"
+                                type="danger"
+                                plain
+                                :disabled="isBusy || busy"
+                                @click="deleteRows([row])"
+                                >{{ l("删除", "Delete") }}</ElButton
+                            >
+                        </div>
+                    </template>
+                </ElTableColumn>
+            </ElTable>
+        </div>
         <ElPagination
             v-model:current-page="page"
             v-model:page-size="pageSize"
             :page-sizes="[20, 50, 100]"
             :total="total"
-            layout="total, sizes, prev, pager, next"
+            :layout="mobile ? 'total, sizes, prev, next' : 'total, sizes, prev, pager, next'"
         />
         <ElDialog
             v-model="editVisible"
+            class="account-dialog"
+            :width="mobile ? 'calc(100vw - 24px)' : '50%'"
             :title="editing ? l('编辑凭据', 'Edit credentials') : l('新增账号', 'Add account')"
             @closed="clearForm"
         >
@@ -303,7 +413,25 @@
                 ><ElButton type="primary" :loading="busy" @click="save">{{ l("保存", "Save") }}</ElButton></template
             >
         </ElDialog>
-        <ElDialog v-model="importVisible" :title="l('导入预览', 'Import preview')" width="85%" @closed="clearImport">
+        <ElDialog
+            v-model="importVisible"
+            class="account-dialog account-import-dialog"
+            :title="l('导入预览', 'Import preview')"
+            :width="mobile ? 'calc(100vw - 24px)' : '85%'"
+            @closed="clearImport"
+        >
+            <div class="import-settings">
+                <ElCheckbox v-model="skipExisting" :disabled="importLocked">{{
+                    text("accountImportSkipExisting", "跳过已有账号", "Skip existing accounts")
+                }}</ElCheckbox>
+                <small>{{
+                    text(
+                        "accountImportSkipExistingHint",
+                        "仅导入新账号；已有账号不更新密码、验证器或恢复邮箱。",
+                        "Import new accounts only; preserve existing passwords, authenticators and recovery emails."
+                    )
+                }}</small>
+            </div>
             <ElSelect v-model="importKind" :disabled="importBusy"
                 ><ElOption
                     label="CSV: email,password,recovery_email,totp_secret (兼容 totpSecret)"
@@ -340,7 +468,7 @@
                     :model-value="skipState.checked"
                     :indeterminate="skipState.partial"
                     :disabled="importLocked || !actionableRows.length"
-                    @change="value => bulkChoice(actionableRows, 'skip', value)"
+                    @change="value => bulkChoice(unprotectedRows, 'skip', value)"
                     >{{ text("accountImportSkipAll", "全部跳过", "Skip all") }}</ElCheckbox
                 >
                 <ElCheckbox
@@ -351,7 +479,70 @@
                     >{{ text("accountImportOverwriteAll", "全部覆盖", "Overwrite all") }}</ElCheckbox
                 >
             </div>
-            <ElTable v-if="preview" :data="preview.rows">
+            <div v-if="preview" class="import-mobile-list">
+                <article v-for="row in preview.rows" :key="row.index" class="account-mobile-card">
+                    <strong class="account-name">{{ row.email || l("未命名导入项", "Unnamed import entry") }}</strong>
+                    <p v-if="row.error" class="state-failed">{{ row.error }}</p>
+                    <div class="import-mapping">
+                        <ElSelect
+                            v-if="importKind === 'authenticator'"
+                            v-model="choices[row.index].accountId"
+                            :disabled="importLocked || !!row.error || row.unchanged"
+                            clearable
+                            :placeholder="l('选择账号或跳过', 'Select account or skip')"
+                            ><ElOption
+                                v-for="account in mappingAccounts"
+                                :key="account.accountId"
+                                :value="account.accountId"
+                                :label="account.email || account.displayName"
+                        /></ElSelect>
+                        <span v-else-if="!row.accountId">{{
+                            text("accountImportNewRecord", "将创建新账号", "New account will be created")
+                        }}</span>
+                        <span v-else>{{ l("匹配已有账号", "Existing account matched") }}</span>
+                    </div>
+                    <div class="import-row-actions">
+                        <ElCheckbox
+                            v-model="choices[row.index].overwrite"
+                            :disabled="
+                                importLocked ||
+                                protectedRow(row) ||
+                                !choices[row.index].accountId ||
+                                !!row.error ||
+                                row.unchanged
+                            "
+                            >{{ l("覆盖", "Overwrite") }}</ElCheckbox
+                        >
+                        <ElCheckbox
+                            :model-value="effectiveSkip(row)"
+                            :disabled="importLocked || protectedRow(row) || !!row.error || row.unchanged"
+                            @change="value => (choices[row.index].skip = value)"
+                            >{{ l("跳过", "Skip") }}</ElCheckbox
+                        >
+                    </div>
+                    <div class="import-row-notes">
+                        <span v-if="protectedRow(row)">{{
+                            text("accountImportExistingSkipped", "已有账号，已跳过", "Existing account skipped")
+                        }}</span>
+                        <span v-if="row.hasRecoveryEmail">{{
+                            text(
+                                "accountImportRecoveryIncluded",
+                                "本次导入含恢复邮箱",
+                                "Import includes recovery email"
+                            )
+                        }}</span>
+                        <span v-if="row.conflict"
+                            >⚠
+                            {{
+                                row.recoveryEmailConflict
+                                    ? l("恢复邮箱冲突", "Recovery email conflict")
+                                    : l("凭据冲突", "Credential conflict")
+                            }}</span
+                        >
+                    </div>
+                </article>
+            </div>
+            <ElTable v-if="preview" class="import-preview-table" :data="preview.rows">
                 <ElTableColumn prop="email" label="Email" />
                 <ElTableColumn prop="error" :label="l('问题', 'Issue')" />
                 <ElTableColumn :label="l('映射 / 创建', 'Map / create')"
@@ -374,27 +565,49 @@
                         <span v-else>{{ l("匹配已有账号", "Existing account matched") }}</span>
                     </template></ElTableColumn
                 >
-                <ElTableColumn :label="l('显式覆盖 / 跳过', 'Overwrite / skip')"
-                    ><template #default="{ row }"
-                        ><ElCheckbox
-                            v-model="choices[row.index].overwrite"
-                            :disabled="importLocked || !choices[row.index].accountId || !!row.error || row.unchanged"
-                            >{{ l("覆盖", "Overwrite") }}</ElCheckbox
-                        ><ElCheckbox
-                            v-model="choices[row.index].skip"
-                            :disabled="importLocked || !!row.error || row.unchanged"
-                            >{{ l("跳过", "Skip") }}</ElCheckbox
-                        ><span v-if="row.hasRecoveryEmail">{{ l("恢复邮箱已配置", "Recovery email configured") }} </span
-                        ><span v-if="row.conflict"
-                            >⚠
-                            {{
-                                row.recoveryEmailConflict
-                                    ? l("恢复邮箱冲突", "Recovery email conflict")
-                                    : l("凭据冲突", "Credential conflict")
-                            }}</span
-                        ></template
-                    ></ElTableColumn
-                >
+                <ElTableColumn :label="l('显式覆盖 / 跳过', 'Overwrite / skip')" min-width="240">
+                    <template #default="{ row }">
+                        <div class="import-row-actions">
+                            <ElCheckbox
+                                v-model="choices[row.index].overwrite"
+                                :disabled="
+                                    importLocked ||
+                                    protectedRow(row) ||
+                                    !choices[row.index].accountId ||
+                                    !!row.error ||
+                                    row.unchanged
+                                "
+                                >{{ l("覆盖", "Overwrite") }}</ElCheckbox
+                            >
+                            <ElCheckbox
+                                :model-value="effectiveSkip(row)"
+                                :disabled="importLocked || protectedRow(row) || !!row.error || row.unchanged"
+                                @change="value => (choices[row.index].skip = value)"
+                                >{{ l("跳过", "Skip") }}</ElCheckbox
+                            >
+                        </div>
+                        <div class="import-row-notes">
+                            <span v-if="protectedRow(row)">{{
+                                text("accountImportExistingSkipped", "已有账号，已跳过", "Existing account skipped")
+                            }}</span>
+                            <span v-if="row.hasRecoveryEmail">{{
+                                text(
+                                    "accountImportRecoveryIncluded",
+                                    "本次导入含恢复邮箱",
+                                    "Import includes recovery email"
+                                )
+                            }}</span>
+                            <span v-if="row.conflict"
+                                >⚠
+                                {{
+                                    row.recoveryEmailConflict
+                                        ? l("恢复邮箱冲突", "Recovery email conflict")
+                                        : l("凭据冲突", "Credential conflict")
+                                }}</span
+                            >
+                        </div>
+                    </template>
+                </ElTableColumn>
             </ElTable>
             <div v-if="importResult" class="import-result">
                 <p>
@@ -437,7 +650,12 @@
                 ></template
             >
         </ElDialog>
-        <ElDialog v-model="historyVisible" :title="l('登录任务与尝试日志', 'Login tasks and attempts')" width="85%">
+        <ElDialog
+            v-model="historyVisible"
+            class="account-dialog"
+            :title="l('登录任务与尝试日志', 'Login tasks and attempts')"
+            :width="mobile ? 'calc(100vw - 24px)' : '85%'"
+        >
             <div v-for="task in tasks" :key="task.taskId">
                 <p>
                     {{ task.taskId }} · {{ stateLabel(task.status) }} · {{ task.phase }} · {{ task.attempts }}
@@ -471,13 +689,18 @@
                 @current-change="loadHistory"
             />
         </ElDialog>
-        <ElDialog v-model="imageVisible" :title="l('失败截图', 'Failure screenshot')" width="85%" @closed="releaseImage"
+        <ElDialog
+            v-model="imageVisible"
+            class="account-dialog"
+            :title="l('失败截图', 'Failure screenshot')"
+            :width="mobile ? 'calc(100vw - 24px)' : '85%'"
+            @closed="releaseImage"
             ><img v-if="imageUrl" :src="imageUrl" style="width: 100%"
         /></ElDialog>
     </section>
 </template>
 <script setup>
-import { computed, ref, reactive, watch, onMounted, onBeforeUnmount } from "vue";
+import { computed, nextTick, ref, reactive, watch, onMounted, onBeforeUnmount } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import I18n from "../utils/i18n";
@@ -490,6 +713,12 @@ defineProps({
     schedulingMode: { default: null, type: String },
 });
 const accountTable = ref(null);
+const mobile = ref(window.matchMedia("(max-width: 768px)").matches);
+const mobileQuery = window.matchMedia("(max-width: 768px)");
+const updateMobile = event => {
+    mobile.value = event.matches;
+};
+
 const l = (zh, en) => (I18n.getLang() === "zh" ? zh : en);
 const text = (key, zh, en) => I18n.t(key, { fallback: l(zh, en) });
 const labels = {
@@ -533,6 +762,7 @@ const editVisible = ref(false),
         totpSecret: "",
     });
 const importVisible = ref(false),
+    skipExisting = ref(true),
     importKind = ref("csv"),
     importBusy = ref(false),
     importContent = ref(""),
@@ -553,24 +783,83 @@ const loginSubmitting = ref(false),
     stoppingIds = ref([]);
 const suppressedLogins = new Set();
 const pendingLogins = new Map();
-function selectPage() {
-    for (const row of accounts.value) accountTable.value?.toggleRowSelection(row, true);
+const selectedIds = computed(() => new Set(selected.value.map(row => row.accountId)));
+const isSelected = row => selectedIds.value.has(row.accountId);
+const pageSelected = computed(() => !!accounts.value.length && accounts.value.every(isSelected));
+const pagePartial = computed(() => !pageSelected.value && accounts.value.some(isSelected));
+function toggleAccount(row, value) {
+    invalidateSelection();
+    selected.value = selected.value.filter(account => account.accountId !== row.accountId);
+    if (value) selected.value.push(row);
+    syncSelection();
+}
+function togglePage(value) {
+    invalidateSelection();
+    const visibleIds = new Set(accounts.value.map(row => row.accountId));
+    selected.value = selected.value.filter(row => !visibleIds.has(row.accountId));
+    if (value) selected.value.push(...accounts.value);
+    syncSelection();
+}
+const selectingAll = ref(false);
+let selectionSequence = 0;
+let syncingSelection = false;
+function updatePageSelection(rows) {
+    if (syncingSelection) return;
+    invalidateSelection();
+    const visibleIds = new Set(accounts.value.map(row => row.accountId));
+    const selectedIds = new Set(rows.map(row => row.accountId));
+    selected.value = [
+        ...selected.value.filter(row => !visibleIds.has(row.accountId)),
+        ...accounts.value.filter(row => selectedIds.has(row.accountId)),
+    ];
+}
+async function syncSelection() {
+    syncingSelection = true;
+    await nextTick();
+    const ids = new Set(selected.value.map(row => row.accountId));
+    accountTable.value?.clearSelection();
+    for (const row of accounts.value) accountTable.value?.toggleRowSelection(row, ids.has(row.accountId));
+    await nextTick();
+    syncingSelection = false;
+}
+async function selectAll() {
+    const sequence = ++selectionSequence;
+    const query = `search=${encodeURIComponent(search.value || "")}&state=${encodeURIComponent(filter.value || "")}`;
+    selectingAll.value = true;
+    try {
+        await action(async () => {
+            const result = await api(`/accounts/selection?${query}`);
+            if (disposed || sequence !== selectionSequence) return;
+            selected.value = [...new Map(result.accounts.map(row => [row.accountId, row])).values()];
+            await syncSelection();
+        });
+    } finally {
+        if (sequence === selectionSequence) selectingAll.value = false;
+    }
 }
 function removeSelection(rows) {
     const ids = new Set(rows.map(row => row.accountId));
-    for (const row of selected.value.filter(row => ids.has(row.accountId)))
-        accountTable.value?.toggleRowSelection(row, false);
     selected.value = selected.value.filter(row => !ids.has(row.accountId));
+    syncSelection();
+}
+function invalidateSelection() {
+    selectionSequence++;
+    selectingAll.value = false;
 }
 function clearSelection() {
-    accountTable.value?.clearSelection();
+    invalidateSelection();
     selected.value = [];
+    syncSelection();
 }
 const importLocked = computed(() => importBusy.value || !!importResult.value);
 const actionableRows = computed(() => (preview.value?.rows || []).filter(row => !row.error && !row.unchanged));
-const overwriteRows = computed(() => actionableRows.value.filter(row => choices.value[row.index]?.accountId));
+const protectedRow = row =>
+    skipExisting.value && (!!choices.value[row.index]?.accountId || !!row.accountId || row.matches > 0);
+const effectiveSkip = row => protectedRow(row) || !!choices.value[row.index]?.skip;
+const unprotectedRows = computed(() => actionableRows.value.filter(row => !protectedRow(row)));
+const overwriteRows = computed(() => unprotectedRows.value.filter(row => choices.value[row.index]?.accountId));
 function bulkState(rows, key) {
-    const count = rows.filter(row => choices.value[row.index]?.[key]).length;
+    const count = rows.filter(row => (key === "skip" ? effectiveSkip(row) : choices.value[row.index]?.[key])).length;
     return { checked: !!rows.length && count === rows.length, partial: count > 0 && count < rows.length };
 }
 const skipState = computed(() => bulkState(actionableRows.value, "skip"));
@@ -604,11 +893,13 @@ async function action(work) {
 async function refresh() {
     const sequence = ++refreshSequence;
     await action(async () => {
-        const [list, status] = await Promise.all([
+        const selectionVersion = selectionSequence;
+        const [list, status, selection] = await Promise.all([
             api(
                 `/accounts?page=${page.value}&pageSize=${pageSize.value}&search=${encodeURIComponent(search.value || "")}&state=${encodeURIComponent(filter.value || "")}`
             ),
             api("/login-queue"),
+            selected.value.length ? api("/accounts/selection") : null,
         ]);
         if (disposed || sequence !== refreshSequence) return;
         const lastPage = Math.max(1, Math.ceil(list.total / pageSize.value));
@@ -616,9 +907,16 @@ async function refresh() {
             page.value = lastPage;
             return;
         }
+        syncingSelection = true;
         accounts.value = list.accounts;
         const refreshed = new Map(list.accounts.map(account => [account.accountId, account]));
-        selected.value = selected.value.map(account => refreshed.get(account.accountId) || account);
+        if (selection && selectionVersion === selectionSequence) {
+            const existing = new Map(selection.accounts.map(account => [account.accountId, account]));
+            selected.value = selected.value
+                .filter(account => existing.has(account.accountId))
+                .map(account => existing.get(account.accountId));
+        } else selected.value = selected.value.map(account => refreshed.get(account.accountId) || account);
+        await syncSelection();
         total.value = list.total;
         stoppingIds.value = stoppingIds.value.filter(
             id =>
@@ -898,7 +1196,11 @@ async function commitImport() {
         await action(async () => {
             importResult.value = await api("/import/commit", "POST", {
                 previewId: preview.value.previewId,
-                rows: choices.value,
+                rows: choices.value.map(choice => ({
+                    ...choice,
+                    skip: effectiveSkip(preview.value.rows[choice.index]),
+                })),
+                skipExisting: skipExisting.value,
             });
             await refresh();
         });
@@ -907,6 +1209,7 @@ async function commitImport() {
     }
 }
 function clearImport() {
+    skipExisting.value = true;
     importContent.value = "";
     preview.value = null;
     choices.value = [];
@@ -948,6 +1251,7 @@ async function showArtifact(id) {
     });
 }
 onMounted(async () => {
+    mobileQuery.addEventListener("change", updateMobile);
     await refresh();
     timer = setInterval(async () => {
         if (polling) return;
@@ -962,7 +1266,9 @@ onMounted(async () => {
     }, 5000);
 });
 onBeforeUnmount(() => {
+    mobileQuery.removeEventListener("change", updateMobile);
     disposed = true;
+    selectionSequence++;
     clearInterval(timer);
     releaseImage();
     clearForm();
@@ -972,6 +1278,8 @@ onBeforeUnmount(() => {
 <style scoped>
 .accounts-panel {
     margin-bottom: 24px;
+    min-width: 0;
+    max-width: 100%;
 }
 .account-toolbar {
     display: flex;
@@ -1036,6 +1344,109 @@ onBeforeUnmount(() => {
     margin: 16px 0;
 }
 small {
+    overflow-wrap: anywhere;
     opacity: 0.7;
+}
+
+.account-table-scroll {
+    max-width: 100%;
+    overflow-x: auto;
+}
+.account-toolbar :deep(.el-button),
+.import-row-actions :deep(.el-checkbox) {
+    margin-left: 0;
+    margin-right: 0;
+}
+.import-settings,
+.import-row-notes {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 8px 0;
+    overflow-wrap: anywhere;
+}
+.import-row-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+}
+:global(.account-dialog) {
+    max-width: calc(100vw - 24px);
+}
+.account-mobile-list,
+.import-mobile-list {
+    display: none;
+}
+@media (max-width: 768px) {
+    .account-table-scroll,
+    .import-preview-table {
+        display: none;
+    }
+    .account-mobile-list,
+    .import-mobile-list {
+        display: grid;
+        gap: 12px;
+    }
+    .account-mobile-card {
+        background: var(--el-bg-color);
+        border: 1px solid var(--el-border-color-light);
+        border-radius: 8px;
+        padding: 12px;
+        min-width: 0;
+    }
+    .mobile-account-heading,
+    .mobile-credentials {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+    .mobile-account-heading {
+        flex-wrap: nowrap;
+    }
+    .mobile-account-heading .account-name {
+        min-width: 0;
+    }
+    .import-mapping {
+        margin: 8px 0;
+    }
+    .import-mobile-list {
+        margin-top: 12px;
+    }
+    .account-mobile-card .row-actions {
+        margin-top: 12px;
+    }
+
+    .account-toolbar > .el-input,
+    .account-toolbar > .el-select {
+        width: 100%;
+        max-width: none;
+    }
+    .batch-toolbar > span {
+        width: 100%;
+    }
+    .account-toolbar {
+        gap: 8px;
+    }
+    .queue-card :deep(.el-card__body) {
+        padding: 12px;
+    }
+    .accounts-panel > .el-pagination {
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 12px;
+    }
+    :global(.account-dialog) {
+        width: calc(100vw - 24px);
+        margin-top: 4vh;
+    }
+    :global(.account-dialog .el-dialog__body) {
+        max-height: 75vh;
+        overflow: auto;
+    }
+    :global(.account-dialog .el-select),
+    :global(.account-dialog input[type="file"]) {
+        max-width: 100%;
+    }
 }
 </style>

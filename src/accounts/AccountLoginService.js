@@ -207,14 +207,12 @@ class AccountLoginService {
     }
     selectedAccounts(input) {
         if (input?.all === true) return this.state.accounts.slice();
-        if (!Array.isArray(input?.accountIds) || !input.accountIds.length || input.accountIds.length > 1000)
-            throw error("Select 1–1000 accounts");
+        if (!Array.isArray(input?.accountIds) || !input.accountIds.length) throw error("Select at least one account");
         return [...new Set(input.accountIds)].map(id => this.account(id));
     }
     async setRecovery(input) {
         if (typeof input.autoRecovery !== "boolean") throw error("autoRecovery must be boolean");
-        if (!Array.isArray(input.accounts) || !input.accounts.length || input.accounts.length > 1000)
-            throw error("Select 1–1000 accounts");
+        if (!Array.isArray(input.accounts) || !input.accounts.length) throw error("Select at least one account");
         const accounts = input.accounts.map(entry => {
             const account = this.account(entry.accountId);
             if (account.credentialVersion !== entry.credentialVersion)
@@ -403,13 +401,8 @@ class AccountLoginService {
     }
     async batchCancelLogin(input) {
         const ids = input?.accountIds;
-        if (
-            !Array.isArray(ids) ||
-            !ids.length ||
-            ids.length > 1000 ||
-            ids.some(id => typeof id !== "string" || !id || id.length > 256)
-        )
-            throw error("Select 1–1000 account IDs");
+        if (!Array.isArray(ids) || !ids.length || ids.some(id => typeof id !== "string" || !id || id.length > 256))
+            throw error("Select at least one account ID");
         const result = { cancelled: 0, failed: 0, results: [], stopping: 0, unnecessary: 0 };
         for (const accountId of new Set(ids)) {
             try {
@@ -826,6 +819,8 @@ class AccountLoginService {
         };
     }
     async importCommit(sessionId, input) {
+        if (input.skipExisting !== undefined && typeof input.skipExisting !== "boolean")
+            throw error("skipExisting must be boolean");
         const preview = this.previews.get(input.previewId);
         if (!preview || preview.sessionId !== sessionId || preview.expiresAt < Date.now())
             throw error("Preview expired or unavailable", 409);
@@ -846,6 +841,17 @@ class AccountLoginService {
                 }
                 if (row.error) throw error(row.error);
                 const accountId = choice.accountId || row.accountId;
+                const matches =
+                    preview.kind === "csv"
+                        ? this.state.accounts.filter(account => account.email && account.email === row.email)
+                        : [];
+                if (input.skipExisting && (accountId || matches.length)) {
+                    result.skipped++;
+                    continue;
+                }
+                if (matches.length > 1)
+                    throw error("Multiple matching accounts; resolve duplicates and preview again", 409);
+
                 if (!accountId) {
                     if (preview.kind !== "csv" || !row.email) {
                         result.skipped++;

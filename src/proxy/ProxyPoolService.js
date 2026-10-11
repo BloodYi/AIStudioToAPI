@@ -39,7 +39,7 @@ class ProxyPoolService {
     status() {
         const data = this.store.snapshot();
         return {
-            bindingCount: Object.values(data.bindings).filter(item => item.desiredNodeId).length,
+            bindingCount: this.bindings.existingBindings(data).filter(item => item.desiredNodeId).length,
             enabled: data.settings.enabled,
             enabledNodeCount: data.nodes.filter(node => node.enabled !== false && node.status !== "missing").length,
             mihomo: this.manager.inspect(data.settings),
@@ -61,9 +61,10 @@ class ProxyPoolService {
     }
 
     nodes() {
-        const bindings = Object.values(this.store.data.bindings);
+        const snapshot = this.store.snapshot();
+        const bindings = this.bindings.existingBindings(snapshot);
         const contexts = [...this.browserManager.contexts.values()];
-        return this.store.snapshot().nodes.map(node => ({
+        return snapshot.nodes.map(node => ({
             ...this.sanitizeNode(node),
             ...(this.testResults.get(node.id) || {}),
             boundAccounts: bindings.filter(binding => binding.desiredNodeId === node.id).length,

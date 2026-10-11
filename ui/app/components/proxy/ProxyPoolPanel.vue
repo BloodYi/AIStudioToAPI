@@ -16,7 +16,7 @@
                 <span>节点池：{{ status.enabled ? "已启用" : "已停用" }}</span>
                 <span>二进制：{{ status.mihomo?.binaryFound ? "已找到" : "未找到" }}</span>
                 <span>版本：{{ status.mihomo?.version || "-" }}</span>
-                <span>节点 / 绑定：{{ status.nodeCount || 0 }} / {{ status.bindingCount || 0 }}</span>
+                <span>节点 / 当前账号绑定：{{ status.nodeCount || 0 }} / {{ status.bindingCount || 0 }}</span>
             </div>
             <el-alert v-if="status.mihomo?.lastError" :title="status.mihomo.lastError" type="error" :closable="false" />
             <div class="actions">

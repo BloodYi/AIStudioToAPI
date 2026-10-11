@@ -293,7 +293,10 @@ test(
                 result = { status: { accountDetails: [], currentAuthIndex: -1 } };
             else if (u.pathname.endsWith("/login-queue"))
                 result = { autoRecovery: false, concurrency: 1, executions: [] };
-            else if (u.pathname === "/api/account-management/accounts") {
+            else if (u.pathname === "/api/account-management/accounts/selection") {
+                const matches = accounts.filter(row => row.email.includes(u.searchParams.get("search") || ""));
+                result = { accounts: matches, total: matches.length };
+            } else if (u.pathname === "/api/account-management/accounts") {
                 queries.push(Object.fromEntries(u.searchParams));
                 const matches = accounts.filter(row => row.email.includes(u.searchParams.get("search") || ""));
                 const size = Number(u.searchParams.get("pageSize")),
@@ -342,9 +345,9 @@ test(
             () => document.querySelectorAll(".accounts-panel .el-table__body-wrapper tbody tr").length === 20
         );
         assert.equal(queries.at(-1).pageSize, "20");
-        await page.getByRole("button", { exact: true, name: "Select this page" }).click();
-        await page.getByRole("button", { exact: true, name: "Select this page" }).click();
-        assert.match(await page.locator(".batch-toolbar").innerText(), /Selected 20/);
+        await page.getByRole("button", { exact: true, name: "Select all" }).click();
+        await page.getByRole("button", { exact: true, name: "Select all" }).click();
+        assert.match(await page.locator(".batch-toolbar").innerText(), /Selected 55/);
         const pagination = page.locator(".accounts-panel > .el-pagination");
         await pagination.getByLabel("Go to next page").click();
         await page.waitForFunction(() =>
@@ -353,12 +356,12 @@ test(
                 ?.textContent.includes("user20@example.com")
         );
         await rows.first().locator(".el-checkbox").click();
-        assert.match(await page.locator(".batch-toolbar").innerText(), /Selected 21/);
+        assert.match(await page.locator(".batch-toolbar").innerText(), /Selected 54/);
         await page.getByRole("button", { exact: true, name: "Cancel selected logins" }).click();
         await page.waitForFunction(() =>
-            document.querySelector(".cancel-result")?.textContent.includes("Cancelled 21")
+            document.querySelector(".cancel-result")?.textContent.includes("Cancelled 54")
         );
-        assert.equal(cancelIds[0].length, 21);
+        assert.equal(cancelIds[0].length, 54);
         await page.getByRole("button", { exact: true, name: "Clear selection" }).click();
         assert.match(await page.locator(".batch-toolbar").innerText(), /Selected 0/);
         await rows.first().locator(".el-checkbox").click();
@@ -384,7 +387,7 @@ test(
             () => document.querySelectorAll(".accounts-panel .el-table__body-wrapper tbody tr").length === 55
         );
         assert.equal(queries.at(-1).pageSize, "100");
-        await page.getByRole("button", { exact: true, name: "Select this page" }).click();
+        await page.getByRole("button", { exact: true, name: "Select all" }).click();
         await page.getByRole("button", { exact: true, name: "Log in selected" }).click();
         await page
             .waitForRequest(request => request.url().endsWith("/batch/cancel-login"), { timeout: 100 })
@@ -402,8 +405,13 @@ test(
         await page.getByRole("button", { exact: true, name: "Import credentials / authenticator" }).click();
         const dialog = page.getByRole("dialog", { exact: true, name: "Import preview" });
         await dialog.getByRole("button", { exact: true, name: "Preview" }).click();
-        await dialog.getByText("New account will be created", { exact: true }).first().waitFor();
+        await dialog
+            .locator(".import-preview-table")
+            .getByText("New account will be created", { exact: true })
+            .first()
+            .waitFor();
         assert.equal(await dialog.getByText("Create record without login", { exact: true }).count(), 0);
+        await dialog.getByText("Skip existing accounts", { exact: true }).click();
         await dialog.getByText("Skip all", { exact: true }).click();
         await dialog.getByText("Skip all", { exact: true }).click();
         const previewRows = dialog.locator(".el-table__body-wrapper tbody tr");
@@ -622,6 +630,222 @@ test(
         assert.ok(writes.some(write => write.method === "PUT" && write.path.endsWith("/nodes/node")));
         assert.ok(writes.some(write => write.path.endsWith("/subscriptions/sub/refresh")));
         assert.ok(writes.some(write => write.path.endsWith("/bindings/account/apply")));
+        assert.deepEqual(errors, []);
+    }
+);
+
+test(
+    "filtered all-selection exports every matching page, survives layouts, and protects existing imports",
+    { skip: !fs.existsSync(chromium.executablePath()) },
+    async t => {
+        const { page, url } = await browserFixture(t);
+        const accounts = Array.from({ length: 250 }, (_, index) => ({
+            accountId: `matching-${index}`,
+            authIndex: index,
+            autoRecovery: false,
+            credentialVersion: 1,
+            email: `selection${index}@example.com`,
+            hasPassword: true,
+            hasRecoveryEmail: true,
+            hasTotpSecret: true,
+            recoveryState: "idle",
+            sessionState: index % 2 ? "expired" : "valid",
+        }));
+        const downloads = [],
+            imports = [],
+            errors = [];
+        await page.addInitScript(() => {
+            window.__selectionTestIntervals = [];
+            const schedule = window.setInterval;
+            window.setInterval = (...args) => {
+                const id = schedule(...args);
+                window.__selectionTestIntervals.push(id);
+                return id;
+            };
+        });
+        let releaseSelection;
+        let delaySelection = false;
+        let failSelection = false;
+        page.on("pageerror", cause => errors.push(cause.message));
+        await page.route("**/api/**", async route => {
+            const request = route.request();
+            const u = new URL(request.url());
+            const search = u.searchParams.get("search") || "";
+            const state = u.searchParams.get("state") || "";
+            const matches = accounts.filter(
+                row => row.email.includes(search) && (!state || row.sessionState === state)
+            );
+            let result = {};
+            if (u.pathname === "/api/status" || u.pathname === "/api/status/core")
+                result = { status: { accountDetails: [], currentAuthIndex: -1 } };
+            else if (u.pathname.endsWith("/login-queue"))
+                result = {
+                    autoRecovery: false,
+                    concurrency: 1,
+                    executions: [],
+                    source: "long-queue-source-".repeat(20),
+                };
+            else if (u.pathname.endsWith("/accounts/selection")) {
+                if (delaySelection)
+                    await new Promise(resolve => {
+                        releaseSelection = resolve;
+                    });
+                if (failSelection)
+                    return route.fulfill({ json: { error: "Selection temporarily unavailable" }, status: 503 });
+                result = { accounts: matches, total: matches.length };
+            } else if (u.pathname === "/api/account-management/accounts") {
+                const cursor = Number(u.searchParams.get("page"));
+                const size = Number(u.searchParams.get("pageSize"));
+                result = { accounts: matches.slice((cursor - 1) * size, cursor * size), total: matches.length };
+            } else if (u.pathname.endsWith("/export/bundle")) {
+                downloads.push(request.postDataJSON().accountIds);
+                return route.fulfill({ body: Buffer.from("synthetic-download"), contentType: "application/zip" });
+            } else if (u.pathname.endsWith("/credentials")) result = { credentialVersion: 1 };
+            else if (u.pathname.endsWith("/import/preview"))
+                result = {
+                    complete: true,
+                    previewId: "protected-preview",
+                    rows: [
+                        { accountId: null, email: "new@example.com", index: 0 },
+                        {
+                            accountId: "matching-0",
+                            conflict: true,
+                            email: "selection0@example.com",
+                            hasRecoveryEmail: true,
+                            index: 1,
+                        },
+                    ],
+                };
+            else if (u.pathname.endsWith("/import/commit")) {
+                imports.push(request.postDataJSON());
+                result = { created: 1, failed: 0, skipped: 1, updated: 0 };
+            }
+            await route.fulfill({ json: result });
+        });
+        await page.goto(`${url}/accounts`);
+        const toolbar = page.locator(".batch-toolbar");
+        const selectAll = page.getByRole("button", { exact: true, name: "Select all" });
+        const waitSelected = count =>
+            page.waitForFunction(
+                expected => document.querySelector(".batch-toolbar")?.textContent.includes(`Selected ${expected} `),
+                count
+            );
+        await selectAll.click();
+        await waitSelected(250);
+        await page.evaluate(() => {
+            for (const id of window.__selectionTestIntervals) clearInterval(id);
+        });
+        await Promise.all([
+            page.waitForResponse(response => response.url().endsWith("/export/bundle")),
+            page.getByRole("button", { exact: true, name: "Download selected" }).click(),
+        ]);
+        assert.equal(downloads[0].length, 250);
+        assert.equal(new Set(downloads[0]).size, 250);
+        const headerCheckbox = page.locator(".account-table-scroll .el-table__header-wrapper .el-checkbox");
+        await headerCheckbox.click();
+        await waitSelected(230);
+        await page.locator(".accounts-panel > .el-pagination").getByLabel("Go to next page").click();
+        await page.waitForFunction(() =>
+            document.querySelector(".account-table-scroll tbody")?.textContent.includes("selection20@example.com")
+        );
+        assert.equal(
+            await page.locator(".account-table-scroll tbody tr").first().getByRole("checkbox").isChecked(),
+            true
+        );
+        const searchInput = page.getByPlaceholder("Search email / account index");
+        await searchInput.fill("selection1");
+        await waitSelected(0);
+        await selectAll.click();
+        await waitSelected(111);
+        const filter = page.locator(".accounts-panel > .account-toolbar .el-select");
+        await filter.click();
+        await page.getByRole("option", { exact: true, name: "Valid" }).click();
+        await waitSelected(0);
+        await selectAll.click();
+        const expected = accounts.filter(row => row.email.includes("selection1") && row.sessionState === "valid");
+        await waitSelected(expected.length);
+        await Promise.all([
+            page.waitForResponse(response => response.url().endsWith("/export/bundle")),
+            page.getByRole("button", { exact: true, name: "Download selected" }).click(),
+        ]);
+        assert.deepEqual(
+            downloads[1],
+            expected.map(row => row.accountId)
+        );
+        failSelection = true;
+        await selectAll.click();
+        await page.getByText("Selection temporarily unavailable", { exact: true }).waitFor();
+        assert.match(await toolbar.innerText(), new RegExp(`Selected ${expected.length}`));
+        failSelection = false;
+        delaySelection = true;
+        await Promise.all([
+            page.waitForRequest(request => request.url().includes("/accounts/selection")),
+            selectAll.click(),
+        ]);
+        await page.getByRole("button", { exact: true, name: "Clear selection" }).click();
+        releaseSelection();
+        delaySelection = false;
+        await selectAll.waitFor({ state: "visible" });
+        await waitSelected(0);
+        // Clear filters and select again before exercising the mobile views.
+        await searchInput.fill("");
+        await filter.hover();
+        await filter.locator(".el-select__clear").click();
+        await selectAll.click();
+        await waitSelected(250);
+        for (const width of [320, 375, 390, 430, 768, 1280]) {
+            await page.setViewportSize({ height: 850, width });
+            await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+            assert.equal(
+                await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1),
+                true,
+                `page overflow at ${width}`
+            );
+            assert.match(await toolbar.innerText(), /Selected 250/);
+            if (width <= 768) {
+                const card = page.locator(".account-mobile-card").first();
+                await card.waitFor({ state: "visible" });
+                for (const name of ["Edit credentials", "Log in", "Download", "Tasks / logs", "Delete"])
+                    assert.equal(await card.getByRole("button", { exact: true, name }).isVisible(), true);
+                assert.equal(await card.getByRole("checkbox").first().isChecked(), true);
+            }
+        }
+        await page.setViewportSize({ height: 850, width: 390 });
+        const card = page.locator(".account-mobile-card").first();
+        await card.locator(".el-checkbox").first().click();
+        await waitSelected(249);
+        await card.getByRole("button", { exact: true, name: "Edit credentials" }).click();
+        const edit = page.getByRole("dialog", { exact: true, name: "Edit credentials" });
+        await edit.waitFor();
+        const editBox = await edit.boundingBox();
+        assert.ok(editBox.x >= 0 && editBox.x + editBox.width <= 390);
+        await edit.locator(".el-dialog__headerbtn").click();
+        await page.getByRole("button", { exact: true, name: "Import credentials / authenticator" }).click();
+        const dialog = page.getByRole("dialog", { exact: true, name: "Import preview" });
+        const protection = dialog.getByRole("checkbox", { exact: true, name: "Skip existing accounts" });
+        assert.equal(await protection.isChecked(), true);
+        await dialog.getByRole("button", { exact: true, name: "Preview" }).click();
+        const existingRow = dialog.locator(".import-mobile-list .account-mobile-card").nth(1);
+        await existingRow.getByText("Existing account skipped", { exact: true }).waitFor();
+        assert.equal(await existingRow.getByRole("checkbox", { exact: true, name: "Skip" }).isChecked(), true);
+        assert.equal(await existingRow.getByRole("checkbox", { exact: true, name: "Overwrite" }).isDisabled(), true);
+        assert.equal(await dialog.getByRole("checkbox", { exact: true, name: "Overwrite all" }).isDisabled(), true);
+        await dialog.getByText("Skip existing accounts", { exact: true }).click();
+        assert.equal(await existingRow.getByRole("checkbox", { exact: true, name: "Skip" }).isChecked(), false);
+        await existingRow.getByText("Overwrite", { exact: true }).click();
+        await dialog.getByText("Skip existing accounts", { exact: true }).click();
+        await existingRow.getByText("Import includes recovery email", { exact: true }).waitFor();
+        const notesBox = await existingRow.locator(".import-row-notes").boundingBox();
+        const actionsBox = await existingRow.locator(".import-row-actions").boundingBox();
+        assert.ok(notesBox.y >= actionsBox.y + actionsBox.height);
+        await page.screenshot({ path: "/tmp/accounts-mobile-import-preview.png" });
+        await dialog.getByRole("button", { exact: true, name: "Commit import" }).click();
+        await dialog.locator(".import-result").waitFor();
+        assert.equal(imports[0].skipExisting, true);
+        assert.deepEqual(
+            imports[0].rows.map(row => row.skip),
+            [false, true]
+        );
         assert.deepEqual(errors, []);
     }
 );

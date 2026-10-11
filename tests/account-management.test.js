@@ -1167,3 +1167,127 @@ test("running cancellation reports stopping, blocks a second executor and reject
     await service.exclusive(() => service.login(account.accountId));
     assert.equal(account.recoveryState, "queued");
 });
+
+test("import protection skips changed, mapped and newly appeared accounts without credential mutation", async t => {
+    const { service } = await fixture(t);
+    const existing = (
+        await service.create({
+            email: "protected@example.com",
+            password: "old-password",
+            recoveryEmail: "old@example.com",
+            totpSecret: secret,
+        })
+    ).account;
+    const original = service.credentials(existing.accountId);
+    const preview = service.preview(
+        "session",
+        "csv",
+        "email,password,recovery_email\nprotected@example.com,new-password,new@example.com\nnew@example.com,new-password,\nlate@example.com,new-password,"
+    );
+    const late = (await service.create({ email: "late@example.com", password: "keep-password" })).account;
+    await assert.rejects(
+        service.importCommit("session", { previewId: preview.previewId, rows: [], skipExisting: "true" }),
+        /skipExisting must be boolean/
+    );
+    const result = await service.importCommit("session", {
+        previewId: preview.previewId,
+        rows: preview.rows.map(row => ({ index: row.index, overwrite: true })),
+        skipExisting: true,
+    });
+    assert.equal(result.created, 1);
+    assert.equal(result.skipped, 2);
+    assert.equal(result.updated, 0);
+    assert.equal(result.failed, 0);
+    assert.deepEqual(service.credentials(existing.accountId), original);
+    assert.equal(service.credentials(late.accountId).password, "keep-password");
+    const mapped = service.preview(
+        "session",
+        "authenticator",
+        "otpauth://totp/unknown@example.com?secret=JBSWY3DPEHPK3PXP&issuer=Test"
+    );
+    const mappedResult = await service.importCommit("session", {
+        previewId: mapped.previewId,
+        rows: [{ accountId: existing.accountId, index: 0, overwrite: true }],
+        skipExisting: true,
+    });
+    assert.equal(mappedResult.skipped, 1);
+    assert.deepEqual(service.credentials(existing.accountId), original);
+    const update = service.preview("session", "csv", "email,password\nprotected@example.com,new-password");
+    assert.equal(
+        (
+            await service.importCommit("session", {
+                previewId: update.previewId,
+                rows: [{ index: 0, overwrite: true }],
+                skipExisting: false,
+            })
+        ).updated,
+        1
+    );
+});
+
+test("ambiguous CSV matches are skipped under protection and rejected without it", async t => {
+    const { service } = await fixture(t);
+    service.state.accounts.push(service.newAccount({ email: "duplicate@example.com", password: "keep-one" }));
+    service.state.accounts.push(service.newAccount({ email: "duplicate@example.com", password: "keep-two" }));
+    for (const skipExisting of [true, false]) {
+        const preview = service.preview("session", "csv", "email,password\nduplicate@example.com,replace-password");
+        assert.equal(preview.rows[0].matches, 2);
+        const result = await service.importCommit("session", {
+            previewId: preview.previewId,
+            rows: [{ index: 0, overwrite: true }],
+            skipExisting,
+        });
+        assert.equal(result.created, 0);
+        assert.equal(result.updated, 0);
+        assert.equal(skipExisting ? result.skipped : result.failed, 1);
+        assert.deepEqual(
+            service.state.accounts.map(account => account.password),
+            ["keep-one", "keep-two"]
+        );
+    }
+});
+
+test("selection endpoint uses the list filters across every page and only returns safe summaries", async t => {
+    const { service, system } = await fixture(t);
+    service.state.accounts = Array.from({ length: 250 }, (_, index) =>
+        service.newAccount({ email: `selection${index}@example.com`, password: "private-password" })
+    );
+    const handlers = new Map();
+    const app = { use() {} };
+    for (const method of ["get", "post", "patch", "delete"])
+        app[method] = (endpoint, ...middleware) => handlers.set(`${method} ${endpoint}`, middleware.at(-1));
+    system.accountLoginService = service;
+    new AccountRoutes(system).setupRoutes(app, () => {});
+    const read = async (endpoint, query) => {
+        let result;
+        const res = {
+            json: value => {
+                result = value;
+            },
+            status() {
+                return this;
+            },
+        };
+        await handlers.get(`get /api/account-management/${endpoint}`)({ query }, res);
+        return result;
+    };
+    const all = await read("accounts/selection", {});
+    assert.equal(all.accounts.length, 250);
+    assert.equal(JSON.stringify(all).includes("private-password"), false);
+    for (const query of [
+        { search: "selection1" },
+        { state: "not_logged_in" },
+        { search: "selection1", state: "not_logged_in" },
+        { state: "valid" },
+    ]) {
+        const selection = await read("accounts/selection", query);
+        const list = await read("accounts", { ...query, pageSize: 100 });
+        assert.equal(selection.total, list.total);
+        assert.deepEqual(selection.accounts.slice(0, 100), list.accounts);
+    }
+    const large = Array.from({ length: 1001 }, (_, index) =>
+        service.newAccount({ email: `large${index}@example.com`, password: "synthetic" })
+    );
+    service.state.accounts.push(...large);
+    assert.equal(service.selectedAccounts({ accountIds: large.map(account => account.accountId) }).length, 1001);
+});

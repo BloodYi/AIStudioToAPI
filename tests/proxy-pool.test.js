@@ -151,6 +151,34 @@ async function main() {
         testResults: new Map(),
     });
     await assert.rejects(() => serviceMethods.deleteNodes(["node-direct"]), /Cannot delete in-use nodes/);
+    serviceMethods.bindings = bindingService;
+    serviceMethods.manager.inspect = () => ({ ready: true });
+    const historical = store.snapshot();
+    historical.bindings["deleted@example.com"] = { desiredNodeId: "node-direct" };
+    historical.bindings["offline@example.com"] = { desiredNodeId: "node-one" };
+    await store.replace(historical);
+    authSource.accountLoginService = {
+        state: { accounts: [{ accountId: "offline", authIndex: null, email: "OFFLINE@example.com" }] },
+    };
+    assert.strictEqual(serviceMethods.status().bindingCount, 2);
+    assert.strictEqual(serviceMethods.nodes().find(node => node.id === "node-direct").boundAccounts, 1);
+    authSource.availableIndices = [];
+    assert.strictEqual(serviceMethods.status().bindingCount, 1);
+    assert.strictEqual(serviceMethods.nodes().find(node => node.id === "node-direct").boundAccounts, 0);
+    assert.ok(store.snapshot().bindings["user@example.com"]);
+    const reloadedStore = new ProxyPoolStore(logger, filePath);
+    const reloadedBindings = new ProxyBindingService(reloadedStore, manager, browserManager, authSource);
+    assert.ok(reloadedStore.snapshot().bindings["user@example.com"]);
+    assert.strictEqual(reloadedBindings.existingBindings().filter(binding => binding.desiredNodeId).length, 1);
+
+    authSource.availableIndices = [0];
+    authSource.accountLoginService.state.accounts.push({
+        accountId: "duplicate",
+        authIndex: null,
+        email: "USER@example.com",
+    });
+    assert.strictEqual(serviceMethods.status().bindingCount, 2);
+    assert.strictEqual(serviceMethods.nodes().find(node => node.id === "node-direct").boundAccounts, 1);
 
     const subscriptionData = store.snapshot();
     subscriptionData.bindings = {};

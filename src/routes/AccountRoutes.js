@@ -24,10 +24,10 @@ class AccountRoutes {
                     });
                 }
             });
-        route("get", "/accounts", (service, req) => {
+        const matchingAccounts = (service, req) => {
             const search = String(req.query.search || "").toLowerCase(),
                 filter = req.query.state;
-            const accounts = service
+            return service
                 .list()
                 .filter(
                     account =>
@@ -42,6 +42,13 @@ class AccountRoutes {
                                   ? account.sessionState === "missing" && !!account.email && account.hasPassword
                                   : account.sessionState === filter || account.recoveryState === filter))
                 );
+        };
+        route("get", "/accounts/selection", (service, req) => {
+            const accounts = matchingAccounts(service, req);
+            return { accounts, total: accounts.length };
+        });
+        route("get", "/accounts", (service, req) => {
+            const accounts = matchingAccounts(service, req);
             const page = Math.max(1, Number(req.query.page) || 1),
                 size = Math.min(100, Math.max(1, Number(req.query.pageSize) || 25));
             return { accounts: accounts.slice((page - 1) * size, page * size), total: accounts.length };

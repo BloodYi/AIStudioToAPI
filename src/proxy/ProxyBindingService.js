@@ -76,8 +76,7 @@ class ProxyBindingService {
         return { appliedNodeId: null, display: "direct", proxy: null, source: "direct" };
     }
 
-    list() {
-        const snapshot = this.store.snapshot();
+    currentAccounts() {
         const accounts = this.authSource.availableIndices.map(authIndex => ({
             accountKey: this.accountKey(authIndex),
             accountName: this.authSource.accountNameMap.get(authIndex) || `auth-${authIndex}`,
@@ -91,6 +90,22 @@ class ProxyBindingService {
                 authIndex: null,
             });
         }
+        const uniqueAccounts = new Map();
+        for (const account of accounts) {
+            if (!uniqueAccounts.has(account.accountKey)) uniqueAccounts.set(account.accountKey, account);
+        }
+        return [...uniqueAccounts.values()];
+    }
+
+    existingBindings(snapshot = this.store.snapshot()) {
+        return this.currentAccounts()
+            .map(({ accountKey }) => snapshot.bindings[accountKey])
+            .filter(Boolean);
+    }
+
+    list() {
+        const snapshot = this.store.snapshot();
+        const accounts = this.currentAccounts();
         return accounts.map(({ accountKey, accountName, authIndex }) => {
             const desiredNodeId = snapshot.bindings[accountKey]?.desiredNodeId || null;
             const data = this.browserManager.contexts.get(authIndex);
