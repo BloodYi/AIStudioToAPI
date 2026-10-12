@@ -607,8 +607,10 @@ test("early sends one empty start before readiness/upstream completion in legacy
             assert.equal(fixture.sent[0].request.streaming_mode, "fake");
             assert.equal(fixture.sent[0].request.path, "/v1beta/models/flash:generateContent");
             // Headers alone do not stop waiting heartbeats or count as model output.
-            if (!legacy) await waitFor(() => res.body.includes(": keep-alive"));
-            assert.equal(completionChunks(res).length, 1);
+            assert.equal(completionChunks(res).length, 2);
+            assert.deepEqual(completionChunks(res)[1].choices, [
+                { delta: { content: "" }, finish_reason: null, index: 0 },
+            ]);
             deliver(fixture, fixture.sent[0], success.slice(1));
             await running;
             const chunks = completionChunks(res);
@@ -632,6 +634,7 @@ test("early sends one empty start before readiness/upstream completion in legacy
 });
 
 test("early start precedes account queue and uses one heartbeat timer that stops on disconnect", async t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     const fixture = setup(() => success, {
         scheduler: { globalConcurrency: 1, streamEarlyHeaders: false, streamKeepaliveIntervalMs: 5 },
         streamingMode: "early",
@@ -640,8 +643,11 @@ test("early start precedes account queue and uses one heartbeat timer that stops
     const blocker = await fixture.scheduler.acquire("flash");
     const res = new Response();
     const running = fixture.handler.processOpenAIRequest(request("flash", true), res);
-    await waitFor(() => res.body.includes(": keep-alive"));
-    assert.equal(completionChunks(res).length, 1);
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(fixture.scheduler.pending.length, 1);
+    assert.equal(completionChunks(res).length, 2);
+    t.mock.timers.tick(1000);
+    assert.equal(completionChunks(res).length, 3);
     assert.equal(fixture.sent.length, 0);
     assert.equal(res.__modelOutputStarted, false);
     assert.equal(fixture.scheduler.pending.length, 1);
@@ -650,7 +656,7 @@ test("early start precedes account queue and uses one heartbeat timer that stops
     await running;
     assert.equal(fixture.scheduler.pending.length, 0);
     const body = res.body;
-    await new Promise(resolve => setTimeout(resolve, 15));
+    t.mock.timers.tick(5000);
     assert.equal(res.body, body);
     fixture.scheduler.release(blocker);
 });
@@ -668,7 +674,7 @@ test("early retries quota after start and preserves stream identity without dupl
         [0, 1]
     );
     const chunks = completionChunks(res);
-    assert.equal(chunks.filter(chunk => chunk.choices?.[0]?.delta?.content === "").length, 1);
+    assert.equal(chunks.filter(chunk => chunk.choices?.[0]?.delta?.content === "").length, 2);
     assert.equal(chunks.filter(chunk => chunk.choices?.[0]?.delta?.content === "hello").length, 1);
     assert.ok(chunks.every(chunk => chunk.id === chunks[0].id));
     assert.equal(chunks.at(-1).usage, undefined);
@@ -676,9 +682,11 @@ test("early retries quota after start and preserves stream identity without dupl
 });
 
 test("early resets buffered body when transport retry moves to another account", async t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     const fixture = setup(
         index => (index === 0 ? [success[0], { data: '{"partial":', event_type: "chunk" }] : success),
         {
+            fakeStreamTimeoutMs: 180000,
             scheduler: { streamEarlyHeaders: false },
             streamingMode: "early",
         }
@@ -686,8 +694,11 @@ test("early resets buffered body when transport retry moves to another account",
     t.after(() => fixture.scheduler.close());
     const res = new Response();
     const running = fixture.handler.processOpenAIRequest(request("flash", true), res);
-    await waitFor(() => fixture.sent.length === 1);
-    await new Promise(resolve => setImmediate(resolve));
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(fixture.sent.length, 1);
+    t.mock.timers.tick(1000);
+    assert.equal(res.__modelOutputStarted, false);
+    assert.equal(fixture.scheduler.metrics.samples.model_first_output_ms.length, 0);
     fixture.registry.closeMessageQueuesForEpoch(0, 1, "connection_lost");
     await running;
     assert.deepEqual(
@@ -695,7 +706,7 @@ test("early resets buffered body when transport retry moves to another account",
         [0, 1]
     );
     assert.match(res.body, /hello/);
-    assert.equal(completionChunks(res).filter(chunk => chunk.choices?.[0]?.delta?.content === "").length, 1);
+    assert.equal(completionChunks(res).filter(chunk => chunk.choices?.[0]?.delta?.content === "").length, 3);
     assert.equal(fixture.registry.messageQueues.size, 0);
 });
 
@@ -797,24 +808,59 @@ test("legacy cancellation stops readiness wait and never forwards upstream", asy
 });
 
 test("early has exactly one heartbeat source throughout buffered waiting and none after finish", async t => {
-    t.mock.method(Math, "random", () => 0.5);
     t.mock.timers.enable({ apis: ["setTimeout"] });
     for (const legacy of [true, false]) {
         const fixture = setup(() => [success[0]], {
-            fakeStreamTimeoutMs: 100000,
+            fakeStreamTimeoutMs: 180000,
             scheduler: { streamEarlyHeaders: true, streamKeepaliveIntervalMs: 15000 },
             streamingMode: "early",
         });
         if (legacy) useLegacy(fixture);
         const res = new Response();
+        const forwarded = [];
+        let buffered;
+        const write = res.write.bind(res);
+        res.write = value => {
+            for (const event of String(value).split("\n\n").filter(Boolean)) {
+                if (buffered !== undefined) forwarded.push(buffered);
+                buffered = event;
+            }
+            return write(value);
+        };
         const running = fixture.handler.processOpenAIRequest(request("flash", true), res);
         for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
         assert.equal(fixture.sent.length, 1);
         assert.equal(res.body.includes(": accepted"), false);
-        t.mock.timers.tick(15000);
-        assert.equal(res.body.split(": keep-alive").length - 1, 1);
-        t.mock.timers.tick(15000);
-        assert.equal(res.body.split(": keep-alive").length - 1, 2);
+        const start = completionChunks(res)[0];
+        assert.equal(completionChunks(res).length, 2);
+        assert.equal(forwarded.length, 1);
+        assert.deepEqual(JSON.parse(forwarded[0].slice(6)), start);
+        assert.equal(res.__keepaliveSent, true);
+        t.mock.timers.tick(999);
+        assert.equal(completionChunks(res).length, 2);
+        t.mock.timers.tick(1);
+        assert.equal(completionChunks(res).length, 3);
+        // Hold the isolated upstream for two minutes of simulated time.
+        for (let second = 1; second < 120; second++) {
+            t.mock.timers.tick(1000);
+            assert.equal(completionChunks(res).length, second + 3);
+        }
+        const emptyChunks = completionChunks(res);
+        assert.equal(emptyChunks.length, 122);
+        assert.equal(forwarded.length, 121);
+        assert.equal(res.__modelOutputStarted, false);
+        assert.equal(res.__modelFirstOutputAt, undefined);
+        assert.equal(fixture.scheduler.metrics.samples.model_first_output_ms.length, 0);
+        assert.equal(res.body.includes(": keep-alive"), false);
+        for (const chunk of emptyChunks.slice(1)) {
+            assert.deepEqual(chunk, {
+                choices: [{ delta: { content: "" }, finish_reason: null, index: 0 }],
+                created: start.created,
+                id: start.id,
+                model: start.model,
+                object: "chat.completion.chunk",
+            });
+        }
         deliver(fixture, fixture.sent[0], success.slice(1));
         await running;
         const body = res.body;
@@ -849,8 +895,8 @@ test("early delivers reasoning and complete tool inputs with usage and tool fini
     await fixture.handler.processOpenAIRequest(req, res);
     const chunks = completionChunks(res);
     assert.equal(chunks[0].choices[0].delta.tool_calls, undefined);
-    assert.equal(chunks[1].choices[0].delta.reasoning_content, "thinking");
-    const tool = chunks[2].choices[0].delta.tool_calls[0];
+    assert.equal(chunks[2].choices[0].delta.reasoning_content, "thinking");
+    const tool = chunks[3].choices[0].delta.tool_calls[0];
     assert.deepEqual(JSON.parse(tool.function.arguments), { city: "上海" });
     assert.equal(tool.function.name, "weather");
     assert.equal(chunks.at(-1).choices[0].finish_reason, "tool_calls");
@@ -860,7 +906,8 @@ test("early delivers reasoning and complete tool inputs with usage and tool fini
     assert.equal(fixture.scheduler.metrics.samples.request_complete_ms.length, 1);
 });
 
-test("early reports late upstream errors and malformed buffered JSON without success DONE", async () => {
+test("early reports late upstream errors and malformed buffered JSON without success DONE", async t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     for (const messages of [
         [success[0], { error: { type: "upstream_error" }, event_type: "error", message: "late error", status: 418 }],
         [success[0], { data: "invalid JSON", event_type: "chunk" }, success[2]],
@@ -878,11 +925,15 @@ test("early reports late upstream errors and malformed buffered JSON without suc
         assert.equal(res.__modelOutputStarted, false);
         assert.equal(fixture.scheduler.metrics.samples.model_first_output_ms.length, 0);
         assert.equal(fixture.registry.messageQueues.size, 0);
+        const body = res.body;
+        t.mock.timers.tick(5000);
+        assert.equal(res.body, body);
         fixture.scheduler.close();
     }
 });
 
-test("early disconnect cancels active upstream and stops heartbeats in both runtime modes", async () => {
+test("early disconnect cancels active upstream and stops heartbeats in both runtime modes", async t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     for (const legacy of [true, false]) {
         const fixture = setup(() => [success[0]], {
             scheduler: { streamKeepaliveIntervalMs: 5 },
@@ -900,13 +951,15 @@ test("early disconnect cancels active upstream and stops heartbeats in both runt
         }
         const res = new Response();
         const running = fixture.handler.processOpenAIRequest(request("flash", true), res);
-        await waitFor(() => fixture.sent.length === 1);
-        await new Promise(resolve => setImmediate(resolve));
+        for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+        assert.equal(fixture.sent.length, 1);
+        t.mock.timers.tick(1000);
+        assert.equal(completionChunks(res).length, 3);
         res.destroyed = true;
         res.emit("close");
         await running;
         const body = res.body;
-        await new Promise(resolve => setTimeout(resolve, 15));
+        t.mock.timers.tick(5000);
         assert.equal(res.body, body);
         assert.equal(fixture.registry.messageQueues.size, 0);
         assert.equal(fixture.scheduler.snapshot().active_workers, 0);

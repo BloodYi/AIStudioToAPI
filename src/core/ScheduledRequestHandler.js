@@ -28,7 +28,7 @@ class ScheduledRequestHandler extends RequestHandler {
             const write = res.write.bind(res);
             res.write = (chunk, ...args) => {
                 const text = Buffer.isBuffer(chunk) ? chunk.toString() : String(chunk ?? "");
-                if (res.__writingStreamStart) return write(chunk, ...args);
+                if (res.__writingStreamStart || res.__writingEarlyKeepalive) return write(chunk, ...args);
                 if (!/^:\s*(?:accepted|keep-alive)\s*\n\n$/.test(text) && text !== "event: ping\ndata: {}\n\n") {
                     if (
                         res.__streamStartSent &&

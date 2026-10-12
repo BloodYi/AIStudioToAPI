@@ -27,7 +27,7 @@ module.exports = [
         application: "hot",
         choices: ["real", "fake", "early"],
         description:
-            "提前发送空首块：流式请求立即发送空正文首块，等待期间保活，完整结果返回后一次填充；非流式仍返回完整 JSON。空首块当前适用于 OpenAI Chat Completions，其余接口按缓冲模式处理。early 优先于 STREAM_EARLY_HEADERS；首块发送后的失败通过流内错误返回，HTTP 状态保持 200。",
+            "提前发送空首块：流式请求立即发送空正文首块，再立即补发无 role 空增量，等待期间每秒发送空增量保活，完整结果返回后一次填充；非流式仍返回完整 JSON。空首块当前适用于 OpenAI Chat Completions，其余接口按缓冲模式处理。early 优先于 STREAM_EARLY_HEADERS；首块发送后的失败通过流内错误返回，HTTP 状态保持 200。",
         group: "请求处理与模型功能",
         label: "流式响应模式",
         minimum: 1,
@@ -427,7 +427,7 @@ module.exports = [
     {
         application: "hot",
         dependsOn: "STREAM_EARLY_HEADERS",
-        description: "提前建立 SSE 后、实际内容输出前的保活间隔，毫秒",
+        description: "提前建立 SSE 后、实际内容输出前的保活间隔，毫秒；early 模式固定每秒发送空增量，不使用此配置",
         group: "排队与等待保活",
         label: "流式等待保活间隔",
         maximum: 2147483647,

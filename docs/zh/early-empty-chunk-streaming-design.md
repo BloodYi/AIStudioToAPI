@@ -14,10 +14,10 @@
 
 扩展现有 `STREAMING_MODE` 枚举，不新增独立开关。
 
-| 配置值 | 下拉框文案 | 下游流式响应行为 |
-| --- | --- | --- |
-| `real` | 真实流式 | 保留当前逐步转发行为 |
-| `fake` | 缓冲后模拟流式 | 保留当前缓冲、转换和输出行为 |
+| 配置值  | 下拉框文案     | 下游流式响应行为                           |
+| ------- | -------------- | ------------------------------------------ |
+| `real`  | 真实流式       | 保留当前逐步转发行为                       |
+| `fake`  | 缓冲后模拟流式 | 保留当前缓冲、转换和输出行为               |
 | `early` | 提前发送空首块 | 立即发送空正文首块，等待完整结果后整段输出 |
 
 前端在原来的两个选项后追加新选项。说明文案建议为：
@@ -72,14 +72,16 @@ data: {"id":"chatcmpl-example","object":"chat.completion.chunk","created":179176
 
 ### 4.3 等待与完成
 
-首块之后使用 SSE 注释保活：
+首块之后立即补发一个无 role 的合法空增量，随后每 1000 ms 发送一次并 flush：
 
 ```text
-: keep-alive
+data: {"id":"chatcmpl-example","object":"chat.completion.chunk","created":1791763200,"model":"MODEL_ID","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}
 
 ```
 
-不需要反复发送空正文 JSON。模型感知调度模式复用 `STREAM_KEEPALIVE_INTERVAL_MS`；legacy 模式复用既有假流式保活间隔。每个请求仅有一个保活计时器，避免早期心跳与旧假流式心跳同时运行。
+立即补发使暂存一条事件的 NewAPI 释放首块；周期空包让下游持续收到数据事件，触发酒馆现有进度刷新。必须使用空字符串，不能加入空格、换行正文或零宽字符。后续空包不重复 role，不携带 usage、工具调用、结束原因或 `[DONE]`，并保持同一流身份。
+
+legacy 与模型感知调度共用一个 early 心跳计时器，固定间隔不改变其他模式的 `STREAM_KEEPALIVE_INTERVAL_MS` 或随机注释保活。真实内容开始交付、成功、失败或取消后停止；空包通过专用写入状态排除在模型首输出判断之外。
 
 完整结果准备好后，复用现有协议转换器输出正文、工具调用、结束原因及客户端请求的 usage，再发送 `[DONE]` 并关闭连接。正文一次交付，不增加逐字切片或播放延迟。工具调用与 usage 不应被强制改写为普通正文；空首块本身也不触发工具执行。
 
@@ -127,15 +129,15 @@ data: {"id":"chatcmpl-example","object":"chat.completion.chunk","created":179176
 
 ## 8. 实施位置与可观察性
 
-| 位置 | 需要处理的内容 |
-| --- | --- |
-| `src/config/definitions.js` | 扩展枚举、说明和保存校验 |
-| `src/utils/ConfigLoader.js` 与配置保存链路 | 新枚举加载、持久化与默认值兼容 |
-| `ui/app/components/UnifiedConfiguration.vue` | 新增下拉选项文案与协议范围说明 |
-| `src/core/FormatConverter.js` | 解析 `-early`，复用流身份和开始块状态 |
-| `src/core/RequestHandler.js` | legacy 与共用 OpenAI 缓冲路径的空首块、心跳和终结处理 |
-| `src/core/ScheduledRequestHandler.js` | 调度前首块、真实输出分类、重试与单一保活管理 |
-| 状态页、日志与使用记录 | 正确显示第三种模式，避免被二元判断显示成旧假流式 |
+| 位置                                         | 需要处理的内容                                        |
+| -------------------------------------------- | ----------------------------------------------------- |
+| `src/config/definitions.js`                  | 扩展枚举、说明和保存校验                              |
+| `src/utils/ConfigLoader.js` 与配置保存链路   | 新枚举加载、持久化与默认值兼容                        |
+| `ui/app/components/UnifiedConfiguration.vue` | 新增下拉选项文案与协议范围说明                        |
+| `src/core/FormatConverter.js`                | 解析 `-early`，复用流身份和开始块状态                 |
+| `src/core/RequestHandler.js`                 | legacy 与共用 OpenAI 缓冲路径的空首块、心跳和终结处理 |
+| `src/core/ScheduledRequestHandler.js`        | 调度前首块、真实输出分类、重试与单一保活管理          |
+| 状态页、日志与使用记录                       | 正确显示第三种模式，避免被二元判断显示成旧假流式      |
 
 请求记录中的下游有效模式应记录为 `early`。非 OpenAI 接口回退时，记录实际生效的 `fake`，必要时另行记录请求模式用于诊断。
 

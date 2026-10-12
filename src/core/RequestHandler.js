@@ -1267,24 +1267,50 @@ class RequestHandler {
         res.__stopEarlyOpenAIStream = stop;
         res.once("close", stop);
         res.once("finish", stop);
+        const emptyChunk = `data: ${JSON.stringify({
+            choices: [{ delta: { content: "" }, finish_reason: null, index: 0 }],
+            created: state.created,
+            id: state.id,
+            model: state.model,
+            object: "chat.completion.chunk",
+        })}\n\n`;
+        const sendKeepalive = () => {
+            if (
+                stopped ||
+                !this._isResponseWritable(res) ||
+                res.__modelOutputStarted ||
+                this.controller?.signal.aborted
+            ) {
+                stop();
+                return false;
+            }
+            // Local empty data events must never count as actual model output.
+            res.__writingEarlyKeepalive = true;
+            try {
+                res.write(emptyChunk);
+                res.flush?.();
+                res.__keepaliveSent = true;
+                return true;
+            } catch (error) {
+                this.logger.debug(`[Request] Early stream keepalive stopped: ${error.message}`);
+                stop();
+                return false;
+            } finally {
+                res.__writingEarlyKeepalive = false;
+            }
+        };
         const schedule = () => {
             if (stopped) return;
-            const interval =
-                this.acceptedSchedulerConfig?.streamKeepaliveIntervalMs || 12000 + Math.floor(Math.random() * 6000);
+            // early has its own one-second cadence; other stream modes retain
+            // their configured/comment keepalive behavior.
             timer = setTimeout(() => {
-                if (!this._isResponseWritable(res) || res.__modelOutputStarted) return stop();
-                try {
-                    res.write(": keep-alive\n\n");
-                    res.flush?.();
-                    schedule();
-                } catch (error) {
-                    this.logger.debug(`[Request] Early stream keepalive stopped: ${error.message}`);
-                    stop();
-                }
-            }, interval);
+                if (sendKeepalive()) schedule();
+            }, 1000);
             timer.unref?.();
         };
-        schedule();
+        // NewAPI buffers one event: release the role start immediately without
+        // repeating role or waiting for the first periodic heartbeat.
+        if (sendKeepalive()) schedule();
     }
 
     // Process OpenAI format requests
