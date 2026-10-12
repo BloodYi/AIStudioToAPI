@@ -1193,12 +1193,107 @@ class RequestHandler {
         return req.method === "POST" && req.path.includes("/upload/") && command.includes("start");
     }
 
+    async _ensureEarlyStreamReady(res) {
+        // Browser readiness can be shared work in legacy mode. Stop awaiting it as
+        // soon as this client leaves, and never forward this request afterwards.
+        let onClose;
+        const disconnected = new Promise(resolve => {
+            onClose = () => {
+                this._markTrackedClientAbort(res);
+                resolve(false);
+            };
+            res.once("close", onClose);
+        });
+        try {
+            if (!this._isResponseWritable(res)) return false;
+            return await Promise.race([
+                this._ensureBrowserBackedRequestReady(res, { waitErrorType: "service_unavailable" }),
+                disconnected,
+            ]);
+        } finally {
+            res.removeListener("close", onClose);
+        }
+    }
+
+    _startEarlyOpenAIStream(res, model) {
+        if (res.__streamStartSent || !this._isResponseWritable(res)) return;
+        const state = {
+            created: Math.floor(Date.now() / 1000),
+            id: `chatcmpl-${this._generateRequestId()}`,
+            model,
+            roleSent: true,
+        };
+        res.__earlyOpenAIStreamState = state;
+        res.status(200).set({
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+            "Content-Type": "text/event-stream",
+            "X-Accel-Buffering": "no",
+        });
+        res.flushHeaders?.();
+        res.__streamStartSent = true;
+        res.__modelOutputStarted = false;
+        res.__streamStartAt = Date.now();
+        // Explicitly distinguish this local acceptance event from model output.
+        res.__writingStreamStart = true;
+        try {
+            res.write(
+                `data: ${JSON.stringify({
+                    choices: [{ delta: { content: "", role: "assistant" }, finish_reason: null, index: 0 }],
+                    created: state.created,
+                    id: state.id,
+                    model,
+                    object: "chat.completion.chunk",
+                })}\n\n`
+            );
+            res.flush?.();
+        } finally {
+            res.__writingStreamStart = false;
+        }
+        const acceptedAt = this._acceptedAt || res.__acceptedAt || Date.now();
+        this.logger.debug(
+            `[Request] Early empty chunk sent for ${model}, elapsed: ${res.__streamStartAt - acceptedAt}ms`
+        );
+        this.scheduler?.observe("http_headers_ms", Date.now() - acceptedAt);
+        this.scheduler?.observe("stream_start_ms", Date.now() - acceptedAt);
+        let timer;
+        let stopped = false;
+        const stop = () => {
+            stopped = true;
+            clearTimeout(timer);
+            res.removeListener("close", stop);
+            res.removeListener("finish", stop);
+        };
+        res.__stopEarlyOpenAIStream = stop;
+        res.once("close", stop);
+        res.once("finish", stop);
+        const schedule = () => {
+            if (stopped) return;
+            const interval =
+                this.acceptedSchedulerConfig?.streamKeepaliveIntervalMs || 12000 + Math.floor(Math.random() * 6000);
+            timer = setTimeout(() => {
+                if (!this._isResponseWritable(res) || res.__modelOutputStarted) return stop();
+                try {
+                    res.write(": keep-alive\n\n");
+                    res.flush?.();
+                    schedule();
+                } catch (error) {
+                    this.logger.debug(`[Request] Early stream keepalive stopped: ${error.message}`);
+                    stop();
+                }
+            }, interval);
+            timer.unref?.();
+        };
+        schedule();
+    }
+
     // Process OpenAI format requests
     async processOpenAIRequest(req, res) {
         if (this.serverSystem.scheduler && !this.scheduled) {
             return require("./ScheduledRequestHandler").dispatch(this, "processOpenAIRequest", req, res);
         }
         const requestId = this._generateRequestId();
+        res.__acceptedAt = Date.now();
         this._startTrackedRequest(requestId, req, {
             apiFormat: "openai",
             isStreaming: req.body.stream === true,
@@ -1209,10 +1304,15 @@ class RequestHandler {
         res.__proxyResponseStreamMode = null;
 
         try {
-            if (!(await this._ensureBrowserBackedRequestReady(res, { waitErrorType: "service_unavailable" }))) {
+            const suffixMode = FormatConverter.parseModelStreamingModeSuffix(
+                FormatConverter.parseModelBuiltInToolSuffixes(req.body.model).cleanModelName
+            ).streamingMode;
+            const wantsEarlyStream = req.body.stream === true && (suffixMode || this.config.streamingMode) === "early";
+            if (
+                !wantsEarlyStream &&
+                !(await this._ensureBrowserBackedRequestReady(res, { waitErrorType: "service_unavailable" }))
+            )
                 return;
-            }
-
             const isOpenAIStream = req.body.stream === true;
             const systemStreamMode = this.config.streamingMode;
 
@@ -1244,6 +1344,15 @@ class RequestHandler {
             }
 
             const effectiveStreamMode = modelStreamingMode || systemStreamMode;
+            const useEarlyStream = isOpenAIStream && effectiveStreamMode === "early";
+            res.__proxyResponseStreamMode = isOpenAIStream ? effectiveStreamMode : null;
+            this._updateTrackedRequest(requestId, { model, streamMode: isOpenAIStream ? effectiveStreamMode : null });
+            if (useEarlyStream && !this.scheduled) this._startEarlyOpenAIStream(res, model);
+            if (useEarlyStream && !(await this._ensureEarlyStreamReady(res))) {
+                return;
+            }
+
+            if (!this._isResponseWritable(res)) return;
             const useRealStream = isOpenAIStream && effectiveStreamMode === "real";
             const googleEndpoint = useRealStream ? "streamGenerateContent" : "generateContent";
             const proxyRequest = {
@@ -1264,13 +1373,13 @@ class RequestHandler {
                     return this._sendErrorResponse(res, error.status || 503, error.message);
                 }
             }
-            res.__proxyResponseStreamMode = isOpenAIStream ? (useRealStream ? "real" : "fake") : null;
+            res.__proxyResponseStreamMode = isOpenAIStream ? effectiveStreamMode : null;
             this._updateTrackedRequest(requestId, {
                 isStreaming: isOpenAIStream,
                 model,
                 path: proxyRequest.path,
                 requestCategory: "generation",
-                ...(isOpenAIStream ? { streamMode: useRealStream ? "real" : "fake" } : {}),
+                ...(isOpenAIStream ? { streamMode: effectiveStreamMode } : {}),
             });
 
             try {
@@ -1387,7 +1496,7 @@ class RequestHandler {
                     // OpenAI Fake Stream / Non-Stream mode
                     // Set up keep-alive timer for fake stream mode to prevent client timeout
                     let connectionMaintainer;
-                    if (isOpenAIStream) {
+                    if (isOpenAIStream && !res.__streamStartSent) {
                         const scheduleNextKeepAlive = () => {
                             const randomInterval = 12000 + Math.floor(Math.random() * 6000); // 12 - 18 seconds
                             connectionMaintainer = setTimeout(() => {
@@ -1460,6 +1569,7 @@ class RequestHandler {
 
                             this.logger.info(`[Request] OpenAI streaming response (Fake Mode) started...`);
                             let fullBody = "";
+                            let bufferingAttemptId = proxyRequest.request_attempt_id;
                             let hadStreamError = false;
                             try {
                                 // eslint-disable-next-line no-constant-condition
@@ -1473,13 +1583,17 @@ class RequestHandler {
                                         this.logger.error(
                                             `❌ [Request] Error received during OpenAI fake stream: ${message.message}`
                                         );
-                                        this._markTrackedResponseError(res, message.message, 500);
+                                        const errorStatus = useEarlyStream ? Number(message.status) || 500 : 500;
+                                        const errorType = useEarlyStream
+                                            ? message.error?.type || this._getDefaultErrorType("openai", errorStatus)
+                                            : "api_error";
+                                        this._markTrackedResponseError(res, message.message, errorStatus);
                                         hadStreamError = true;
                                         // Check if response is still writable before attempting to write
                                         if (this._isResponseWritable(res)) {
                                             try {
                                                 res.write(
-                                                    `data: ${JSON.stringify({ error: { code: 500, message: message.message, type: "api_error" } })}\n\n`
+                                                    `data: ${JSON.stringify({ error: { code: errorStatus, message: message.message, type: errorType } })}\n\n`
                                                 );
                                             } catch (writeError) {
                                                 this.logger.debug(
@@ -1490,13 +1604,20 @@ class RequestHandler {
                                         break;
                                     }
 
+                                    if (useEarlyStream && bufferingAttemptId !== proxyRequest.request_attempt_id) {
+                                        fullBody = "";
+                                        bufferingAttemptId = proxyRequest.request_attempt_id;
+                                    }
                                     if (message.data) fullBody += message.data;
                                 }
                                 if (hadStreamError) {
                                     // Backend errored; don't attempt to translate/send a "normal" stream afterwards.
                                     return;
                                 }
-                                const streamState = {};
+                                const streamState = res.__earlyOpenAIStreamState || {};
+                                if (useEarlyStream)
+                                    streamState.includeUsage = req.body.stream_options?.include_usage === true;
+                                if (useEarlyStream) JSON.parse(fullBody);
                                 const translatedChunk = this.formatConverter.translateGoogleToOpenAIStream(
                                     fullBody,
                                     model,
@@ -1505,6 +1626,14 @@ class RequestHandler {
                                 if (this._isResponseWritable(res)) {
                                     try {
                                         if (translatedChunk) {
+                                            if (useEarlyStream && !this.scheduled && streamState.modelOutputStarted) {
+                                                res.__modelOutputStarted = true;
+                                                res.__modelFirstOutputAt = Date.now();
+                                                res.__stopEarlyOpenAIStream?.();
+                                                this.logger.debug(
+                                                    `[Request] Model output delivered, elapsed: ${res.__modelFirstOutputAt - res.__acceptedAt}ms`
+                                                );
+                                            }
                                             res.write(translatedChunk);
                                         }
                                         res.write("data: [DONE]\n\n");
@@ -1552,6 +1681,9 @@ class RequestHandler {
                 if (!res.writableEnded) res.end();
             }
         } finally {
+            res.__stopEarlyOpenAIStream?.();
+            if (res.__streamStartSent)
+                this.logger.debug(`[Request] Early stream finished, elapsed: ${Date.now() - res.__acceptedAt}ms`);
             this._finalizeTrackedRequest(requestId, res);
         }
     }
@@ -1566,7 +1698,12 @@ class RequestHandler {
             apiFormat: "response_api",
             isStreaming: req.body.stream === true,
             requestCategory: "generation",
-            streamMode: req.body.stream === true ? this.config.streamingMode : null,
+            streamMode:
+                req.body.stream === true
+                    ? this.config.streamingMode === "early"
+                        ? "fake"
+                        : this.config.streamingMode
+                    : null,
         });
         this._setResponseApiFormat(res, "response_api");
         res.__proxyResponseStreamMode = null;
@@ -2007,7 +2144,12 @@ class RequestHandler {
             apiFormat: "claude",
             isStreaming: req.body.stream === true,
             requestCategory: "generation",
-            streamMode: req.body.stream === true ? this.config.streamingMode : null,
+            streamMode:
+                req.body.stream === true
+                    ? this.config.streamingMode === "early"
+                        ? "fake"
+                        : this.config.streamingMode
+                    : null,
         });
         this._setResponseApiFormat(res, "claude");
         res.__proxyResponseStreamMode = null;
@@ -3942,8 +4084,10 @@ class RequestHandler {
                     // SSE format - send error event
                     try {
                         // Determine error code and type based on error classification
-                        let errorCode = 500;
-                        let errorType = "api_error";
+                        let errorCode = res.__streamStartSent ? Number(error.status) || 500 : 500;
+                        let errorType = res.__streamStartSent
+                            ? error.error?.type || this._getDefaultErrorType(format, errorCode)
+                            : "api_error";
                         let errorMessage = `Processing failed: ${errorMsg}`;
 
                         // Use precise error type checking instead of string matching
@@ -4017,11 +4161,13 @@ class RequestHandler {
                             `❌ [Request] Failed to write error to stream: ${writeErrorMsg}${requestIdSuffix}`
                         );
                     }
-                } else if (res.__proxyResponseStreamMode === "fake") {
+                } else if (["fake", "early"].includes(res.__proxyResponseStreamMode)) {
                     // Request-scoped fake stream mode - try to send an SSE-style error chunk
                     try {
-                        let status = 500;
-                        let errorType = "api_error";
+                        let status = res.__streamStartSent ? Number(error.status) || 500 : 500;
+                        let errorType = res.__streamStartSent
+                            ? error.error?.type || this._getDefaultErrorType(format, status)
+                            : "api_error";
                         if (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT") {
                             status = 504;
                             errorType = "timeout_error";
@@ -4068,6 +4214,13 @@ class RequestHandler {
     }
 
     _sendErrorResponse(res, status, message, errorType = null) {
+        if (res.__streamStartSent && res.headersSent) {
+            if (this._isResponseWritable(res)) {
+                this._sendErrorChunkToClient(res, message, Number(status) || 500, errorType);
+                res.end();
+            }
+            return;
+        }
         if (!res.headersSent) {
             const statusCode = Number(status) || 500;
             const resolvedFormat = this._resolveErrorFormat(res);
@@ -4491,7 +4644,10 @@ class RequestHandler {
             query_params: req.query || {},
             request_id: requestId,
             response_transform: responseTransform,
-            streaming_mode: modelStreamingMode || this.config.streamingMode,
+            streaming_mode:
+                (modelStreamingMode || this.config.streamingMode) === "early"
+                    ? "fake"
+                    : modelStreamingMode || this.config.streamingMode,
         };
     }
 

@@ -177,7 +177,14 @@ class ModelScheduler {
         this.metrics = {
             dispatch_timeout: 0,
             local_transport: 0,
-            samples: { context_wait_ms: [], http_headers_ms: [], model_first_output_ms: [], upstream_ttfb_ms: [] },
+            samples: {
+                context_wait_ms: [],
+                http_headers_ms: [],
+                model_first_output_ms: [],
+                request_complete_ms: [],
+                stream_start_ms: [],
+                upstream_ttfb_ms: [],
+            },
             upstream_error: 0,
         };
         this.load();

@@ -220,6 +220,7 @@ const choiceLabels = {
     BLOCK_MEDIUM_AND_ABOVE: "拦截中及高风险",
     BLOCK_NONE: "不拦截",
     BLOCK_ONLY_HIGH: "仅拦截高风险",
+    early: "提前发送空首块",
     fake: "缓冲后模拟流式",
     HARM_BLOCK_THRESHOLD_UNSPECIFIED: "上游默认阈值",
     least_recently_used: "较久未使用优先",

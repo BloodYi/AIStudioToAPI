@@ -156,6 +156,7 @@
     "downloadLogs": "Download Logs",
     "duplicateAuth": "Duplicated (Auto Ignored)",
     "duplicateAuthHint": "Duplicate, keep #{index}",
+    "earlyStream": "Early empty chunk",
     "emptyValue": "Empty",
     "enableAuthUpdate": "Auto Update Auth",
     "enabled": "Enabled",

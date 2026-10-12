@@ -247,3 +247,21 @@ test("proxy settings restore Mihomo after a persistence failure", async () => {
     await assert.rejects(pool._commit(next), /disk full/);
     assert.deepEqual(reloads, [next, previous]);
 });
+
+test("all streaming modes persist, reload, reset and validate with old defaults", t => {
+    const { service, save } = setup(t);
+    for (const mode of ["early", "fake", "real"]) {
+        save({ STREAMING_MODE: mode });
+        assert.equal(service.running.streamingMode, mode);
+        const restarted = new ConfigurationService({ logger }, { env: {}, file: service.file });
+        assert.equal(restarted.running.streamingMode, mode);
+        assert.equal(restarted.snapshot().saved.STREAMING_MODE, mode);
+    }
+    save({ STREAMING_MODE: "early" });
+    service.save({ reset: ["STREAMING_MODE"], version: service.document.version });
+    assert.equal(service.running.streamingMode, "real");
+    assert.throws(() => save({ STREAMING_MODE: "invalid" }), { status: 400 });
+    const withEnv = setup(t, { STREAMING_MODE: "early" });
+    assert.equal(withEnv.service.running.streamingMode, "early");
+    assert.equal(setup(t).service.running.streamingMode, "real");
+});

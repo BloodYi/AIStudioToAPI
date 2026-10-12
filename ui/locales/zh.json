@@ -156,6 +156,7 @@
     "downloadLogs": "下载日志",
     "duplicateAuth": "重复账号（已自动忽略）",
     "duplicateAuthHint": "重复，保留 #{index}",
+    "earlyStream": "提前发送空首块",
     "emptyValue": "空值",
     "enableAuthUpdate": "自动更新 Auth",
     "enabled": "已启用",

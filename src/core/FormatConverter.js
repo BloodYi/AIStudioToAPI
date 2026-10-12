@@ -98,7 +98,7 @@ class FormatConverter {
 
     /**
      * Parse streaming mode suffix from model name.
-     * Only matches a trailing `-real` or `-fake` (case-insensitive).
+     * Only matches a trailing `-real`, `-fake` or `-early` (case-insensitive).
      * Callers should strip trailing built-in tool suffixes before invoking this helper, so the
      * combined suffix order remains: thinking -> streaming -> built-in tools.
      *
@@ -109,14 +109,14 @@ class FormatConverter {
      * - gemini-3-flash-preview(minimal)-fake-search-code -> no direct match here; callers strip tool suffixes first
      *
      * @param {string} modelName - Original model name
-     * @returns {{ cleanModelName: string, streamingMode: ("real"|"fake"|null) }}
+     * @returns {{ cleanModelName: string, streamingMode: ("real"|"fake"|"early"|null) }}
      */
     static parseModelStreamingModeSuffix(modelName) {
         if (!modelName || typeof modelName !== "string") {
             return { cleanModelName: modelName, streamingMode: null };
         }
 
-        const match = modelName.match(/^(.+)-(real|fake)$/i);
+        const match = modelName.match(/^(.+)-(real|fake|early)$/i);
         if (!match) {
             return { cleanModelName: modelName, streamingMode: null };
         }
@@ -533,7 +533,7 @@ class FormatConverter {
     /**
      * Convert OpenAI request format to Google Gemini format
      * @param {object} openaiBody - OpenAI format request body
-     * @returns {Promise<{ googleRequest: object, cleanModelName: string, modelStreamingMode: ("real"|"fake"|null) }>}
+     * @returns {Promise<{ googleRequest: object, cleanModelName: string, modelStreamingMode: ("real"|"fake"|"early"|null) }>}
      *          - modelStreamingMode: Streaming mode override parsed from model name suffix, or null
      */
     async translateOpenAIToGoogle(openaiBody) {
@@ -544,7 +544,7 @@ class FormatConverter {
 
         // Parse model suffixes in reverse stripping order:
         // 1) built-in tool overrides: trailing `-search` / `-code`
-        // 2) streaming override: trailing `-real` / `-fake` after any thinking suffix
+        // 2) streaming override: trailing `-real` / `-fake` / `-early` after any thinking suffix
         // 3) thinkingLevel override: trailing `-minimal` / `(minimal)` etc.
         // Combined user-facing suffix order: thinking -> streaming -> built-in tools
         const rawModel = openaiBody.model || "gemini-2.5-flash-lite";
@@ -1146,6 +1146,7 @@ class FormatConverter {
         }
         const streamId = streamState.id;
         const created = streamState.created;
+        modelName = streamState.model || modelName;
 
         // Cache usage data whenever it arrives.
         // Store in streamState to prevent concurrency issues between requests
@@ -1226,6 +1227,7 @@ class FormatConverter {
                 }
 
                 if (hasContent) {
+                    streamState.modelOutputStarted = true;
                     // The 'role' should only be sent in the first chunk with content.
                     if (!streamState.roleSent) {
                         delta.role = "assistant";
@@ -1275,7 +1277,7 @@ class FormatConverter {
             };
 
             // Attach cached usage data to the very last message (if available)
-            if (streamState.usage) {
+            if (streamState.usage && streamState.includeUsage !== false) {
                 finalResponse.usage = streamState.usage;
             }
             chunksToSend.push(`data: ${JSON.stringify(finalResponse)}\n\n`);
@@ -2126,7 +2128,7 @@ class FormatConverter {
     /**
      * Convert Claude API request format to Google Gemini format
      * @param {object} claudeBody - Claude API format request body
-     * @returns {Promise<{ googleRequest: object, cleanModelName: string, modelStreamingMode: ("real"|"fake"|null) }>}
+     * @returns {Promise<{ googleRequest: object, cleanModelName: string, modelStreamingMode: ("real"|"fake"|"early"|null) }>}
      *          - modelStreamingMode: Streaming mode override parsed from model name suffix, or null
      */
     async translateClaudeToGoogle(claudeBody) {
@@ -2137,7 +2139,7 @@ class FormatConverter {
 
         // Parse model suffixes in reverse stripping order:
         // 1) built-in tool overrides: trailing `-search` / `-code`
-        // 2) streaming override: trailing `-real` / `-fake` after any thinking suffix
+        // 2) streaming override: trailing `-real` / `-fake` / `-early` after any thinking suffix
         // 3) thinkingLevel override: trailing `-minimal` / `(minimal)` etc.
         // Combined user-facing suffix order: thinking -> streaming -> built-in tools
         const rawModel = claudeBody.model || "gemini-2.5-flash-lite";
@@ -3006,7 +3008,7 @@ class FormatConverter {
      * Convert OpenAI Response API request format to Google Gemini format
      * Response API uses different structure: input instead of messages, instructions instead of system message
      * @param {object} responseBody - OpenAI Response API format request body
-     * @returns {Promise<{ googleRequest: object, cleanModelName: string, modelStreamingMode: ("real"|"fake"|null) }>}
+     * @returns {Promise<{ googleRequest: object, cleanModelName: string, modelStreamingMode: ("real"|"fake"|"early"|null) }>}
      *          - modelStreamingMode: Streaming mode override parsed from model name suffix, or null
      */
     async translateOpenAIResponseToGoogle(responseBody) {
@@ -3018,7 +3020,7 @@ class FormatConverter {
 
         // Parse model suffixes in reverse stripping order:
         // 1) built-in tool overrides: trailing `-search` / `-code`
-        // 2) streaming override: trailing `-real` / `-fake` after any thinking suffix
+        // 2) streaming override: trailing `-real` / `-fake` / `-early` after any thinking suffix
         // 3) thinkingLevel override: trailing `-minimal` / `(minimal)` etc.
         // Combined user-facing suffix order: thinking -> streaming -> built-in tools
         const rawModel = responseBody.model || "gemini-2.5-flash-lite";

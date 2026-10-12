@@ -496,8 +496,8 @@
                                 </span>
                                 <span
                                     class="value status-text-bold"
-                                    :class="state.streamingModeReal ? 'status-ok' : 'status-error'"
-                                    >{{ state.streamingModeReal ? t("real") : t("fake") }}</span
+                                    :class="state.streamingMode === 'real' ? 'status-ok' : 'status-error'"
+                                    >{{ translateLabel(state.streamingMode) }}</span
                                 >
                             </div>
                             <div class="status-item">
@@ -724,9 +724,7 @@
                 <div class="status-card">
                     <span>{{ t("currentVersion") }}：{{ appVersion }}</span>
                     <button type="button" @click="copyText(appVersion)">{{ t("copy") }}</button>
-                    <a href="https://github.com/Naoya666/AIStudioToAPI" target="_blank">{{
-                        t("viewRelease")
-                    }}</a>
+                    <a href="https://github.com/Naoya666/AIStudioToAPI" target="_blank">{{ t("viewRelease") }}</a>
                 </div>
                 <div class="status-card">
                     <label>{{ t("language") }}</label>
@@ -2610,6 +2608,7 @@ const translateLabel = value => {
     // Map backend identifiers to user-facing i18n keys
     const keyMap = {
         count_tokens: "countTokens",
+        early: "earlyStream",
         fake: "fakeStream",
         non: "nonStream",
         real: "realStream",
@@ -3017,7 +3016,7 @@ const state = reactive({
     schedulingMode: null,
     selectedAccounts: new Set(), // Selected account indices
     serviceConnected: false,
-    streamingModeReal: false,
+    streamingMode: "real",
     // theme: handled by useTheme
     usageCount: 0,
 });
@@ -3347,7 +3346,7 @@ const updateStatus = data => {
 
     state.isUpdating = true;
     state.checkUpdateEnabled = isEnabled(data.status.checkUpdate);
-    state.streamingModeReal = data.status.streamingMode === "real";
+    state.streamingMode = data.status.streamingMode;
     state.enableAuthUpdateEnabled = isEnabled(data.status.enableAuthUpdate);
     state.forceThinkingEnabled = isEnabled(data.status.forceThinking);
     state.forceCodeExecutionEnabled = isEnabled(data.status.forceCodeExecution);

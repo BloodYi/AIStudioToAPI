@@ -28,11 +28,31 @@ class ScheduledRequestHandler extends RequestHandler {
             const write = res.write.bind(res);
             res.write = (chunk, ...args) => {
                 const text = Buffer.isBuffer(chunk) ? chunk.toString() : String(chunk ?? "");
+                if (res.__writingStreamStart) return write(chunk, ...args);
                 if (!/^:\s*(?:accepted|keep-alive)\s*\n\n$/.test(text) && text !== "event: ping\ndata: {}\n\n") {
+                    if (
+                        res.__streamStartSent &&
+                        !text.split("\n").some(line => {
+                            if (!line.startsWith("data: {")) return false;
+                            try {
+                                return JSON.parse(line.slice(6)).choices?.some(choice => {
+                                    const delta = choice.delta || {};
+                                    return Boolean(
+                                        delta.content || delta.reasoning_content || delta.tool_calls?.length
+                                    );
+                                });
+                            } catch {
+                                return false;
+                            }
+                        })
+                    )
+                        return write(chunk, ...args);
                     if (!res.__modelOutputStarted)
                         this.scheduler.observe("model_first_output_ms", Date.now() - this._acceptedAt);
                     res.__modelOutputStarted = true;
+                    res.__modelFirstOutputAt ||= Date.now();
                     this._stopEarlyStreamKeepalive();
+                    res.__stopEarlyOpenAIStream?.();
                 } else if (text.includes("keep-alive") || text.startsWith("event: ping")) {
                     res.__keepaliveSent = true;
                 }
@@ -40,6 +60,8 @@ class ScheduledRequestHandler extends RequestHandler {
             };
         }
         this.onClose = () => {
+            this._stopEarlyStreamKeepalive();
+            res.__stopEarlyOpenAIStream?.();
             if (!res.writableFinished) this.controller.abort();
         };
         res.on("close", this.onClose);
@@ -321,7 +343,7 @@ class ScheduledRequestHandler extends RequestHandler {
     }
 
     _sendErrorResponse(res, status, message, errorType = null) {
-        if (res.headersSent && !res.writableEnded) {
+        if (res.headersSent && this._isResponseWritable(res)) {
             this._sendErrorChunkToClient(res, message, Number(status) || 500, errorType);
             res.end();
             return;
@@ -330,6 +352,10 @@ class ScheduledRequestHandler extends RequestHandler {
     }
 
     _beginEarlyStreamIfNeeded(proxyRequest) {
+        if (this.response.__proxyResponseStreamMode === "early") {
+            this._startEarlyOpenAIStream(this.response, this.model);
+            return;
+        }
         const requestedStream =
             this.incomingRequest?.body?.stream === true ||
             String(this.incomingRequest?.path || proxyRequest.path).includes("streamGenerateContent");
@@ -361,7 +387,10 @@ class ScheduledRequestHandler extends RequestHandler {
     }
 
     finish() {
+        if (this.response.__streamStartSent)
+            this.scheduler.observe("request_complete_ms", Date.now() - this._acceptedAt);
         this._stopEarlyStreamKeepalive();
+        this.response.__stopEarlyOpenAIStream?.();
         this.response.removeListener("close", this.onClose);
         const success =
             !this.controller.signal.aborted && !this.response.__usageTrackingOutcome && this.response.statusCode < 400;
