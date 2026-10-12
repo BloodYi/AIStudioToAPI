@@ -40,7 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Install a pinned Mihomo release for both published image architectures.
+# Install a pinned Mihomo release for both supported image architectures.
 RUN case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
         amd64) MIHOMO_ASSET="mihomo-linux-amd64-compatible-${MIHOMO_VERSION}.gz"; MIHOMO_SHA256="${MIHOMO_SHA256_AMD64}" ;; \
         arm64) MIHOMO_ASSET="mihomo-linux-arm64-${MIHOMO_VERSION}.gz"; MIHOMO_SHA256="${MIHOMO_SHA256_ARM64}" ;; \
@@ -89,6 +89,7 @@ RUN ARCH=$(uname -m) && \
 
 # Copy application source code with proper ownership
 # Layer is rebuilt when source code changes
+COPY --chown=node:node LICENSE ./
 COPY --chown=node:node main.js ./
 COPY --chown=node:node vite.config.js ./
 COPY --chown=node:node vite.public.config.js ./
@@ -114,6 +115,7 @@ EXPOSE 7860 7861
 
 # Configure runtime environment
 ENV NODE_ENV=production \
+    CHECK_UPDATE=false \
     CAMOUFOX_EXECUTABLE_PATH=/app/camoufox-linux/camoufox \
     MIHOMO_PATH=/usr/local/bin/mihomo
 

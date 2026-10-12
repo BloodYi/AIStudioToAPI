@@ -27,7 +27,6 @@ yarn-error.log*
 
 # Documentation and development files
 README.md
-LICENSE
 *.md
 !package.json
 
@@ -65,6 +64,14 @@ temp
 *.tmp
 *.zip
 camoufox*
+
+# Private runtime files must never enter the build context
+configs/auth
+data
+auth
+auth-*.json
+users.csv
+accounts.csv
 
 # Auth setup scripts (not needed in Linux container)
 scripts/auth

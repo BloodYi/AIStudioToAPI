@@ -1,0 +1,20 @@
+name: aistudio-to-api
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aistudio-to-api:local
+    pull_policy: never
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:7860:7860"
+      # Enable PUBLIC_DASHBOARD_ENABLED in .env before exposing this port.
+      # - "127.0.0.1:7861:7861"
+    volumes:
+      - ./configs/auth:/app/configs/auth
+      - ./data:/app/data

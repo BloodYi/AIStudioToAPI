@@ -1,385 +1,235 @@
-# Google AI Studio Build App to API Adapter
+# AIStudioToAPI（二次开发版）
 
 中文文档 | [English](README_EN.md)
 
-一个将 Google AI Studio Build App 网页端封装为兼容 OpenAI API、Gemini API 和 Anthropic API 的工具。该服务将充当代理，将 API 请求转换为与 AI Studio Build App 应用界面的浏览器交互。
+将 Google AI Studio Build App 网页端封装为兼容 OpenAI、Gemini 和 Anthropic 格式的 API，通过浏览器自动化转发请求，并提供账号、模型调度、代理节点及用量管理界面。
 
-## ✨ 功能特性
+本仓库是基于 [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) 二次开发的独立维护版本，非上游官方版本。上游进一步基于 [Ellinav/ais2api](https://github.com/Ellinav/ais2api) 开发。本版本保留上游署名和许可说明，沿用 **CC BY-NC 4.0**，仅限符合许可证的非商业用途。
 
-- 🔄 **API 兼容性**：同时兼容 OpenAI API、Gemini API 和 Anthropic API 格式
-- 🌐 **网页自动化**：使用浏览器自动化技术与 AI Studio Build 交互
-- 👥 **多账号支持**：支持多个 Google 账号同时登录，快速切换无需重新登录
-- 🔧 **支持工具调用**：OpenAI、Gemini 和 Anthropic 接口均支持 Tool Calls (Function Calling)
-- 📝 **模型支持**：通过 AI Studio 访问各种 Gemini 模型，包括生图模型和 TTS 语音合成模型
-- 🎨 **主页展示控制**：提供可视化的 Web 控制台，支持账号管理、VNC 登录等操作
+## 功能与本版本改动
 
-## 🚀 快速开始
+继承上游的多协议 API、浏览器自动化、多账号会话、工具调用、图片及语音模型支持，具体可用能力取决于账号权限和上游模型。
 
-### 💻 直接运行（Windows / macOS / Linux）
+本版本的主要扩展：
 
-1. 克隆仓库：
+- **账号管理**：独立账号页面，支持账号凭据、Cookie、CSV 和验证器导入，筛选、批量选择、登录队列、失败诊断及过期会话恢复。
+- **模型感知调度**：按账号 × 模型维护额度与冷却，支持并发控制、排队、资源分配、错误重试和每日冷却重置。
+- **代理节点池**：集成 Mihomo，管理节点及账号出口绑定，支持在首次登录前指定出口。
+- **实时用量统计**：记录请求成功率、模型用量、延迟和调度状态，统计存储于 SQLite。
+- **匿名公开看板**：可选的独立端口只读页面，展示聚合用量及分模型时间窗口统计。
+- **可视化配置**：控制台保存管理配置，显示生效状态及待重启项，配置随数据目录持久化。
+- **界面改进**：账号、节点及状态页面的移动端布局与批量操作体验优化。
 
-   ```bash
-   git clone https://github.com/iBUHub/AIStudioToAPI.git
-   cd AIStudioToAPI
-   ```
+## 快速开始
 
-2. 运行快速设置脚本：
+推荐使用 Docker Compose 从本仓库源码构建。本版本的部署示例使用本地镜像 `aistudio-to-api:local`。
 
-   ```bash
-   npm run setup-auth
-   ```
+### Docker Compose 本地构建
 
-   自动填充和无交互模式示例请看 [账号自动填充](#-账号自动填充) 部分。
-
-   该脚本将：
-   - 自动下载 Camoufox 浏览器（一个注重隐私的 Firefox 分支）
-   - 启动浏览器并打开 AI Studio，引导您手动完成登录
-   - 在本地保存您的身份验证凭据（auth 文件位于 `/configs/auth`）
-
-   > 💡 **提示：** 如果下载 Camoufox 浏览器失败或等待太久，可以自行点击 [此处](https://github.com/daijro/camoufox/releases/tag/v135.0.1-beta.24) 下载，然后设置环境变量 `CAMOUFOX_EXECUTABLE_PATH` 为可执行文件的路径（支持绝对和相对路径）。
-
-3. 配置环境变量（可选）：
-
-   复制根目录下的 `.env.example` 为 `.env`，并在 `.env` 中按需修改配置（如端口、API 密钥等）。
-
-4. 启动服务：
-
-   ```bash
-   npm start
-   ```
-
-   如果已经构建过前端资源，后续只想快速重启服务，可使用：
-
-   ```bash
-   npm run quick-start
-   ```
-
-   API 服务将在 `http://localhost:7860` 上运行。
-
-   服务启动后，您可以在浏览器中访问 `http://localhost:7860` 打开 Web 控制台主页，在这里可以查看账号状态和服务状态。
-   请求统计数据会持久化保存到 `/data/usage-stats.sqlite`；旧的 JSONL 会在首次启动时自动迁移并保留为备份。
-
-5. 更新到最新版本（已有本地部署时）：
-
-   ```bash
-   git pull
-   npm install
-   npm start
-   ```
-
-> ⚠ **注意：** 直接运行不支持通过 VNC 在线添加账号，需要使用 `npm run setup-auth` 脚本添加账号。当前 VNC 登录功能仅在 Docker 容器中可用。
-
-### 🐋 Docker 部署
-
-使用 Docker 部署，无需预先提取身份验证凭据。
-
-#### 🚢 步骤 1：部署容器
-
-##### 🎮️ 方式 1：Docker 命令
+需要 Docker Engine / Docker Desktop 和 Docker Compose v2。容器镜像支持 Linux amd64、arm64；Dockerfile 会下载 Node.js 基础镜像、系统依赖、Camoufox 和 Mihomo，首次构建需要访问对应下载源。
 
 ```bash
+git clone https://github.com/Naoya666/AIStudioToAPI.git
+cd AIStudioToAPI
+cp .env.example .env
+```
+
+编辑 `.env`，至少设置自己的 API 密钥和控制台密码：
+
+```dotenv
+API_KEYS=replace-with-your-api-key
+WEB_CONSOLE_USERNAME=admin
+WEB_CONSOLE_PASSWORD=replace-with-your-console-password
+TZ=Asia/Shanghai
+CHECK_UPDATE=false
+```
+
+不要使用示例密码。`CHECK_UPDATE=false` 用于关闭继承自上游的版本检查，本版本通过拉取源码和重新构建更新。
+
+```bash
+docker compose up -d --build
+docker compose logs -f app
+```
+
+浏览器访问 `http://localhost:7860`，使用配置的控制台用户名和密码登录，然后添加 Google 账号。
+
+仓库中的 [docker-compose.yml](docker-compose.yml) 会：
+
+- 通过 `build: .` 构建当前源码，使用本地镜像标签。
+- 从 `.env` 注入配置，并使用 `init: true` 回收子进程。
+- 将 `./configs/auth` 挂载到 `/app/configs/auth`，保存登录会话。
+- 将 `./data` 挂载到 `/app/data`，保存账号数据库、统计、调度、节点和管理配置。
+- 默认仅将管理/API 端口映射到宿主机 `127.0.0.1:7860`。
+
+远程部署可通过 SSH 隧道访问，或配置 [Nginx 反向代理与 HTTPS](docs/zh/nginx-setup.md)。需要直接通过服务器 IP 访问时，将 Compose 端口映射改为 `7860:7860`。如果修改容器内 `PORT`，需同步修改映射的容器端口。
+
+### 使用 Docker 命令构建
+
+在仓库根目录准备好 `.env` 后执行：
+
+```bash
+docker build -t aistudio-to-api:local .
+mkdir -p configs/auth data
 docker run -d \
   --name aistudio-to-api \
-  -p 7860:7860 \
-  -v /path/to/auth:/app/configs/auth \
-  -v /path/to/data:/app/data \
-  -e API_KEYS=your-api-key-1,your-api-key-2 \
-  -e TZ=Asia/Shanghai \
+  --init \
+  --env-file .env \
+  -p 127.0.0.1:7860:7860 \
+  -v "$(pwd)/configs/auth:/app/configs/auth" \
+  -v "$(pwd)/data:/app/data" \
   --restart unless-stopped \
-  ghcr.io/ibuhub/aistudio-to-api:latest
+  aistudio-to-api:local
 ```
 
-> 💡 **提示：** 如果 `ghcr.io` 访问速度较慢或不可用，可以使用 Docker Hub 镜像：`ibuhub/aistudio-to-api:latest`。
+以上多行命令适用于 Bash；Windows 用户建议使用 Docker Compose。
 
-参数说明：
+### 本地源码运行
 
-- `-p 7860:7860`：API 服务器端口（如果使用反向代理，强烈建议改成 `127.0.0.1:7860`）
-- `-v /path/to/auth:/app/configs/auth`：挂载包含认证文件的目录
-- `-v /path/to/data:/app/data`：挂载统计数据持久化目录（`/app/data/usage-stats.sqlite` 及 WAL 文件）
-- `-e API_KEYS`：用于身份验证的 API 密钥列表（使用逗号分隔）
-- `-e TZ=Asia/Shanghai`：时区设置（可选，默认使用系统时区）
-
-##### 📦 方式 2：Docker Compose
-
-创建 `docker-compose.yml` 文件：
-
-```yaml
-name: aistudio-to-api
-
-services:
-  app:
-    image: ghcr.io/ibuhub/aistudio-to-api:latest
-    container_name: aistudio-to-api
-    ports:
-      # API 服务器端口（如果使用反向代理，强烈建议改成 127.0.0.1:7860）
-      - 7860:7860
-    restart: unless-stopped
-    volumes:
-      # 挂载包含认证文件的目录
-      - ./auth:/app/configs/auth
-      # 挂载统计数据持久化目录
-      - ./data:/app/data
-    environment:
-      # 用于身份验证的 API 密钥列表（使用逗号分隔）
-      API_KEYS: your-api-key-1,your-api-key-2
-      # 时区设置（可选，默认使用系统时区）
-      TZ: Asia/Shanghai
-```
-
-> 💡 **提示：** 如果 `ghcr.io` 访问速度较慢或不可用，可以将 `image` 改为 `ibuhub/aistudio-to-api:latest`。
-
-##### 🛠️ 方式 3：从源码构建
-
-如果您希望自己构建 Docker 镜像，可以使用以下命令：
-
-1. 构建镜像：
-
-   ```bash
-   docker build -t aistudio-to-api .
-   ```
-
-2. 运行容器：
-
-   ```bash
-   docker run -d \
-     --name aistudio-to-api \
-     -p 7860:7860 \
-     -v /path/to/auth:/app/configs/auth \
-     -v /path/to/data:/app/data \
-     -e API_KEYS=your-api-key-1,your-api-key-2 \
-     -e TZ=Asia/Shanghai \
-     --restart unless-stopped \
-     aistudio-to-api
-   ```
-
-#### 🔑 步骤 2：账号管理
-
-控制台账号管理位于独立的 `/accounts` 分页，支持邮箱/密码/验证器自动登录、会话过期后台恢复和凭据导入。部署与运维说明见 [账号自动登录与会话恢复](docs/zh/account-auto-login-operations.md)。
-
-部署后，您需要使用以下方式之一添加 Google 账号：
-
-**方法 1：VNC 登录（推荐）**
-
-- 在浏览器中访问部署的服务地址（例如 `http://your-server:7860`）并点击「添加账号」按钮
-- 将跳转到 VNC 页面，显示浏览器实例
-- 登录您的 Google 账号，登录完成后点击「保存」按钮
-- 账号将自动保存为 `auth-N.json`（N 从 0 开始）
-
-**方法 2：上传认证文件**
-
-- 在本地机器上运行 `npm run setup-auth` 生成认证文件（参考 [直接运行](#-直接运行windows--macos--linux) 的 1 和 2），认证文件在 `/configs/auth`
-- 在网页控制台，点击「上传 Auth」，上传 auth 的 JSON 文件，或手动上传到挂载的 `/path/to/auth` 目录
-
-> 💡 **提示**：您也可以从已有的容器下载 auth 文件，然后上传到新的容器。在网页控制台点击对应账号的「下载 Auth」按钮即可下载 auth 文件。
-
-> ⚠ 目前暂不支持通过环境变量注入认证信息。
-
-#### 🌐 步骤 3（可选）：使用 Nginx 反向代理
-
-如果需要通过域名访问或希望在反向代理层统一管理（例如配置 HTTPS、负载均衡等），可以使用 Nginx。
-
-> 📖 详细的 Nginx 配置说明请参阅：[Nginx 反向代理配置文档](docs/zh/nginx-setup.md)
-
-### 🐾 Claw Cloud Run 部署
-
-> ℹ **Claw Cloud Run 公告：** 自 **2026/05/11 00:00 UTC** 起，Claw Cloud Run 已停止产品及相关服务。详情请参阅官方公告：
-> [公告](https://question.run.claw.cloud/questions/10010000000003261)
-
-> 📖 旧版部署教程请参阅：[部署到 Claw Cloud Run](docs/zh/claw-cloud-run.md)
-
-### 🦓 Zeabur 部署
-
-> ℹ **Zeabur 公告：** 自 **2026/03/15** 起，Zeabur 已停止在 **共享集群** 上创建新项目；**已经运行在共享集群上的服务不会受到影响**。详情请参阅官方变更说明：
-> [公告](https://zeabur.com/zh-CN/changelogs/phasing-out-shared-cluster)
-
-> 📖 旧版部署教程请参阅：[部署到 Zeabur](docs/zh/zeabur.md)
-
-## 📡 使用 API
-
-### 🤖 OpenAI 兼容 API
-
-此端点处理后转发到 Gemini API 格式端点。
-
-- `GET /v1/models`: 列出模型。
-- `POST /v1/chat/completions`: 聊天补全和图片生成，支持非流式、真流式和假流式。
-- `POST /v1/embeddings`: 生成文本嵌入向量。
-- `POST /v1/responses`: OpenAI Responses API 兼容接口，用于对话生成，不支持图像生成，支持非流式、真流式和假流式。
-- `POST /v1/responses/input_tokens`: 计算 OpenAI Responses API 请求的输入 token 数量。
-
-### ♊ Gemini 原生 API 格式
-
-此端点转发到 Gemini API 格式端点。
-
-- `GET /v1beta/models`: 列出可用的 Gemini 模型。
-- `POST /v1beta/models/{model_name}:generateContent`: 生成内容、图片和语音。
-- `POST /v1beta/models/{model_name}:streamGenerateContent`: 流式生成内容、图片和语音，支持真流式和假流式。
-- `POST /v1beta/models/{model_name}:embedContent`: 生成单条文本嵌入向量。
-- `POST /v1beta/models/{model_name}:batchEmbedContents`: 批量生成文本嵌入向量。
-- `POST /v1beta/models/{model_name}:predict`: Imagen 系列模型图像生成。
-
-### 👤 Anthropic 兼容 API
-
-此端点处理后转发到 Gemini API 格式端点。
-
-- `GET /v1/models`: 列出模型。
-- `POST /v1/messages`: 聊天消息补全，支持非流式、真流式和假流式。
-- `POST /v1/messages/count_tokens`: 计算消息中的 token 数量。
-
-> 📖 详细的 API 使用示例请参阅：[API 使用示例文档](docs/zh/api-examples.md)
-
-## 🖥️ 推荐前端：AMC WebUI
-
-[AMC WebUI](https://github.com/yeahhe365/AMC-WebUI) 是一款面向 Gemini 的 Local-First AI 工作流 WebUI，集成多模态聊天、Canvas、文件处理、实时搜索、代码执行与高级推理。它已经支持将 AIStudioToAPI 作为第三方 Gemini 兼容后端使用，可以作为本项目的图形化前端。
-
-在线 Demo：[https://all-model-chat.pages.dev](https://all-model-chat.pages.dev)
-
-使用方式：
-
-- 先部署并启动 AIStudioToAPI，确保 Gemini 原生 API 地址可访问，例如 `http://localhost:7860/v1beta`。
-- 在 AMC WebUI 中进入 **设置 -> API 配置**，启用“自定义 API 配置”，并将 Gemini 兼容 Base URL 填为 AIStudioToAPI 的 `/v1beta` 地址。
-- AMC WebUI 中填写的 API Key 应与 AIStudioToAPI 部署时配置的 `API_KEYS` 对应。
-
-## 模型感知账号池
-
-默认按账号 × 模型独立维护额度和错误状态，支持多个 context/page worker、模型配额、排队和空闲资源借用。管理主页可查看调度状态并手动恢复模型或账号。六 worker 配置、兼容模式、持久化与部署验收见 [模型感知调度说明](docs/zh/model-aware-scheduling.md)。
-
-如需在独立端口匿名公开聚合后的服务额度和请求质量，可启用只读公示页；隔离原则、指标口径和部署方式见 [公益站公开用量看板设计方案](docs/zh/public-dashboard-design.md)。
-
-## 🧰 相关配置
-
-### 🔧 环境变量
-
-#### 📱 应用配置
-
-| 变量名                          | 描述                                                                                                                           | 默认值               |
-| :------------------------------ | :----------------------------------------------------------------------------------------------------------------------------- | :------------------- |
-| `API_KEYS`                      | 用于身份验证的有效 API 密钥列表（使用逗号分隔）。                                                                              | `123456`             |
-| `WEB_CONSOLE_USERNAME`          | 网页控制台登录的用户名（可选）。如果同时设置用户名和密码，登录时需要输入两者。                                                 | 无                   |
-| `WEB_CONSOLE_PASSWORD`          | 网页控制台登录的密码（可选）。如果只设置密码，登录页面仅要求输入密码；如果两者都不设置，系统将使用 `API_KEYS` 进行控制台登录。 | 无                   |
-| `PORT`                          | API 服务器端口。                                                                                                               | `7860`               |
-| `HOST`                          | 服务器监听的主机地址。                                                                                                         | `0.0.0.0`            |
-| `PUBLIC_DASHBOARD_ENABLED`      | 是否启用独立端口上的匿名只读用量公示页。                                                                                       | `false`              |
-| `PUBLIC_DASHBOARD_PORT`         | 公示页 HTTP 端口，不能与 `PORT` 或内部 WebSocket 端口相同。                                                                    | `7861`               |
-| `PUBLIC_DASHBOARD_HOST`         | 公示页监听地址，未设置时继承 `HOST`。                                                                                          | `HOST`               |
-| `PUBLIC_DASHBOARD_CORS_ORIGINS` | 允许跨域读取公示 JSON 的精确 Origin，逗号分隔；留空表示仅同源。                                                                | 无                   |
-| `ICON_URL`                      | 用于自定义控制台的 favicon 图标。支持 ICO, PNG, SVG 等格式。                                                                   | `/AIStudio_logo.svg` |
-| `SECURE_COOKIES`                | 是否启用安全 Cookie。`true` 表示仅支持 HTTPS 协议访问控制台。                                                                  | `false`              |
-| `RATE_LIMIT_MAX_ATTEMPTS`       | 时间窗口内控制台允许的最大失败登录尝试次数（设为 `0` 禁用）。                                                                  | `5`                  |
-| `RATE_LIMIT_WINDOW_MINUTES`     | 速率限制的时间窗口长度（分钟）。                                                                                               | `15`                 |
-| `CHECK_UPDATE`                  | 是否在页面加载时检查版本更新（设为 `false` 禁用）。                                                                            | `true`               |
-| `LOG_LEVEL`                     | 日志输出等级。设为 `DEBUG` 启用详细调试日志。                                                                                  | `INFO`               |
-| `TZ`                            | 日志和显示时间使用的时区，例如 `Asia/Shanghai`。留空时默认使用系统时区。                                                       | 系统时区             |
-
-#### 🌐 代理配置
-
-| 变量名                          | 描述                                                                                                                                                                | 默认值    |
-| :------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :-------- |
-| `INITIAL_AUTH_INDEX`            | 启动时使用的初始身份验证索引。                                                                                                                                      | `0`       |
-| `ENABLE_AUTH_UPDATE`            | 是否启用自动保存凭证更新。默认为启用状态，将在每次登录/切换账号成功时以及每 24 小时自动更新 auth 文件。设为 `false` 禁用。                                          | `true`    |
-| `MAX_RETRIES`                   | 请求失败后的最大重试次数（仅对假流式和非流式生效）。                                                                                                                | `3`       |
-| `RETRY_DELAY`                   | 两次重试之间的间隔（毫秒）。                                                                                                                                        | `2000`    |
-| `STREAM_TIMEOUT_MS`             | 真流式响应相邻数据块之间的超时时间（毫秒），最大 `300000`。                                                                                                         | `60000`   |
-| `FAKE_STREAM_TIMEOUT_MS`        | 假流式/非流式缓冲响应的超时时间（毫秒），最大 `300000`。                                                                                                            | `300000`  |
-| `SWITCH_ON_USES`                | 自动切换帐户前允许的请求次数（设为 `0` 禁用）。                                                                                                                     | `40`      |
-| `FAILURE_THRESHOLD`             | 切换帐户前允许的连续失败次数（设为 `0` 禁用）。                                                                                                                     | `3`       |
-| `IMMEDIATE_SWITCH_STATUS_CODES` | 触发立即切换帐户的 HTTP 状态码（逗号分隔，设为空值以禁用）。                                                                                                        | `429,503` |
-| `MAX_CONTEXTS`                  | 最大同时登录的账号数量。同时登录的账号切换更快，无需重新登录。数值越大内存消耗越高（约：1 个账号 ~700MB，2 个账号 ~950MB，3 个账号 ~1100MB）。设为 `0` 表示无限制。 | `1`       |
-| `HTTP_PROXY`                    | 用于访问 Google 服务的 HTTP 代理地址。                                                                                                                              | 无        |
-| `HTTPS_PROXY`                   | 用于访问 Google 服务的 HTTPS 代理地址。                                                                                                                             | 无        |
-| `NO_PROXY`                      | 不经过代理的地址列表（逗号分隔）。项目已内置自动绕过本地地址（localhost, 127.0.0.1, ::, ::1, 0.0.0.0），通常无需手动配置本地绕过。                                  | 无        |
-
-#### 🗒️ 其他配置
-
-| 变量名                               | 描述                                                                                                        | 默认值                      |
-| :----------------------------------- | :---------------------------------------------------------------------------------------------------------- | :-------------------------- |
-| `STREAMING_MODE`                     | 流式传输模式。`real` 为真流式，`fake` 为假流式。                                                            | `real`                      |
-| `ENABLE_USAGE_STATS`                 | 是否启用请求统计。默认为启用；设为 `false` 后，不读取本地统计、不写入统计，`/api/usage-stats` 返回空数据。  | `true`                      |
-| `USAGE_DB_PATH`                      | SQLite 统计数据库路径；相对路径以进程工作目录解析。                                                         | `./data/usage-stats.sqlite` |
-| `USAGE_LOG_RETENTION_DAYS`           | 请求明细保留天数，`0` 表示永久保留；汇总不会随明细清理。                                                    | `30`                        |
-| `USAGE_LOG_CLEANUP_INTERVAL_MINUTES` | 过期明细自动清理检查间隔（分钟）。                                                                          | `60`                        |
-| `USAGE_LOG_CLEANUP_BATCH_SIZE`       | 每个短事务最多删除的请求条数。                                                                              | `1000`                      |
-| `SAFETY_SETTINGS_THRESHOLD`          | 安全设置的等级。官方说明：[Safety settings](https://ai.google.dev/gemini-api/docs/safety-settings?hl=zh-cn) | `OFF`                       |
-| `FORCE_THINKING`                     | 强制为所有请求启用思考模式。                                                                                | `false`                     |
-| `FORCE_WEB_SEARCH`                   | 强制为所有请求启用网络搜索。                                                                                | `false`                     |
-| `FORCE_CODE_EXECUTION`               | 强制为所有请求启用代码执行。                                                                                | `false`                     |
-| `FORCE_URL_CONTEXT`                  | 强制为所有请求启用 URL 上下文。                                                                             | `false`                     |
-| `CAMOUFOX_EXECUTABLE_PATH`           | Camoufox 浏览器的可执行文件路径（支持绝对或相对路径）。仅在手动下载浏览器时需配置。                         | 自动检测                    |
-
-### ⚡ 账号自动填充
-
-为了简化多个账号的登录流程，您可以通过配置 `users.csv` 文件来实现自动填充：
-
-1. 在项目根目录创建 `users.csv`。
-2. 格式为：`email,password,recovery_email,totp_secret`（每行一个，`recovery_email` 和 `totp_secret` 可选）。
-3. 运行 `npm run setup-auth` 后按提示选择账号。
-
-> 📖 详细配置说明请参阅：[账号自动填充指南](docs/zh/auto-fill-guide.md)
->
-> 💡 **提示**：如果需要无交互执行，可使用 `npm run setup-auth -- --non-interactive --account 1`，或直接传入 `--email` / `--password`。
->
-> 💡 **批量添加**：使用 `npm run setup-auth-batch -- --headless` 可按顺序添加 `users.csv` 中的全部账号。
-
-### 🧠 模型列表配置
-
-编辑 `configs/models.json` 以自定义可用模型及其设置。
-
-> 💡 **提示：** 思考参数预留了通过模型后缀名来设置的功能，支持在模型名后面通过 `-THINKING_LEVEL` 或 `(THINKING_LEVEL)` 来设置（`THINKING_LEVEL` 支持 `high`、`low`、`medium`、`minimal`，不区分大小写）。例如：`gemini-3-flash-preview(minimal)` 或 `gemini-3-flash-preview-minimal`。
->
-> 真假流式也支持通过模型名后缀覆盖，支持追加 `-real` 或 `-fake`。该后缀优先级高于系统的真假流式，但只会在流式请求中生效。例如：`gemini-3-flash-preview-fake`。若和思考后缀同时使用，真假流后缀应放在思考后缀之后，例如：`gemini-3-flash-preview-minimal-fake` 或 `gemini-3-flash-preview(minimal)-real`。
->
-> 联网搜索和代码执行也支持通过模型名后缀强制开启：联网搜索追加 `-search`，代码执行追加 `-code`。例如：`gemini-3-flash-preview-search` 或 `gemini-3-flash-preview-code`。若和其他后缀同时使用，内置工具后缀放在最后；完整组合顺序为“思考 -> 流式 -> 内置工具”，例如：`gemini-3-flash-preview-minimal-search`、`gemini-3-flash-preview-real-code` 或 `gemini-3-flash-preview(minimal)-fake-search-code`。
-
-### 🌐 账号固定代理
-
-在项目根目录创建 `proxylist.txt` 即可启用账号固定代理。每行填写一个 HTTP 代理，支持以下格式：
-
-```text
-user:pass@ip:port
-ip:port:user:pass
-ip:port
-http://user:pass@ip:port
-```
-
-当 `proxylist.txt` 至少包含一个有效代理时，服务会写入 `proxy_mapping.json`，并为每个有效账号分配第一个空闲代理。只要账号仍然存在、代理也仍然保留在 `proxylist.txt` 中，已有绑定就会继续复用。如果账号或代理被移除，对应的旧映射会自动清理。如果有效账号数量多于代理数量，没有分配到代理的账号将无法启动，直到添加更多代理。
-
-`proxy_mapping.json` 会生成在项目根目录，格式是“账号标识 -> 原始代理行”的 JSON 对象，例如：
-
-```json
-{
-  "user@example.com": "user:pass@1.2.3.4:8080",
-  "auth-1": "5.6.7.8:8080"
-}
-```
-
-基于 VNC 的账号绑定也会使用固定代理。新的 VNC 登录会先预留一个空闲代理再打开浏览器，账号保存后会把该代理持久化绑定到检测到的账号。如果已启用账号固定代理但没有空闲代理，VNC 会直接返回错误，而不会回退到服务器直连 IP。
-
-账号固定代理使用与 `HTTP_PROXY` / `HTTPS_PROXY` 相同的绕过规则：默认绕过本地地址，也可以通过 `NO_PROXY` 添加自定义绕过项：
+需要 Node.js **22.13.0 或以上**，建议使用与 Dockerfile 一致的 Node.js 24。完整的自动登录队列依赖 Linux `/proc` 和 POSIX 进程组，建议在 Linux 或 Docker 中运行。
 
 ```bash
-NO_PROXY=internal.example.com,10.0.0.0/8
+git clone https://github.com/Naoya666/AIStudioToAPI.git
+cd AIStudioToAPI
+npm install
+cp .env.example .env
 ```
 
-## 📄 许可证
+编辑 `.env` 设置密钥和控制台密码，然后运行认证设置脚本：
 
-本项目基于 [**ais2api**](https://github.com/Ellinav/ais2api)（作者：[**Ellinav**](https://github.com/Ellinav)）分支开发，并完全沿用上游项目所采用的 CC BY-NC 4.0 许可证，其使用、分发与修改行为均需遵守原有许可证的全部条款，完整许可的内容请参见 [LICENSE](LICENSE) 文件。
+```bash
+npm run setup-auth
+npm start
+```
 
-## 🤝 贡献者
+设置脚本会检查依赖、下载 Camoufox，并引导登录，认证文件保存到 `configs/auth/`。已有 Camoufox 时，可通过 `CAMOUFOX_EXECUTABLE_PATH` 指定程序路径。本地源码运行不提供容器内的 VNC 环境；节点池需要自行安装 Mihomo 并设置 `MIHOMO_PATH`，Docker 镜像已包含该程序。
 
-[![Contributors](https://contrib.rocks/image?repo=iBUHub/AIStudioToAPI)](https://github.com/iBUHub/AIStudioToAPI/graphs/contributors)
+`npm start` 会构建管理界面及公开看板。前端已经构建且源码未变化时，可用 `npm run quick-start` 启动服务。源码运行的数据位于仓库的 `data/`，不是宿主机根目录 `/data`。
 
-感谢所有为本项目付出汗水与智慧的开发者。
+## 添加账号
 
----
+访问控制台的 `/accounts` 页面，可选择：
 
-如果你觉得 AIStudioToAPI 对你有帮助，欢迎给项目点一个 ⭐️！
+- **凭据登录**：保存邮箱、密码及可选 TOTP 验证器密钥，通过后台队列登录；支持 CSV 导入和批量重新登录。
+- **Cookie 导入**：上传已有的认证 JSON，或将认证文件放入挂载的 `configs/auth/` 目录。
+- **VNC 人工登录**：Docker 部署可使用 `/auth` 登录入口，完成人工验证并保存会话。
 
-## Star History
+自动登录不能保证通过 Google 的所有验证；出现验证码或其他人工挑战时，需按控制台提示处理。需要固定出口的账号，可先在节点池保存绑定，再发起登录。
 
-<a href="https://star-history.dera.page/#iBUHub/AIStudioToAPI">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI" />
-   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI" />
- </picture>
-</a>
+账号密码、TOTP 和 Cookie 属于敏感信息；本版本的凭据采用受限本地明文存储。不要提交或分享 `.env`、`configs/auth/`、`data/`、账号导出文件或登录截图。完整说明见 [账号自动登录与会话恢复](docs/zh/account-auto-login-operations.md)。
+
+## 使用 API
+
+| 协议            | Base URL                       | 常用接口                                                                              |
+| --------------- | ------------------------------ | ------------------------------------------------------------------------------------- |
+| OpenAI 兼容     | `http://localhost:7860/v1`     | `/chat/completions`、`/responses`、`/embeddings`、`/models`                           |
+| Gemini 原生格式 | `http://localhost:7860/v1beta` | `/models`、`/models/{model}:generateContent`、`/models/{model}:streamGenerateContent` |
+| Anthropic 兼容  | `http://localhost:7860/v1`     | `/messages`、`/messages/count_tokens`                                                 |
+
+先查询当前模型列表：
+
+```bash
+curl http://localhost:7860/v1/models \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+将下面的 `MODEL_ID` 替换为列表中的模型名：
+
+```bash
+curl http://localhost:7860/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"MODEL_ID","messages":[{"role":"user","content":"你好"}],"stream":false}'
+```
+
+更多协议、流式请求、图片、语音和工具调用示例见 [API 使用示例](docs/zh/api-examples.md)。
+
+## 配置
+
+完整环境变量见 [.env.example](.env.example)。常用配置：
+
+| 配置                                                 | 用途                                                                                    |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `API_KEYS`                                           | 客户端访问密钥，多个值用逗号分隔；未设置时会使用上游默认密钥 `123456`，部署时应显式设置 |
+| `WEB_CONSOLE_USERNAME` / `WEB_CONSOLE_PASSWORD`      | 控制台登录；均未设置时回退到 API 密钥鉴权                                               |
+| `PORT` / `HOST`                                      | 服务监听端口与地址，默认 `7860` / `0.0.0.0`                                             |
+| `TZ`                                                 | 日志和显示时区                                                                          |
+| `SECURE_COOKIES`                                     | HTTPS 部署时可设为 `true`                                                               |
+| `CHECK_UPDATE`                                       | 继承自上游的版本检查，本地构建部署保持 `false`                                          |
+| `PUBLIC_DASHBOARD_ENABLED` / `PUBLIC_DASHBOARD_PORT` | 启用独立匿名看板及其端口，默认关闭 / `7861`                                             |
+| `CAMOUFOX_EXECUTABLE_PATH` / `MIHOMO_PATH`           | 本地源码运行时的浏览器和代理程序路径                                                    |
+
+控制台已保存的管理配置优先于对应环境值。修改 `.env` 后，如对应设置已在控制台保存，需要在控制台修改或恢复环境值；Compose 环境配置变更需要重新创建容器。管理配置存于 `data/managed-config.json`。
+
+模型并发、排队和冷却参数见 [模型感知调度说明](docs/zh/model-aware-scheduling.md)。每日调度冷却重置使用固定的 `America/Los_Angeles` 时区，不随 `TZ` 改变。
+
+### 可选公开看板
+
+在 `.env` 中启用：
+
+```dotenv
+PUBLIC_DASHBOARD_ENABLED=true
+PUBLIC_DASHBOARD_PORT=7861
+```
+
+在 Compose 的 `ports` 中增加：
+
+```yaml
+- "127.0.0.1:7861:7861"
+```
+
+执行 `docker compose up -d` 重新创建容器，通过 `http://localhost:7861` 访问。此端口提供匿名聚合数据；管理端仍使用 `7860`。部署说明和指标定义见 [公开用量看板说明](docs/zh/public-dashboard-design.md)。
+
+## 更新与维护
+
+### Docker Compose
+
+```bash
+git pull --ff-only
+docker compose up -d --build
+docker compose logs --tail=100 app
+```
+
+每次更新都重新构建本仓库源码，无需 `docker compose pull`。更新前备份 `.env`、`configs/auth/` 和 `data/`，备份数据库时先停止服务。
+
+```bash
+docker compose stop
+# 将 .env、configs/auth/ 和 data/ 复制到安全的备份位置
+docker compose up -d
+```
+
+停止并移除容器可用 `docker compose down`，宿主机绑定目录仍保留。不要删除这些目录；多个实例不能共享同一套账号、数据库和调度状态。
+
+### 本地源码
+
+```bash
+git pull --ff-only
+npm install
+npm start
+```
+
+如使用 `docker run`，更新时重新执行 `docker build`，停止并移除旧容器，再按原启动命令创建新容器，继续挂载原数据目录。
+
+## 开发与文档
+
+```bash
+npm run dev
+npm test
+npm run lint
+npm run build:ui
+```
+
+自动化测试不替代真实 Google 账号登录和上游请求验收。仓库的 Docker 工作流仅提供手动构建检查，不发布镜像，也不需要上游的仓库凭据。
+
+- [API 示例](docs/zh/api-examples.md)
+- [账号登录与恢复](docs/zh/account-auto-login-operations.md)
+- [模型调度](docs/zh/model-aware-scheduling.md)
+- [Nginx 反向代理](docs/zh/nginx-setup.md)
+- [公开用量看板](docs/zh/public-dashboard-design.md)
+
+## 来源、致谢与许可证
+
+本项目基于 [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) 二次开发；该上游项目基于 [ais2api](https://github.com/Ellinav/ais2api)（作者：[Ellinav](https://github.com/Ellinav)）分支开发。感谢原作者、上游维护者及贡献者；源码中的既有作者署名予以保留。
+
+本版本沿用上游 **CC BY-NC 4.0（署名－非商业性使用 4.0 国际）** 许可证。使用、分发与修改均需遵守原有许可证全部条款，完整内容见 [LICENSE](LICENSE) 与 [许可说明](https://creativecommons.org/licenses/by-nc/4.0/)。本仓库已说明二次开发及主要修改，不代表上游作者对本版本的背书。
+
+Docker 中包含的 Node.js、Camoufox、Mihomo 等第三方组件遵循各自许可证。Mihomo 的许可证及源码链接保存在镜像 `/usr/share/licenses/mihomo/` 中。
