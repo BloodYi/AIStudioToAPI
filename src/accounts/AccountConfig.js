@@ -11,20 +11,17 @@ const definitions = {
     screenshotTimeout: ["ACCOUNT_LOGIN_SCREENSHOT_TIMEOUT_MS", 5000, 30000],
     stepTimeout: ["ACCOUNT_LOGIN_STEP_TIMEOUT_MS", 30000, 300000],
 };
-function config() {
+function config(env = process.env) {
     const result = {};
     for (const [key, [name, fallback, maximum]] of Object.entries(definitions)) {
-        const value = process.env[name] === undefined ? fallback : Number(process.env[name]);
+        const value = env[name] === undefined ? fallback : Number(env[name]);
         if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) throw new Error(`Invalid ${name}`);
         result[key] = value;
     }
-    result.autoRecovery = process.env.ACCOUNT_AUTO_RELOGIN_ENABLED !== "false";
-    if (
-        process.env.ACCOUNT_LOGIN_HUMANIZE !== undefined &&
-        !["true", "false"].includes(process.env.ACCOUNT_LOGIN_HUMANIZE)
-    )
+    result.autoRecovery = env.ACCOUNT_AUTO_RELOGIN_ENABLED !== "false";
+    if (env.ACCOUNT_LOGIN_HUMANIZE !== undefined && !["true", "false"].includes(env.ACCOUNT_LOGIN_HUMANIZE))
         throw new Error("Invalid ACCOUNT_LOGIN_HUMANIZE");
-    result.humanize = process.env.ACCOUNT_LOGIN_HUMANIZE !== "false";
+    result.humanize = env.ACCOUNT_LOGIN_HUMANIZE !== "false";
     result.paused = false;
     return result;
 }

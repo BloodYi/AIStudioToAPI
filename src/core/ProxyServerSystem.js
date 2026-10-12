@@ -21,7 +21,7 @@ const BrowserManager = require("./BrowserManager");
 const ConnectionRegistry = require("./ConnectionRegistry");
 const RequestHandler = require("./RequestHandler");
 const UsageStatsService = require("./UsageStatsService");
-const ConfigLoader = require("../utils/ConfigLoader");
+const { ConfigurationService } = require("../config/ConfigurationService");
 const WebRoutes = require("../routes/WebRoutes");
 const PublicDashboardServer = require("../public/PublicDashboardServer");
 const ProxyPoolService = require("../proxy/ProxyPoolService");
@@ -36,8 +36,7 @@ class ProxyServerSystem extends EventEmitter {
         super();
         this.logger = new LoggingService("AIStudioToAPI");
 
-        const configLoader = new ConfigLoader(this.logger);
-        this.config = configLoader.loadConfiguration();
+        this.configurationService = new ConfigurationService(this);
 
         this.authSource = new AuthSource(this.logger);
         this.browserManager = new BrowserManager(this.logger, this.config, this.authSource);
@@ -171,6 +170,7 @@ class ProxyServerSystem extends EventEmitter {
 
         if (allAvailableIndices.length === 0) {
             this.logger.warn("[System] No available authentication source. Starting in account binding mode.");
+            this.ready = true;
             this.emit("started");
             return; // Exit early
         }
@@ -180,6 +180,7 @@ class ProxyServerSystem extends EventEmitter {
                 `[Scheduler] Model-aware ready-context pool enabled (${this.config.scheduler.maxWorkers} max, ${this.config.scheduler.contextPoolMinReady} warm).`
             );
             this.browserManager.startContextPool();
+            this.ready = true;
             this.emit("started");
             return;
         }
@@ -221,6 +222,7 @@ class ProxyServerSystem extends EventEmitter {
 
             if (firstReady === null) {
                 this.logger.error("[System] Failed to initialize any context!");
+                this.ready = true;
                 this.emit("started");
                 return;
             }
@@ -234,6 +236,7 @@ class ProxyServerSystem extends EventEmitter {
             this.requestHandler.authSwitcher.isSystemBusy = false;
         }
 
+        this.ready = true;
         this.emit("started");
     }
 
@@ -400,6 +403,8 @@ class ProxyServerSystem extends EventEmitter {
     _createExpressApp() {
         const app = express();
 
+        this.activeBusinessRequests = 0;
+
         // Request logging
         app.use((req, res, next) => {
             if (
@@ -521,6 +526,20 @@ class ProxyServerSystem extends EventEmitter {
 
         // API authentication middleware
         app.use(this._createAuthMiddleware());
+        app.use((req, res, next) => {
+            if (this.restarting) return res.status(503).json({ error: "Service restarting" });
+            this.activeBusinessRequests++;
+            let finished = false;
+            const release = () => {
+                if (!finished) {
+                    finished = true;
+                    this.activeBusinessRequests--;
+                }
+            };
+            res.once("finish", release);
+            res.once("close", release);
+            return this.requestHandler.withConfigurationSnapshot(next);
+        });
 
         // API routes
         app.get(["/v1/models"], (req, res) => {

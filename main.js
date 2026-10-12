@@ -8,7 +8,10 @@
 // Load environment variables based on NODE_ENV
 const path = require("path");
 const envFile = process.env.NODE_ENV === "production" ? ".env" : ".env.development";
-require("dotenv").config({ path: path.resolve(__dirname, envFile) });
+// The supervisor must keep only the original shell environment. Each child reloads
+// the environment file so file-only changes also take effect on a managed restart.
+if (require.main !== module || (process.env.AISTUDIO_SERVICE_CHILD === "1" && process.send))
+    require("dotenv").config({ path: path.resolve(__dirname, envFile) });
 
 const ProxyServerSystem = require("./src/core/ProxyServerSystem");
 
@@ -20,33 +23,58 @@ const initializeServer = async () => {
     const initialAuthIndex =
         Number.isInteger(parsedInitialAuthIndex) && parsedInitialAuthIndex >= 0 ? parsedInitialAuthIndex : null;
 
+    let serverSystem;
     try {
-        const serverSystem = new ProxyServerSystem();
+        serverSystem = new ProxyServerSystem();
         await serverSystem.start(initialAuthIndex);
 
-        // Handle graceful shutdown
+        let shuttingDown = false;
         const shutdownHandler = async signal => {
+            if (shuttingDown) return;
+            shuttingDown = true;
+            serverSystem.restarting = true;
             console.log(`\n${signal} received, shutting down gracefully...`);
+            const forceExit = setTimeout(() => process.exit(1), 40000);
             try {
+                const deadline = Date.now() + 15000;
+                while (serverSystem.activeBusinessRequests > 0 && Date.now() < deadline)
+                    await new Promise(resolve => setTimeout(resolve, 100));
                 await serverSystem.shutdown();
+                clearTimeout(forceExit);
                 process.exit(0);
             } catch (error) {
                 console.error("Error during shutdown:", error);
                 process.exit(1);
             }
         };
-
         process.on("SIGTERM", () => shutdownHandler("SIGTERM"));
         process.on("SIGINT", () => shutdownHandler("SIGINT"));
+        process.on("message", message => {
+            if (message?.type === "shutdown") shutdownHandler("restart");
+        });
+        const startupDeadline = Date.now() + 240000;
+        while (!shuttingDown && !serverSystem.configurationService.operational() && Date.now() < startupDeadline)
+            await new Promise(resolve => setTimeout(resolve, 250));
+        if (shuttingDown) return;
+        if (!serverSystem.configurationService.operational())
+            throw new Error("Service contexts did not become healthy within startup deadline");
+        process.send?.({ configuration: serverSystem.configurationService.runningDocument(), type: "ready" });
     } catch (error) {
         console.error("❌ Server startup failed:", error.message);
+        process.send?.({ error: error.message, type: "startup-error" });
+        if (serverSystem)
+            await Promise.race([
+                serverSystem.shutdown().catch(() => {}),
+                new Promise(resolve => setTimeout(resolve, 20000)),
+            ]);
         process.exit(1);
     }
 };
 
 // If this file is run directly, start the server
 if (require.main === module) {
-    initializeServer();
+    if (process.env.AISTUDIO_SERVICE_CHILD === "1" && process.send) initializeServer();
+    else require("./src/config/ServiceSupervisor").supervise(__filename);
 }
 
 module.exports = { initializeServer, ProxyServerSystem };

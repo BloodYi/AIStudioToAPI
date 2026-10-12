@@ -13,6 +13,7 @@ const AuthRoutes = require("./AuthRoutes");
 const StatusRoutes = require("./StatusRoutes");
 const ProxyPoolRoutes = require("./ProxyPoolRoutes");
 const AccountRoutes = require("./AccountRoutes");
+const ConfigurationRoutes = require("../config/ConfigurationRoutes");
 
 /**
  * Web Routes Manager
@@ -32,6 +33,7 @@ class WebRoutes {
         this.statusRoutes = new StatusRoutes(serverSystem);
         this.proxyPoolRoutes = new ProxyPoolRoutes(serverSystem);
         this.accountRoutes = new AccountRoutes(serverSystem);
+        this.configurationRoutes = new ConfigurationRoutes(serverSystem);
     }
 
     /**
@@ -39,7 +41,7 @@ class WebRoutes {
      */
     setupSession(app) {
         // Generate a secure random session secret
-        const sessionSecret = crypto.randomBytes(32).toString("hex");
+        const sessionSecret = process.env.AISTUDIO_SESSION_SECRET || crypto.randomBytes(32).toString("hex");
 
         // Trust first proxy (Nginx) for secure cookies and IP forwarding
         app.set("trust proxy", 1);
@@ -59,12 +61,14 @@ class WebRoutes {
             resave: false,
             saveUninitialized: false,
             secret: sessionSecret,
+            store: new (require("../config/RestartSessionStore"))(),
         });
         app.use(this.sessionParser);
 
         // Setup all route handlers
         this.authRoutes.setupRoutes(app);
         this.accountRoutes.setupRoutes(app, this.authRoutes.isAuthenticated.bind(this.authRoutes));
+        this.configurationRoutes.setupRoutes(app, this.authRoutes.isAuthenticated.bind(this.authRoutes));
         this.statusRoutes.setupRoutes(app, this.authRoutes.isAuthenticated.bind(this.authRoutes));
         this.proxyPoolRoutes.setupRoutes(app, this.authRoutes.isAuthenticated.bind(this.authRoutes));
     }

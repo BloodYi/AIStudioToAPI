@@ -41,7 +41,9 @@ class AccountLoginService {
         return result;
     }
     async initialize({ startQueue = true } = {}) {
-        const initialConfig = config();
+        const initialConfig = this.system.configurationService
+            ? { ...this.system.configurationService.running.login }
+            : config();
         this.state = (await this.store.call("load")) || {
             accounts: [],
             artifacts: [],
@@ -56,6 +58,7 @@ class AccountLoginService {
             concurrency: this.state.config.concurrency,
             paused: this.state.config.paused,
         };
+        this.system?.configurationService?.initializeAccounts(this.state);
         for (const account of this.state.accounts) account.recoveryEmail ??= null;
         await this.artifacts.initialize();
         await fs.mkdir(this.authDir, { mode: 0o700, recursive: true });
@@ -129,7 +132,12 @@ class AccountLoginService {
     }
     async save() {
         try {
-            return await this.store.call("save", this.state);
+            return await this.store.call(
+                "save",
+                this.system.configurationService
+                    ? { ...this.state, config: { paused: this.state.config.paused } }
+                    : this.state
+            );
         } catch (cause) {
             this.storageFailed = true;
             this.queue.stopped = true;

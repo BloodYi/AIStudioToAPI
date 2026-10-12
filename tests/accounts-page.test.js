@@ -613,7 +613,7 @@ test(
         assert.equal(await bindings.getByRole("button", { exact: true, name: "保存选中绑定" }).isEnabled(), true);
         await bindings.locator(".mobile-item").getByRole("button", { exact: true, name: "保存绑定" }).click();
         await bindings.locator(".mobile-item").getByRole("button", { exact: true, name: "应用" }).click();
-        await pool.getByRole("button", { exact: true, name: "保存测试设置" }).click();
+        await pool.getByRole("button", { exact: true, name: "保存节点池设置" }).click();
         await nodes.locator(".mobile-item .el-checkbox").click();
         await nodes.getByRole("button", { exact: true, name: "删除选中" }).click();
         await page.locator(".el-message-box__btns button").last().click();
@@ -776,6 +776,9 @@ test(
         await selectAll.click();
         await page.getByText("Selection temporarily unavailable", { exact: true }).waitFor();
         assert.match(await toolbar.innerText(), new RegExp(`Selected ${expected.length}`));
+        // Let the expected error notification close before hovering controls beneath it;
+        // hovering the floating message pauses its close timer.
+        await page.getByText("Selection temporarily unavailable", { exact: true }).waitFor({ state: "hidden" });
         failSelection = false;
         delaySelection = true;
         await Promise.all([

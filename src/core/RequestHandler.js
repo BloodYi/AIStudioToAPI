@@ -30,19 +30,30 @@ class RequestHandler {
         this.logger = logger;
         this.browserManager = browserManager;
         this.config = config;
+        this.requestConfiguration = new (require("async_hooks").AsyncLocalStorage)();
         this.authSource = authSource;
 
         // Initialize sub-modules
         this.authSwitcher = new AuthSwitcher(logger, config, authSource, browserManager);
-        this.formatConverter = new FormatConverter(logger, serverSystem);
+        this.formatConverter = new FormatConverter(logger, serverSystem, () => this.config);
 
         this.needsSwitchingAfterRequest = false;
+    }
 
-        // Timeout settings
-        this.timeouts = {
+    get config() {
+        return this.requestConfiguration?.getStore() || this._config;
+    }
+    set config(value) {
+        this._config = value;
+    }
+    get timeouts() {
+        return {
             FAKE_STREAM: this.config.fakeStreamTimeoutMs || DEFAULT_TIMEOUTS.FAKE_STREAM,
             STREAM_CHUNK: this.config.streamTimeoutMs || DEFAULT_TIMEOUTS.STREAM_CHUNK,
         };
+    }
+    withConfigurationSnapshot(next) {
+        return this.requestConfiguration.run({ ...this.config, scheduler: { ...this.config.scheduler } }, next);
     }
 
     // Delegate properties to AuthSwitcher

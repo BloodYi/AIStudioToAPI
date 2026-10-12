@@ -11,11 +11,12 @@ class ScheduledRequestHandler extends RequestHandler {
             parent.connectionRegistry,
             parent.logger,
             parent.browserManager,
-            parent.config,
+            { ...parent.config, scheduler: { ...parent.config.scheduler } },
             parent.authSource
         );
         this.scheduled = true;
         this.scheduler = parent.serverSystem.scheduler;
+        this.acceptedSchedulerConfig = { ...this.scheduler.config };
         this.excluded = new Set();
         this.controller = new AbortController();
         this.response = res;
@@ -149,7 +150,7 @@ class ScheduledRequestHandler extends RequestHandler {
     }
 
     async selectNext() {
-        while (this.excluded.size <= this.scheduler.config.maxRetries) {
+        while (this.excluded.size <= this.acceptedSchedulerConfig.maxRetries) {
             const excluded = new Set(this.excluded);
             if (this.affinity) {
                 for (const index of this.authSource.getRotationIndices()) {
@@ -177,7 +178,7 @@ class ScheduledRequestHandler extends RequestHandler {
                 this.scheduler.failure(this.lease, error);
                 this.scheduler.release(this.lease);
                 this.lease = null;
-                if (this.controller.signal.aborted || this.excluded.size > this.scheduler.config.maxRetries)
+                if (this.controller.signal.aborted || this.excluded.size > this.acceptedSchedulerConfig.maxRetries)
                     throw error;
             }
         }
@@ -197,7 +198,7 @@ class ScheduledRequestHandler extends RequestHandler {
             !this._shouldRetryError(error) ||
             this.controller.signal.aborted ||
             this.response.__modelOutputStarted ||
-            this.excluded.size > this.scheduler.config.maxRetries
+            this.excluded.size > this.acceptedSchedulerConfig.maxRetries
         )
             return false;
         this.scheduler.release(this.lease);
@@ -300,7 +301,7 @@ class ScheduledRequestHandler extends RequestHandler {
         if (
             this.controller.signal.aborted ||
             this.response.__modelOutputStarted ||
-            this.excluded.size > this.scheduler.config.maxRetries
+            this.excluded.size > this.acceptedSchedulerConfig.maxRetries
         )
             throw error;
         const failedAuthIndex = this.currentAuthIndex;
@@ -332,7 +333,7 @@ class ScheduledRequestHandler extends RequestHandler {
         const requestedStream =
             this.incomingRequest?.body?.stream === true ||
             String(this.incomingRequest?.path || proxyRequest.path).includes("streamGenerateContent");
-        if (!requestedStream || !this.scheduler.config.streamEarlyHeaders || this.response.headersSent) return;
+        if (!requestedStream || !this.acceptedSchedulerConfig.streamEarlyHeaders || this.response.headersSent) return;
         this.response.status(200).set({
             "Cache-Control": "no-cache",
             Connection: "keep-alive",
@@ -349,7 +350,7 @@ class ScheduledRequestHandler extends RequestHandler {
             }
             this.response.write(": keep-alive\n\n");
         };
-        this._earlyStreamKeepalive = setInterval(sendKeepalive, this.scheduler.config.streamKeepaliveIntervalMs);
+        this._earlyStreamKeepalive = setInterval(sendKeepalive, this.acceptedSchedulerConfig.streamKeepaliveIntervalMs);
         this._earlyStreamKeepalive.unref?.();
     }
 

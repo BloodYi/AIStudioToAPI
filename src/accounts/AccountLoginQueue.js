@@ -301,6 +301,7 @@ class AccountLoginQueue {
     snapshot() {
         return {
             ...this.service.state.config,
+            configurationVersion: this.service.system.configurationService?.document.version,
             executions: [...this.running.values()].map(slot => {
                 const task = this.service.state.tasks.find(item => item.taskId === slot.taskId);
                 return {

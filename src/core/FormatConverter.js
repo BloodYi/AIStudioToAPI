@@ -168,13 +168,14 @@ class FormatConverter {
         return { cleanModelName: modelName, thinkingLevel: null };
     }
 
-    constructor(logger, serverSystem) {
+    constructor(logger, serverSystem, configProvider = () => serverSystem.config) {
         this.logger = logger;
         this.serverSystem = serverSystem;
+        this.configProvider = configProvider;
     }
 
     getDefaultSafetySettings() {
-        const threshold = this.serverSystem.config.safetySettingsThreshold || "OFF";
+        const threshold = this.configProvider().safetySettingsThreshold || "OFF";
         return [
             { category: "HARM_CATEGORY_HARASSMENT", threshold },
             { category: "HARM_CATEGORY_HATE_SPEECH", threshold },
@@ -871,10 +872,7 @@ class FormatConverter {
         }
 
         // Force thinking mode (only set includeThoughts=true when missing)
-        if (
-            this.serverSystem.config.forceThinking &&
-            (!thinkingConfig || thinkingConfig.includeThoughts === undefined)
-        ) {
+        if (this.configProvider().forceThinking && (!thinkingConfig || thinkingConfig.includeThoughts === undefined)) {
             this.logger.info("[Adapter] ⚠️ Force thinking enabled, setting includeThoughts=true for OpenAI request.");
             thinkingConfig = { ...(thinkingConfig || {}), includeThoughts: true };
         }
@@ -1053,9 +1051,9 @@ class FormatConverter {
      * @private
      */
     _finalizeGoogleRequest(googleRequest, options = {}) {
-        const forceCodeExecution = options.forceCodeExecution || this.serverSystem.config.forceCodeExecution;
-        const forceWebSearch = options.forceWebSearch || this.serverSystem.config.forceWebSearch;
-        const forceUrlContext = options.forceUrlContext || this.serverSystem.config.forceUrlContext;
+        const forceCodeExecution = options.forceCodeExecution || this.configProvider().forceCodeExecution;
+        const forceWebSearch = options.forceWebSearch || this.configProvider().forceWebSearch;
+        const forceUrlContext = options.forceUrlContext || this.configProvider().forceUrlContext;
 
         // Force built-in tools
         if (forceWebSearch || forceUrlContext || forceCodeExecution) {
@@ -2464,10 +2462,7 @@ class FormatConverter {
         }
 
         // Force thinking mode (only set includeThoughts=true when missing)
-        if (
-            this.serverSystem.config.forceThinking &&
-            (!thinkingConfig || thinkingConfig.includeThoughts === undefined)
-        ) {
+        if (this.configProvider().forceThinking && (!thinkingConfig || thinkingConfig.includeThoughts === undefined)) {
             this.logger.info("[Adapter] ⚠️ Force thinking enabled, setting includeThoughts=true for Claude request.");
             thinkingConfig = { ...(thinkingConfig || {}), includeThoughts: true };
         }
@@ -3314,10 +3309,7 @@ class FormatConverter {
         }
 
         // Force thinking mode (only set includeThoughts=true when missing)
-        if (
-            this.serverSystem.config.forceThinking &&
-            (!thinkingConfig || thinkingConfig.includeThoughts === undefined)
-        ) {
+        if (this.configProvider().forceThinking && (!thinkingConfig || thinkingConfig.includeThoughts === undefined)) {
             this.logger.info(
                 "[Adapter] ⚠️ Force thinking enabled, setting includeThoughts=true for OpenAI Response API request."
             );

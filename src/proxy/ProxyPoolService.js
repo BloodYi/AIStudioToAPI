@@ -56,6 +56,10 @@ class ProxyPoolService {
             binaryPath: binaryPath ? "(configured)" : "",
             exitIpUrl: snapshot.automation.exitIpUrl,
             healthTimeoutMs: snapshot.automation.healthTimeoutMs,
+            revision: crypto
+                .createHash("sha256")
+                .update(JSON.stringify([snapshot.settings, snapshot.automation]))
+                .digest("hex"),
             testUrl: snapshot.automation.testUrl,
         };
     }
@@ -139,21 +143,36 @@ class ProxyPoolService {
 
     async _commit(next) {
         const previous = this.store.snapshot();
-        if (next.settings.enabled) {
+        const wasRunning = this.manager.status.running;
+        try {
+            if (next.settings.enabled) await this.manager.reload(next);
+            else if (wasRunning) await this.manager.stop();
+            await this.store.replace(next);
+        } catch (error) {
             try {
-                await this.manager.reload(next);
-            } catch (error) {
-                if (previous.settings.enabled && this.manager.status.running)
-                    await this.manager.reload(previous).catch(() => {});
-                throw error;
+                if (wasRunning) await this.manager.reload(previous);
+                else if (this.manager.status.running) await this.manager.stop();
+            } catch (rollbackError) {
+                throw Object.assign(new Error(`节点池保存或应用失败，Mihomo 恢复未完成：${rollbackError.message}`), {
+                    status: 500,
+                });
             }
+            throw error;
         }
-        await this.store.replace(next);
-        if (!next.settings.enabled && this.manager.status.running) await this.manager.stop();
         return next;
     }
 
-    async updateSettings(input) {
+    updateSettings(input) {
+        const operation = (this.settingsQueue || Promise.resolve())
+            .catch(() => {})
+            .then(() => this._updateSettings(input));
+        this.settingsQueue = operation;
+        return operation;
+    }
+
+    async _updateSettings(input) {
+        if (input.revision !== undefined && input.revision !== this.settings().revision)
+            throw Object.assign(new Error("节点池设置已被其他页面修改，请刷新并处理草稿差异"), { status: 409 });
         const next = this.store.snapshot();
         for (const key of ["enabled", "binaryPath", "basePort", "controllerPort"])
             if (

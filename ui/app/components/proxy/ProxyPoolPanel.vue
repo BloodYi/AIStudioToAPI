@@ -20,9 +20,12 @@
             </div>
             <el-alert v-if="status.mihomo?.lastError" :title="status.mihomo.lastError" type="error" :closable="false" />
             <div class="actions">
-                <el-switch v-model="settings.enabled" active-text="启用节点池" @change="saveSettings(true)" />
+                <el-switch v-model="settings.enabled" active-text="启用节点池" />
                 <el-input-number v-model="settings.basePort" :min="1024" :max="65535" controls-position="right" />
                 <span>起始端口</span>
+                <el-input-number v-model="settings.controllerPort" :min="1024" :max="65535" />
+                <span>控制端口</span>
+                <el-input v-model="settings.binaryPath" placeholder="Mihomo 程序路径（留空使用环境配置）" />
                 <el-button @click="mihomo('start')">启动</el-button>
                 <el-button @click="mihomo('stop')">停止</el-button>
                 <el-button @click="mihomo('reload')">重载</el-button>
@@ -43,8 +46,17 @@
                     controls-position="right"
                 />
                 <span>超时毫秒</span>
-                <el-button @click="saveSettings(false)">保存测试设置</el-button>
+                <el-button :disabled="settingsConflict" @click="saveSettings">保存节点池设置</el-button>
             </div>
+            <p v-if="settingsDirty">节点池设置尚未保存，保存后会应用必要的 Mihomo 重载。</p>
+            <p v-if="settingsConflict">配置已被其他页面修改，请放弃草稿并刷新后处理差异。</p>
+            <el-button
+                @click="
+                    savedSettings = null;
+                    loadAll();
+                "
+                >放弃设置草稿 / 刷新</el-button
+            >
         </section>
 
         <section class="pool-card">
@@ -402,12 +414,18 @@ const nodeTable = ref(null),
 const status = reactive({ mihomo: {} });
 const settings = reactive({
     basePort: 10801,
+    binaryPath: "",
     controllerPort: 19090,
     enabled: false,
     exitIpUrl: "",
     healthTimeoutMs: 5000,
     testUrl: "https://www.google.com/generate_204",
 });
+const savedSettings = ref(null);
+const settingsConflict = ref(false);
+const settingsDirty = computed(
+    () => savedSettings.value && Object.keys(settings).some(key => settings[key] !== savedSettings.value[key])
+);
 const nodes = ref([]);
 const bindings = ref([]);
 const subscriptions = ref([]);
@@ -479,7 +497,11 @@ const loadAll = async () => {
             request("/api/proxy-pool/subscriptions"),
         ]);
         Object.assign(status, s);
-        Object.assign(settings, cfg);
+        if (!settingsDirty.value) {
+            Object.assign(settings, cfg);
+            savedSettings.value = { ...cfg };
+            settingsConflict.value = false;
+        } else if (savedSettings.value.revision !== cfg.revision) settingsConflict.value = true;
         nodes.value = n.nodes;
         bindings.value = b.bindings;
         subscriptions.value = sub.subscriptions;
@@ -487,12 +509,22 @@ const loadAll = async () => {
         ElMessage.error(error.message);
     }
 };
-const saveSettings = async (fromToggle = false) => {
+const saveSettings = async () => {
     try {
-        await request("/api/proxy-pool/settings", { body: JSON.stringify(settings), method: "PUT" });
+        const changes = Object.fromEntries(
+            Object.keys(settings)
+                .filter(key => !savedSettings.value || settings[key] !== savedSettings.value[key])
+                .map(key => [key, settings[key]])
+        );
+        const saved = await request("/api/proxy-pool/settings", {
+            body: JSON.stringify({ ...changes, revision: savedSettings.value?.revision }),
+            method: "PUT",
+        });
+        Object.assign(settings, saved);
+        savedSettings.value = { ...saved };
         await loadAll();
+        ElMessage.success("节点池设置已保存并应用，必要时已重载 Mihomo。");
     } catch (error) {
-        if (fromToggle) settings.enabled = !settings.enabled;
         ElMessage.error(error.message);
     }
 };

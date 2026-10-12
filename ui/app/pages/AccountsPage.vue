@@ -34,11 +34,7 @@
                 >
                     <label class="queue-toggle"
                         >{{ l("全局自动登录", "Automatic login") }}
-                        <ElSwitch
-                            :model-value="queue.autoRecovery === true"
-                            :disabled="busy"
-                            @change="value => configure({ autoRecovery: value })"
-                        />
+                        <ElSwitch v-model="autoRecoveryDraft" :disabled="busy" />
                     </label>
                 </ElTooltip>
                 <span
@@ -47,13 +43,30 @@
                     {{ queue.faultSlots || 0 }} {{ l("故障槽", "fault slots") }}</span
                 >
                 <ElInputNumber v-model="concurrency" :min="1" :max="32" size="small" />
-                <ElButton size="small" @click="configure({ concurrency })">{{
-                    l("设置并发", "Set concurrency")
+                <ElButton size="small" @click="saveQueueConfiguration">{{
+                    l("保存登录配置", "Save login settings")
                 }}</ElButton>
+                <ElButton size="small" @click="discardQueueDraft">{{
+                    l("放弃草稿 / 刷新", "Discard draft / refresh")
+                }}</ElButton>
+                <span v-if="queueConfigConflict">{{
+                    l("配置有并发修改，请处理草稿差异", "Settings changed elsewhere")
+                }}</span>
                 <ElButton size="small" @click="configure({ paused: !queue.paused })">{{
                     queue.paused ? l("恢复队列", "Resume queue") : l("暂停队列", "Pause queue")
                 }}</ElButton>
             </div>
+            <p
+                v-if="
+                    queueConfigBase &&
+                    (autoRecoveryDraft !== queueConfigBase.autoRecovery || concurrency !== queueConfigBase.concurrency)
+                "
+            >
+                {{ l("登录配置草稿尚未保存；当前生效自动登录：", "Unsaved login draft; active automatic login: ") }}
+                {{ queue.autoRecovery ? l("开启", "on") : l("关闭", "off") }}；{{
+                    l("当前并发：", "active concurrency: ")
+                }}{{ queue.concurrency }}
+            </p>
             <small
                 >{{ queue.source }} · {{ l("单次超时", "Attempt timeout") }} {{ queue.attemptTimeout / 1000 }}s</small
             >
@@ -746,6 +759,9 @@ const accounts = ref([]),
     filter = ref(""),
     selected = ref([]),
     queue = ref({}),
+    autoRecoveryDraft = ref(true),
+    queueConfigBase = ref(null),
+    queueConfigConflict = ref(false),
     concurrency = ref(1),
     now = ref(Date.now());
 const editVisible = ref(false),
@@ -924,7 +940,18 @@ async function refresh() {
                 status.executions?.some(execution => execution.accountId === id)
         );
         queue.value = status;
-        if (!polling) concurrency.value = status.concurrency;
+        const base = queueConfigBase.value;
+        const dirty = base && (autoRecoveryDraft.value !== base.autoRecovery || concurrency.value !== base.concurrency);
+        if (!dirty) {
+            concurrency.value = status.concurrency;
+            autoRecoveryDraft.value = status.autoRecovery;
+            queueConfigBase.value = {
+                autoRecovery: status.autoRecovery,
+                concurrency: status.concurrency,
+                version: status.configurationVersion,
+            };
+            queueConfigConflict.value = false;
+        } else if (base.version !== status.configurationVersion) queueConfigConflict.value = true;
     });
 }
 watch([search, filter, pageSize, page], (values, previous) => {
@@ -936,10 +963,28 @@ watch([search, filter, pageSize, page], (values, previous) => {
     refresh();
 });
 defineExpose({ refresh });
+async function saveQueueConfiguration() {
+    if (queueConfigConflict.value)
+        return ElMessage.error(
+            l(
+                "配置已被其他页面修改，请刷新并处理草稿差异",
+                "Settings changed elsewhere; refresh and resolve your draft"
+            )
+        );
+    const values = { version: queueConfigBase.value?.version };
+    if (autoRecoveryDraft.value !== queueConfigBase.value?.autoRecovery) values.autoRecovery = autoRecoveryDraft.value;
+    if (concurrency.value !== queueConfigBase.value?.concurrency) values.concurrency = concurrency.value;
+    if (Object.keys(values).length > 1) await configure(values);
+}
+async function discardQueueDraft() {
+    queueConfigBase.value = null;
+    await refresh();
+}
 async function configure(values) {
     busy.value = true;
     await action(async () => {
         queue.value = await api("/login-queue", "PATCH", values);
+        if (values.version !== undefined) queueConfigBase.value = null;
         await refresh();
     });
     busy.value = false;

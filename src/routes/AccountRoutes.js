@@ -114,11 +114,15 @@ class AccountRoutes {
                 throw Object.assign(new Error("paused must be boolean"), { status: 400 });
             if (autoRecovery !== undefined && typeof autoRecovery !== "boolean")
                 throw Object.assign(new Error("autoRecovery must be boolean"), { status: 400 });
-            if (autoRecovery !== undefined) service.state.config.autoRecovery = autoRecovery;
-            if (concurrency !== undefined) service.state.config.concurrency = concurrency;
+            if (autoRecovery !== undefined || concurrency !== undefined) {
+                const manager = this.system.configurationService;
+                if (!manager) throw Object.assign(new Error("统一配置服务未就绪"), { status: 503 });
+                const changes = {};
+                if (autoRecovery !== undefined) changes.ACCOUNT_AUTO_RELOGIN_ENABLED = autoRecovery;
+                if (concurrency !== undefined) changes.ACCOUNT_LOGIN_CONCURRENCY = concurrency;
+                manager.save({ changes, version: req.body.version });
+            }
             if (paused !== undefined) service.state.config.paused = paused;
-            service.state.configSource =
-                "console (autoRecovery / concurrency / paused); environment/default (other limits)";
             await service.save();
             return service.queue.snapshot();
         });

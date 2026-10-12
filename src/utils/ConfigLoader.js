@@ -18,7 +18,7 @@ class ConfigLoader {
         this.logger = logger;
     }
 
-    loadConfiguration() {
+    loadConfiguration(env = process.env) {
         const config = {
             apiKeys: [],
             apiKeySource: "Not set",
@@ -57,26 +57,26 @@ class ConfigLoader {
             wsPort: 9998,
         };
 
-        config.scheduler = require("../core/SchedulerConfig")();
+        config.scheduler = require("../core/SchedulerConfig")(env);
 
         // Environment variable overrides
-        if (process.env.PORT) {
-            const parsed = parseInt(process.env.PORT, 10);
+        if (env.PORT) {
+            const parsed = parseInt(env.PORT, 10);
             config.httpPort = Number.isFinite(parsed) ? parsed : config.httpPort;
         }
-        if (process.env.HOST) config.host = process.env.HOST;
-        config.publicDashboard.host = process.env.PUBLIC_DASHBOARD_HOST || config.host;
-        config.publicDashboard.enabled = process.env.PUBLIC_DASHBOARD_ENABLED?.toLowerCase() === "true";
-        if (process.env.PUBLIC_DASHBOARD_PORT !== undefined) {
-            const rawPort = String(process.env.PUBLIC_DASHBOARD_PORT).trim();
+        if (env.HOST) config.host = env.HOST;
+        config.publicDashboard.host = env.PUBLIC_DASHBOARD_HOST || config.host;
+        config.publicDashboard.enabled = env.PUBLIC_DASHBOARD_ENABLED?.toLowerCase() === "true";
+        if (env.PUBLIC_DASHBOARD_PORT !== undefined) {
+            const rawPort = String(env.PUBLIC_DASHBOARD_PORT).trim();
             const parsed = Number(rawPort);
             if (!/^\d+$/.test(rawPort) || !Number.isSafeInteger(parsed) || parsed < 1 || parsed > 65535) {
                 throw new Error("Invalid PUBLIC_DASHBOARD_PORT: expected an integer between 1 and 65535");
             }
             config.publicDashboard.port = parsed;
         }
-        if (process.env.PUBLIC_DASHBOARD_CORS_ORIGINS) {
-            config.publicDashboard.corsOrigins = process.env.PUBLIC_DASHBOARD_CORS_ORIGINS.split(",").map(value => {
+        if (env.PUBLIC_DASHBOARD_CORS_ORIGINS) {
+            config.publicDashboard.corsOrigins = env.PUBLIC_DASHBOARD_CORS_ORIGINS.split(",").map(value => {
                 const origin = value.trim();
                 let parsed;
                 try {
@@ -95,36 +95,36 @@ class ConfigLoader {
                 return origin;
             });
         }
-        if (process.env.STREAMING_MODE) config.streamingMode = process.env.STREAMING_MODE;
-        if (process.env.FAILURE_THRESHOLD) {
-            const parsed = parseInt(process.env.FAILURE_THRESHOLD, 10);
+        if (env.STREAMING_MODE) config.streamingMode = env.STREAMING_MODE;
+        if (env.FAILURE_THRESHOLD) {
+            const parsed = parseInt(env.FAILURE_THRESHOLD, 10);
             config.failureThreshold = Number.isFinite(parsed) ? Math.max(0, parsed) : config.failureThreshold;
         }
-        if (process.env.SWITCH_ON_USES) {
-            const parsed = parseInt(process.env.SWITCH_ON_USES, 10);
+        if (env.SWITCH_ON_USES) {
+            const parsed = parseInt(env.SWITCH_ON_USES, 10);
             config.switchOnUses = Number.isFinite(parsed) ? Math.max(0, parsed) : config.switchOnUses;
         }
-        if (process.env.MAX_RETRIES) {
-            const parsed = parseInt(process.env.MAX_RETRIES, 10);
+        if (env.MAX_RETRIES) {
+            const parsed = parseInt(env.MAX_RETRIES, 10);
             config.maxRetries = Number.isFinite(parsed) ? Math.max(1, parsed) : config.maxRetries;
         }
-        if (process.env.RETRY_DELAY) {
-            const parsed = parseInt(process.env.RETRY_DELAY, 10);
+        if (env.RETRY_DELAY) {
+            const parsed = parseInt(env.RETRY_DELAY, 10);
             config.retryDelay = Number.isFinite(parsed) ? Math.max(50, parsed) : config.retryDelay;
         }
-        if (process.env.STREAM_TIMEOUT_MS) {
-            const parsed = parseInt(process.env.STREAM_TIMEOUT_MS, 10);
+        if (env.STREAM_TIMEOUT_MS) {
+            const parsed = parseInt(env.STREAM_TIMEOUT_MS, 10);
             config.streamTimeoutMs = Number.isFinite(parsed)
                 ? Math.min(300000, Math.max(1, parsed))
                 : config.streamTimeoutMs;
         }
-        if (process.env.FAKE_STREAM_TIMEOUT_MS) {
-            const parsed = parseInt(process.env.FAKE_STREAM_TIMEOUT_MS, 10);
+        if (env.FAKE_STREAM_TIMEOUT_MS) {
+            const parsed = parseInt(env.FAKE_STREAM_TIMEOUT_MS, 10);
             config.fakeStreamTimeoutMs = Number.isFinite(parsed)
                 ? Math.min(300000, Math.max(1, parsed))
                 : config.fakeStreamTimeoutMs;
         }
-        if (process.env.WS_PORT) {
+        if (env.WS_PORT) {
             // WS_PORT environment variable is no longer supported
             this.logger.error(
                 `[Config] ❌ WS_PORT environment variable is deprecated and no longer supported. ` +
@@ -132,23 +132,21 @@ class ConfigLoader {
             );
             // Do not modify config.wsPort - keep it at default 9998
         }
-        if (process.env.MAX_CONTEXTS) {
-            const parsed = parseInt(process.env.MAX_CONTEXTS, 10);
+        if (env.MAX_CONTEXTS) {
+            const parsed = parseInt(env.MAX_CONTEXTS, 10);
             config.maxContexts = Number.isFinite(parsed) ? Math.max(0, parsed) : config.maxContexts;
         }
-        if (process.env.CAMOUFOX_EXECUTABLE_PATH) config.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
-        if (process.env.API_KEYS) {
-            config.apiKeys = process.env.API_KEYS.split(",");
+        if (env.CAMOUFOX_EXECUTABLE_PATH) config.browserExecutablePath = env.CAMOUFOX_EXECUTABLE_PATH;
+        if (env.API_KEYS) {
+            config.apiKeys = env.API_KEYS.split(",");
         }
-        if (process.env.CHECK_UPDATE) config.checkUpdate = process.env.CHECK_UPDATE.toLowerCase() !== "false";
-        if (process.env.FORCE_THINKING) config.forceThinking = process.env.FORCE_THINKING.toLowerCase() === "true";
-        if (process.env.FORCE_CODE_EXECUTION)
-            config.forceCodeExecution = process.env.FORCE_CODE_EXECUTION.toLowerCase() === "true";
-        if (process.env.FORCE_WEB_SEARCH) config.forceWebSearch = process.env.FORCE_WEB_SEARCH.toLowerCase() === "true";
-        if (process.env.FORCE_URL_CONTEXT)
-            config.forceUrlContext = process.env.FORCE_URL_CONTEXT.toLowerCase() === "true";
-        if (process.env.SAFETY_SETTINGS_THRESHOLD) {
-            const rawThreshold = String(process.env.SAFETY_SETTINGS_THRESHOLD).trim().toUpperCase();
+        if (env.CHECK_UPDATE) config.checkUpdate = env.CHECK_UPDATE.toLowerCase() !== "false";
+        if (env.FORCE_THINKING) config.forceThinking = env.FORCE_THINKING.toLowerCase() === "true";
+        if (env.FORCE_CODE_EXECUTION) config.forceCodeExecution = env.FORCE_CODE_EXECUTION.toLowerCase() === "true";
+        if (env.FORCE_WEB_SEARCH) config.forceWebSearch = env.FORCE_WEB_SEARCH.toLowerCase() === "true";
+        if (env.FORCE_URL_CONTEXT) config.forceUrlContext = env.FORCE_URL_CONTEXT.toLowerCase() === "true";
+        if (env.SAFETY_SETTINGS_THRESHOLD) {
+            const rawThreshold = String(env.SAFETY_SETTINGS_THRESHOLD).trim().toUpperCase();
             const allowedThresholds = new Set([
                 "HARM_BLOCK_THRESHOLD_UNSPECIFIED",
                 "BLOCK_LOW_AND_ABOVE",
@@ -161,17 +159,15 @@ class ConfigLoader {
                 config.safetySettingsThreshold = rawThreshold;
             } else {
                 this.logger.warn(
-                    `[Config] Invalid SAFETY_SETTINGS_THRESHOLD "${process.env.SAFETY_SETTINGS_THRESHOLD}", falling back to ${config.safetySettingsThreshold}.`
+                    `[Config] Invalid SAFETY_SETTINGS_THRESHOLD "${env.SAFETY_SETTINGS_THRESHOLD}", falling back to ${config.safetySettingsThreshold}.`
                 );
             }
         }
-        if (process.env.ENABLE_AUTH_UPDATE)
-            config.enableAuthUpdate = process.env.ENABLE_AUTH_UPDATE.toLowerCase() !== "false";
-        if (process.env.ENABLE_USAGE_STATS)
-            config.enableUsageStats = process.env.ENABLE_USAGE_STATS.toLowerCase() !== "false";
+        if (env.ENABLE_AUTH_UPDATE) config.enableAuthUpdate = env.ENABLE_AUTH_UPDATE.toLowerCase() !== "false";
+        if (env.ENABLE_USAGE_STATS) config.enableUsageStats = env.ENABLE_USAGE_STATS.toLowerCase() !== "false";
         const strictInteger = (name, defaultValue, { allowZero = false, max = Number.MAX_SAFE_INTEGER } = {}) => {
-            if (process.env[name] === undefined) return defaultValue;
-            const raw = String(process.env[name]).trim();
+            if (env[name] === undefined) return defaultValue;
+            const raw = String(env[name]).trim();
             const value = Number(raw);
             if (
                 !/^\d+$/.test(raw) ||
@@ -191,8 +187,8 @@ class ConfigLoader {
             max: Math.floor(2147483647 / 60000),
         });
         config.usageStorage.cleanupBatchSize = strictInteger("USAGE_LOG_CLEANUP_BATCH_SIZE", 1000);
-        if (process.env.USAGE_DB_PATH !== undefined) {
-            const rawPath = String(process.env.USAGE_DB_PATH).trim();
+        if (env.USAGE_DB_PATH !== undefined) {
+            const rawPath = String(env.USAGE_DB_PATH).trim();
             if (!rawPath) throw new Error("Invalid USAGE_DB_PATH: expected a non-empty path");
             config.usageStorage.dbPath = path.resolve(process.cwd(), rawPath);
         }
@@ -201,7 +197,7 @@ class ConfigLoader {
             throw new Error("PUBLIC_DASHBOARD_PORT must differ from PORT and the internal WebSocket port");
         }
 
-        let rawCodes = process.env.IMMEDIATE_SWITCH_STATUS_CODES;
+        let rawCodes = env.IMMEDIATE_SWITCH_STATUS_CODES;
         let codesSource = "environment variable";
 
         if (
