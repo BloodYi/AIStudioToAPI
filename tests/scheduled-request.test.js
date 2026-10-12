@@ -1122,6 +1122,7 @@ test("anti early account retry creates a new transport and preserves one stream 
     assert.equal(res.body.includes("最终😀回答"), true);
     assert.equal(res.body.match(/\[DONE\]/g).length, 1);
     assert.equal(res.body.includes(names[0]), false);
+    assert.equal(res.body.includes('"error"'), false);
 });
 
 test("anti real handles fragmented SSE and errors after parameters without replay or DONE", async t => {
@@ -1142,7 +1143,7 @@ test("anti real handles fragmented SSE and errors after parameters without repla
         assert.equal(res.body.includes("最终😀回答"), true);
         assert.equal(res.body.includes("[DONE]"), !fail);
         assert.equal(res.body.includes('"error"'), fail);
-        assert.equal(res.body.includes("upstream private"), false);
+        assert.equal(res.body.includes("upstream private"), fail);
     }
 });
 
@@ -1163,6 +1164,12 @@ test("anti decoder and incomplete EOF failures are explicit with no success DONE
             assert.equal(res.body.includes('"error"'), true);
             assert.equal(res.body.includes("[DONE]"), false);
             assert.equal(fixture.sent.length, 1);
+            const returnedError = errorPayload(res);
+            assert.equal(
+                returnedError.code,
+                malformed === "finish" ? "anti_truncation_incomplete_stream" : "anti_truncation_decode_failed"
+            );
+            assert.equal(res.body.includes("agw_emit_"), false);
         }
     }
 });
@@ -1317,4 +1324,129 @@ test("anti real delivery waits for drain and cleans up temporary backpressure li
     assert.equal(res.body.includes("最终😀回答"), true);
     assert.equal(res.listenerCount("drain"), 0);
     assert.equal(res.listenerCount("error"), 0);
+});
+
+function errorPayload(res) {
+    if (res.body.trimStart().startsWith("{")) return JSON.parse(res.body).error;
+    return res.body
+        .split("\n")
+        .filter(line => line.startsWith("data: {"))
+        .map(line => JSON.parse(line.slice(6)))
+        .find(event => event.error)?.error;
+}
+
+test("anti preserves upstream error fields across stream modes and runtimes", async t => {
+    const message = '配额不足 "model"\n请稍后重试';
+    for (const legacy of [false, true]) {
+        for (const mode of [null, "early", "fake", "real"]) {
+            for (const embedded of [false, true]) {
+                const fields = { code: "RESOURCE_EXHAUSTED", message, type: "quota_error" };
+                const fixture = setup(
+                    () =>
+                        embedded
+                            ? [
+                                  success[0],
+                                  {
+                                      data:
+                                          mode === "real"
+                                              ? `data: ${JSON.stringify({ error: fields })}\n\n`
+                                              : JSON.stringify({ error: fields }),
+                                      event_type: "chunk",
+                                  },
+                                  success[2],
+                              ]
+                            : [{ event_type: "error", message, status: 429, upstreamError: fields }],
+                    {
+                        maxRetries: 1,
+                        scheduler: { maxRetries: 0, streamEarlyHeaders: false },
+                    }
+                );
+                t.after(() => fixture.scheduler.close());
+                if (legacy) {
+                    useLegacy(fixture);
+                    fixture.handler._ensureBrowserBackedRequestReady = async () => true;
+                    fixture.handler.authSwitcher.handleRequestFailureAndSwitch = async () => {};
+                }
+                const res = new Response();
+                let flushed = 0;
+                res.flush = () => flushed++;
+                await fixture.handler.processOpenAIRequest(
+                    request(`anti-gemini-2.5-flash${mode ? `-${mode}` : ""}`, Boolean(mode)),
+                    res
+                );
+                assert.deepEqual(errorPayload(res), fields, `${legacy}/${mode}/${embedded}: ${res.body}`);
+                if (!legacy && !embedded) {
+                    assert.equal(
+                        fixture.scheduler.account(fixture.sent[0].index).models["gemini-2.5-flash"].last_http_status,
+                        429
+                    );
+                }
+                assert.equal(res.statusCode, mode === "early" ? 200 : embedded ? 502 : 429);
+                assert.equal(res.body.includes("[DONE]"), false);
+                assert.equal(res.writableEnded, true);
+                if (res.statusCode === 200) assert.ok(flushed > 0);
+                assert.equal(fixture.registry.messageQueues.size, 0);
+            }
+        }
+    }
+});
+
+test("anti early reports numeric upstream codes and keeps statistics status independent", async t => {
+    for (const status of [403, 429, 500]) {
+        const fixture = setup(
+            () => [{ event_type: "error", status, upstreamError: { code: status, message: `upstream ${status}` } }],
+            { scheduler: { maxRetries: 0 } }
+        );
+        t.after(() => fixture.scheduler.close());
+        const res = new Response();
+        await fixture.handler.processOpenAIRequest(request("anti-gemini-2.5-flash-early", true), res);
+        assert.equal(res.statusCode, 200);
+        assert.equal(errorPayload(res).code, status);
+        assert.equal(errorPayload(res).message, `upstream ${status}`);
+        assert.equal(res.body.includes("[DONE]"), false);
+    }
+});
+
+test("retry acquisition failure returns the terminal local error rather than upstream quota", async t => {
+    const fixture = setup(() => [
+        { event_type: "error", message: "quota", status: 429, upstreamError: { code: "QUOTA", message: "quota" } },
+    ]);
+    t.after(() => fixture.scheduler.close());
+    const acquire = fixture.scheduler.acquire.bind(fixture.scheduler);
+    let count = 0;
+    fixture.scheduler.acquire = (...args) =>
+        ++count === 1
+            ? acquire(...args)
+            : Promise.reject(Object.assign(new Error("Account queue deadline exceeded"), { status: 504 }));
+    const res = new Response();
+    await fixture.handler.processOpenAIRequest(request("anti-gemini-2.5-flash-early", true), res);
+    assert.equal(errorPayload(res).code, 504);
+    assert.equal(errorPayload(res).message, "Account queue deadline exceeded");
+    assert.equal(res.body.includes("[DONE]"), false);
+});
+
+test("anti early fills missing or invalid upstream fields without overriding valid messages", async t => {
+    for (const [input, expected] of [
+        [
+            { error: {}, event_type: "error", status: 200 },
+            { code: 502, message: "Upstream generation failed" },
+        ],
+        [
+            { event_type: "error", status: 429, upstreamError: { code: {}, message: [], type: 1 } },
+            { code: 429, message: "Upstream generation failed" },
+        ],
+        [
+            { event_type: "error", upstreamError: { code: 429, message: "quota" } },
+            { code: 429, message: "quota" },
+        ],
+    ]) {
+        const fixture = setup(() => [input], { scheduler: { maxRetries: 0 } });
+        t.after(() => fixture.scheduler.close());
+        const res = new Response();
+        await fixture.handler.processOpenAIRequest(request("anti-gemini-2.5-flash-early", true), res);
+        assert.equal(errorPayload(res).code, expected.code);
+        assert.equal(errorPayload(res).message, expected.message);
+        assert.equal(errorPayload(res).type, "api_error");
+        assert.equal(res.body.includes("[DONE]"), false);
+    }
 });

@@ -66,7 +66,9 @@
 - stream_options.include_usage 为 true 时统一在成功终结前交付一次 usage-only 事件，包含独立或混合到达的上游 usage。业务用量采集仍由既有 UsageStatsService 处理，注入开销按实际上游统计，不根据还原字符数重估。
 - early 空包不设置真实输出状态，不影响重试。收到函数名称、参数、文本等真实上游增量后禁止换账号重生成。尚未解析完的非空网络片段保守视为上游开始，避免错误重放；完整空事件、注释和 usage-only 不作为正文。只有 empty heartbeat 不影响业务 token、工具或 choice。
 - 状态分别使用 headersSent / __streamStartSent / __upstreamOutputStarted / __modelOutputStarted / writableEnded，Attempt 保管还原状态。账号选择、取消、超时、错误处理及 usage 沿用原生命周期，没有独立 HTTP 或重试循环。
-- 首包前本地准入错误为 HTTP 非 200；首包后错误走原 SSE error 终结，保留状态信息，flush 后结束，不补成功 DONE。协议失败使用安全信息；私有工具名及完整正文不写入新增日志或转换器调试日志。
+- 首包前本地准入错误为 HTTP 非 200；首包后错误走原 SSE error 终结，保留状态信息，flush 后结束，不补成功 DONE。上游业务错误保留原始 code、message 及有效 type，不增加代理前缀；业务错误码与 HTTP 状态独立保存。缺失字段使用明确回退值。本地解码/协议错误返回具体内部错误码和安全信息，在错误产生位置避免包含私有工具名、参数和完整正文；这些内容不写入新增日志或转换器调试日志。
+
+错误字段、early 流内错误及验收约定见 [错误透传方案](anti-truncation-error-passthrough-plan.md)。
 
 该机制可能改善普通正文通道截断和有限格式问题，不能突破 token 上限、恢复丢失内容或绕过安全拒绝。默认不开启，多一层工具 JSON 与控制消息会增加真实 token 成本。不要叠加独立网关的 synthetic 包装。
 

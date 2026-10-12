@@ -272,10 +272,28 @@ class RequestProcessor {
 
                 if (!response.ok) {
                     const errorBody = await response.text();
-                    const error = new Error(
-                        `Google API returned error: ${response.status} ${response.statusText} ${errorBody}`
-                    );
+                    let fields;
+                    try {
+                        fields = JSON.parse(errorBody)?.error;
+                    } catch {
+                        // Non-JSON error pages are not a structured upstream error.
+                    }
+                    const message =
+                        typeof fields?.message === "string" && fields.message.trim()
+                            ? fields.message
+                            : `Upstream request failed (HTTP ${response.status})`;
+                    const error = new Error(message);
                     error.status = response.status;
+                    error.upstreamError = {
+                        code:
+                            (typeof fields?.code === "string" && fields.code.trim()) ||
+                            (typeof fields?.code === "number" && Number.isFinite(fields.code))
+                                ? fields.code
+                                : response.status,
+                        message,
+                        status: typeof fields?.status === "string" ? fields.status : null,
+                        type: typeof fields?.type === "string" && fields.type.trim() ? fields.type : null,
+                    };
                     throw error;
                 }
                 // Clear timeout when fetch succeeds to prevent timer leak
@@ -982,12 +1000,13 @@ class ProxySystem extends EventTarget {
             cooldown: status === 429 || status >= 500,
             event_type: "error",
             kind,
-            message: `Proxy browser error: ${error.message || "Unknown error"}`,
+            message: error.message || "Unknown error",
             reason: kind === "transport" ? "connection_lost" : kind,
             request_attempt_id: requestAttemptId,
             request_id: operationId,
             retryable: status === 429 || status >= 500 || kind === "transport",
             status: error.status || 503,
+            upstreamError: error.upstreamError,
         });
         // --- Core modification: Use different log wording based on error type ---
         if (error.name === "AbortError") {

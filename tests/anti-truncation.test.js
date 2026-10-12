@@ -171,7 +171,10 @@ test("transport assembler handles every JSON/Unicode/escape boundary, mixed usag
         code: "anti_truncation_incomplete_stream",
     });
     assert.throws(() => new Attempt("synthetic").restore({ error: { code: 429, message: "private" } }), {
+        code: "upstream_error",
+        message: "private",
         status: 429,
+        upstreamError: { code: 429, message: "private", type: null },
     });
 });
 
@@ -197,4 +200,95 @@ test("upstream safety block remains a safety finish and batch DONE does not dupl
     assert.equal(responses.length, 1);
     attempt.stream(responses[0], converter, model, {});
     attempt.assertComplete();
+});
+
+test("upstream error normalization preserves business codes and uses bounded HTTP statuses", () => {
+    const { normalizeError, upstreamError } = require("../src/utils/UpstreamError");
+    for (const code of [429, "429", "RESOURCE_EXHAUSTED"]) {
+        const fields = { code, message: '错误 "文本"\n下一行', type: "quota_error" };
+        const error = upstreamError(fields, 403);
+        assert.equal(error.code, "upstream_error");
+        assert.deepEqual(normalizeError(error), { code, message: fields.message, status: 403, type: fields.type });
+    }
+    assert.deepEqual(normalizeError(upstreamError({ code: "QUOTA" })), {
+        code: "QUOTA",
+        message: "Upstream generation failed",
+        status: 502,
+        type: null,
+    });
+    for (const code of [null, {}, [], NaN, Infinity]) {
+        assert.deepEqual(normalizeError(upstreamError({ code, message: {}, type: 5 }, 200)), {
+            code: 502,
+            message: "Upstream generation failed",
+            status: 502,
+            type: null,
+        });
+    }
+    assert.equal(normalizeError(upstreamError({ code: 429 })).status, 429);
+    assert.equal(
+        normalizeError({
+            code: "anti_truncation_incomplete_stream",
+            message: "Upstream ended before a finish event",
+            status: 502,
+        }).code,
+        "anti_truncation_incomplete_stream"
+    );
+});
+
+test("browser HTTP failures retain structured upstream fields without proxy prefixes", async () => {
+    const fs = require("node:fs");
+    const vm = require("node:vm");
+    const source = fs.readFileSync(require.resolve("../scripts/client/build.js"), "utf8");
+    let body;
+    const context = vm.createContext({
+        AbortController,
+        clearTimeout,
+        EventTarget,
+        fetch: async () => ({ ok: false, status: 429, statusText: "Too Many Requests", text: async () => body }),
+        performance,
+        setTimeout,
+    });
+    vm.runInContext(
+        source.replace(/initializeProxySystem\(\);\s*$/, "") +
+            "\nLogger.enabled = false; globalThis.processor = new RequestProcessor(); globalThis.ProxySystemClass = ProxySystem;",
+        context
+    );
+    context.processor._constructUrl = () => "https://example.invalid";
+    context.processor._buildRequestConfig = () => ({});
+    const message = '配额不足 "model"\n稍后重试';
+    for (const fields of [
+        { code: "RESOURCE_EXHAUSTED", message, status: "RESOURCE_EXHAUSTED", type: "quota_error" },
+        { code: 429, message },
+        { code: {}, message: {}, type: [] },
+        null,
+    ]) {
+        body = fields ? JSON.stringify({ error: fields }) : "<html>private error page</html>";
+        const execution = context.processor.execute({ request_attempt_id: "attempt" }, "test");
+        let captured;
+        await assert.rejects(execution.responsePromise, error => {
+            context.ProxySystemClass.prototype._sendErrorResponse.call(
+                {
+                    connectionManager: {
+                        transmit(value) {
+                            captured = JSON.parse(JSON.stringify(value));
+                        },
+                    },
+                },
+                error,
+                "test",
+                "attempt"
+            );
+            return true;
+        });
+        execution.cancelTimeout();
+        assert.equal(captured.status, 429);
+        assert.equal(
+            captured.message,
+            fields && typeof fields.message === "string" ? message : "Upstream request failed (HTTP 429)"
+        );
+        assert.equal(captured.upstreamError.code, fields && typeof fields.code !== "object" ? fields.code : 429);
+        assert.equal(captured.retryable, true);
+        assert.equal(captured.cooldown, true);
+        assert.equal(captured.message.includes("private error page"), false);
+    }
 });

@@ -1273,3 +1273,25 @@ test("persisted cooldown rebuilds a single wake timer on restart and clears it a
     assert.equal(cleared.at(-1), timers[1]);
     fs.rmSync(directory, { recursive: true });
 });
+
+test("structured upstream UNAUTHENTICATED preserves session expiry and late-session guards", async t => {
+    for (const replace of [false, true]) {
+        const scheduler = setup({}, 1);
+        t.after(() => scheduler.close());
+        const session = { authIndex: 0, sessionVersion: 7 };
+        scheduler.authSource.accountLoginService = { state: { accounts: [session] } };
+        const calls = [];
+        scheduler.authSource.markAsExpired = async (...args) => calls.push(args);
+        const lease = await scheduler.acquire("flash");
+        scheduler.startAttempt(lease);
+        if (replace) session.sessionVersion++;
+        await scheduler.failure(lease, {
+            message: "Credentials expired",
+            status: 401,
+            upstreamError: { code: 401, message: "Credentials expired", status: "UNAUTHENTICATED" },
+        });
+        assert.deepEqual(calls, replace ? [] : [[0, 7]]);
+        assert.equal(lease.account.healthy, replace);
+        scheduler.release(lease);
+    }
+});

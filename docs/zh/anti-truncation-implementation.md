@@ -46,3 +46,17 @@
 - 搜索/代码执行/URL context 的真实模型能力矩阵；目前这些组合主动拒绝显式 anti 或跳过 prefer。
 
 配置、请求格式、限制及上线步骤见 [使用说明](anti-truncation.md)。
+
+## 错误透传修改（2026-10-12）
+
+已按 [错误透传方案](anti-truncation-error-passthrough-plan.md) 修改运行代码，尚未部署。
+
+- 浏览器读取 HTTP 失败响应时提取结构化上游错误，通过队列保留 code、message 和有效 type；不再将完整响应体拼进带代理前缀的 message。非 JSON 错误页面及无效字段使用明确回退信息。
+- anti 还原器保留 HTTP 200 正文内嵌错误的业务字段。HTTP 状态与业务错误码分别保存，字符串业务码保持原始类型；内部分类仍使用独立的 `upstream_error`。
+- JSON 与 SSE 错误出口复用归一化规则，取消按 anti 请求统一覆盖 message 的行为。覆盖 legacy、模型感知调度以及非流式、fake、early、real；early 已发出的 HTTP 200 保持不变，最终错误通过 SSE 返回并 flush、结束，不发送成功 DONE。
+- 本地 anti 解码、协议和超限错误返回具体内部错误码；缓冲 JSON 解析失败在产生位置使用安全信息，避免 SyntaxError 携带正文片段。重试账号选择失败返回实际终止错误。
+- 浏览器错误结构变化后，调度器通过结构化 Google `UNAUTHENTICATED` 状态保留会话过期处理和旧会话响应保护，同时兼容原有错误格式。
+
+验证结果：`npm test` 全部测试命令通过，可选真实浏览器用例按现有条件跳过；`npm run lint` 通过。最后补充缺失/无效字段、统计状态和本地协议错误码断言后，`node tests/scheduled-request.test.js` 再次通过（53/53），相关文件 ESLint 检查通过。浏览器入口通过 VM 执行真实客户端代码、模拟 fetch 验证，真实本地 HTTP 测试通过；这些结果不代表真实 Gemini 或公网下游已经验收。
+
+本次只修改代码、测试和文档，没有构建部署镜像、重启服务或更改运行容器。真实 Gemini、NewAPI、SillyTavern 的错误显示、识别及渠道处理仍属于上文的外部验收事项。

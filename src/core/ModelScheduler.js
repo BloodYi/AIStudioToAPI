@@ -598,7 +598,8 @@ class ModelScheduler {
         }
         const upstreamAuthExpired =
             kind === "account" &&
-            /Google API returned error:\s*401\s+UNAUTHENTICATED\b/i.test(String(error.message || ""));
+            ((Number(error.status) === 401 && error.upstreamError?.status === "UNAUTHENTICATED") ||
+                /Google API returned error:\s*401\s+UNAUTHENTICATED\b/i.test(String(error.message || "")));
         const currentSession = this.authSource.accountLoginService?.state?.accounts.find(
             account => account.authIndex === lease.account.index
         );

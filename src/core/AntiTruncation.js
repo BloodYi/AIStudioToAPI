@@ -5,6 +5,7 @@
  */
 const { randomBytes } = require("node:crypto");
 const FormatConverter = require("./FormatConverter");
+const { upstreamError } = require("../utils/UpstreamError");
 const MAX_BYTES = 10 * 1024 * 1024;
 const TEXT_MODELS = Object.freeze([
     "gemini-2.5-flash",
@@ -136,6 +137,14 @@ function decode(args) {
     return { content: value.content, repaired };
 }
 
+function parseResponse(raw) {
+    try {
+        return JSON.parse(raw);
+    } catch {
+        throw error("anti_truncation_decode_failed", "Invalid upstream JSON response", 502);
+    }
+}
+
 class Attempt {
     constructor(name, log = () => {}, sideBufferBytes = 0) {
         this.name = name;
@@ -196,8 +205,7 @@ class Attempt {
         return responses;
     }
     restore(response, buffered = false) {
-        if (response?.error)
-            throw error("upstream_error", "Upstream generation failed", Number(response.error.code) || 502);
+        if (response?.error) throw upstreamError(response.error);
         if (!response || typeof response !== "object")
             throw error("anti_truncation_decode_failed", "Invalid upstream response", 502);
         this.responseBytes += Buffer.byteLength(JSON.stringify(response));
@@ -332,4 +340,4 @@ class Attempt {
         return `data: ${JSON.stringify({ choices: [], created: shared.created, id: shared.id, model: shared.model, object: "chat.completion.chunk", usage: this.usage })}\n\n`;
     }
 }
-module.exports = { Attempt, decode, identity, inject, MAX_BYTES, resolve, TEXT_MODELS };
+module.exports = { Attempt, decode, identity, inject, MAX_BYTES, parseResponse, resolve, TEXT_MODELS };

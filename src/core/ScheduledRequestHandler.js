@@ -256,7 +256,7 @@ class ScheduledRequestHandler extends RequestHandler {
             return true;
         } catch (selectionError) {
             this.logger.info(`[Scheduler] Retry stopped: ${selectionError.message}`);
-            return false;
+            throw selectionError;
         }
     }
 
@@ -272,7 +272,13 @@ class ScheduledRequestHandler extends RequestHandler {
             this._forwardRequest(proxyRequest, authIndex);
             return await this._readInitialMessage(queue);
         } catch (error) {
-            return { event_type: "error", message: error.message, reason: error.reason, status: 503 };
+            return {
+                ...error,
+                event_type: "error",
+                message: error.message,
+                reason: error.reason,
+                status: error.status || 503,
+            };
         }
     }
 
@@ -283,10 +289,16 @@ class ScheduledRequestHandler extends RequestHandler {
             return message;
         } catch (error) {
             return {
+                ...error,
                 event_type: "error",
                 message: error.message,
                 reason: error.reason,
-                status: error.reason === "client_disconnect" ? 499 : 503,
+                status:
+                    error.reason === "client_disconnect"
+                        ? 499
+                        : error.code === "QUEUE_TIMEOUT"
+                          ? 504
+                          : error.status || 503,
             };
         }
     }
@@ -310,7 +322,7 @@ class ScheduledRequestHandler extends RequestHandler {
                 if (result.event_type === "timeout")
                     result = { ...result, message: "Browser request timed out", status: 504 };
             } catch (error) {
-                result = { message: error.message, reason: error.reason, status: 503 };
+                result = { ...error, message: error.message, reason: error.reason, status: error.status || 503 };
             }
             this._cancelCurrentAttemptBeforeRetry(proxyRequest, this.currentAuthIndex);
             if (
@@ -368,13 +380,13 @@ class ScheduledRequestHandler extends RequestHandler {
         return queue;
     }
 
-    _sendErrorResponse(res, status, message, errorType = null) {
+    _sendErrorResponse(res, status, message, errorType = null, details = null) {
         if (res.headersSent && this._isResponseWritable(res)) {
-            this._sendErrorChunkToClient(res, message, Number(status) || 500, errorType);
+            this._sendErrorChunkToClient(res, message, status, errorType, "error", details);
             res.end();
             return;
         }
-        return super._sendErrorResponse(res, status, message, errorType);
+        return super._sendErrorResponse(res, status, message, errorType, details);
     }
 
     _beginEarlyStreamIfNeeded(proxyRequest) {
@@ -436,7 +448,7 @@ async function dispatch(parent, method, req, res) {
     } catch (error) {
         if (!handler.controller.signal.aborted) {
             if (res.headersSent) handler._handleRequestError(error, res);
-            else handler._sendErrorResponse(res, error.status || 503, error.message);
+            else handler._sendErrorResponse(res, error.status || 503, error.message, null, error);
         }
     } finally {
         handler.finish();

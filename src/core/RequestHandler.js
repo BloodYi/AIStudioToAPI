@@ -10,6 +10,7 @@
  * Main request handler that coordinates between other modules
  */
 const AntiTruncation = require("./AntiTruncation");
+const { normalizeError } = require("../utils/UpstreamError");
 const AuthSwitcher = require("../auth/AuthSwitcher");
 const FormatConverter = require("./FormatConverter");
 const { isUserAbortedError } = require("../utils/CustomErrors");
@@ -966,7 +967,7 @@ class RequestHandler {
                 try {
                     await this._acquireScheduledLease(proxyRequest);
                 } catch (error) {
-                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                    return this._sendErrorResponse(res, error.status || 503, error.message, null, error);
                 }
             }
 
@@ -1070,7 +1071,7 @@ class RequestHandler {
                 try {
                     await this._acquireScheduledLease(proxyRequest);
                 } catch (error) {
-                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                    return this._sendErrorResponse(res, error.status || 503, error.message, null, error);
                 }
             }
             this._updateTrackedRequest(requestId, {
@@ -1138,7 +1139,7 @@ class RequestHandler {
                 try {
                     await this._acquireScheduledLease(proxyRequest);
                 } catch (error) {
-                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                    return this._sendErrorResponse(res, error.status || 503, error.message, null, error);
                 }
             }
             this._updateTrackedRequest(requestId, {
@@ -1440,7 +1441,7 @@ class RequestHandler {
                 try {
                     await this._acquireScheduledLease(proxyRequest);
                 } catch (error) {
-                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                    return this._sendErrorResponse(res, error.status || 503, error.message, null, error);
                 }
             }
             res.__proxyResponseStreamMode = isOpenAIStream ? effectiveStreamMode : null;
@@ -1529,7 +1530,13 @@ class RequestHandler {
                         });
 
                         // Send standard HTTP error response
-                        this._sendErrorResponse(res, initialMessage.status || 500, initialMessage.message);
+                        this._sendErrorResponse(
+                            res,
+                            initialMessage.status,
+                            initialMessage.message,
+                            null,
+                            initialMessage
+                        );
 
                         // Avoid switching account if the error is just a connection reset
                         if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
@@ -1597,7 +1604,13 @@ class RequestHandler {
                                 // If keep-alives already started the SSE response, send an SSE error event instead of JSON.
                                 this._handleRequestError(result.error, res, requestId);
                             } else {
-                                this._sendErrorResponse(res, result.error.status || 500, result.error.message);
+                                this._sendErrorResponse(
+                                    res,
+                                    result.error.status,
+                                    result.error.message,
+                                    null,
+                                    result.error
+                                );
                             }
 
                             // Avoid switching account if the error is just a connection reset
@@ -1691,7 +1704,7 @@ class RequestHandler {
                                         if (res.__antiAttempt && Buffer.byteLength(fullBody) > AntiTruncation.MAX_BYTES)
                                             throw Object.assign(
                                                 new Error("Anti-truncation response exceeds size limit"),
-                                                { status: 502 }
+                                                { code: "anti_truncation_limit", status: 502 }
                                             );
                                     }
                                 }
@@ -1702,10 +1715,10 @@ class RequestHandler {
                                 const streamState = res.__earlyOpenAIStreamState || {};
                                 if (useEarlyStream || res.__antiAttempt)
                                     streamState.includeUsage = req.body.stream_options?.include_usage === true;
-                                if (useEarlyStream) JSON.parse(fullBody);
+                                if (useEarlyStream && !res.__antiAttempt) JSON.parse(fullBody);
                                 const translatedChunk = res.__antiAttempt
                                     ? res.__antiAttempt.stream(
-                                          JSON.parse(fullBody),
+                                          AntiTruncation.parseResponse(fullBody),
                                           this.formatConverter,
                                           model,
                                           streamState,
@@ -1913,7 +1926,7 @@ class RequestHandler {
                 try {
                     await this._acquireScheduledLease(proxyRequest);
                 } catch (error) {
-                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                    return this._sendErrorResponse(res, error.status || 503, error.message, null, error);
                 }
             }
             res.__proxyResponseStreamMode = isOpenAIStream ? (useRealStream ? "real" : "fake") : null;
@@ -2002,7 +2015,13 @@ class RequestHandler {
                         });
 
                         // Send standard HTTP error response
-                        this._sendErrorResponse(res, initialMessage.status || 500, initialMessage.message);
+                        this._sendErrorResponse(
+                            res,
+                            initialMessage.status,
+                            initialMessage.message,
+                            null,
+                            initialMessage
+                        );
 
                         // Avoid switching account if the error is just a connection reset
                         if (!skipFinalFailureSwitch && !this._isConnectionResetError(initialMessage)) {
@@ -2077,7 +2096,13 @@ class RequestHandler {
                                 // If keep-alives already started the SSE response, send an SSE error event instead of JSON.
                                 this._handleRequestError(result.error, res, requestId);
                             } else {
-                                this._sendErrorResponse(res, result.error.status || 500, result.error.message);
+                                this._sendErrorResponse(
+                                    res,
+                                    result.error.status,
+                                    result.error.message,
+                                    null,
+                                    result.error
+                                );
                             }
 
                             // Avoid switching account if the error is just a connection reset
@@ -2306,7 +2331,7 @@ class RequestHandler {
                 try {
                     await this._acquireScheduledLease(proxyRequest);
                 } catch (error) {
-                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                    return this._sendErrorResponse(res, error.status || 503, error.message, null, error);
                 }
             }
             res.__proxyResponseStreamMode = isClaudeStream ? (useRealStream ? "real" : "fake") : null;
@@ -2648,7 +2673,7 @@ class RequestHandler {
                 try {
                     await this._acquireScheduledLease(proxyRequest);
                 } catch (error) {
-                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                    return this._sendErrorResponse(res, error.status || 503, error.message, null, error);
                 }
             }
             this._updateTrackedRequest(requestId, {
@@ -2807,7 +2832,7 @@ class RequestHandler {
                 try {
                     await this._acquireScheduledLease(proxyRequest);
                 } catch (error) {
-                    return this._sendErrorResponse(res, error.status || 503, error.message);
+                    return this._sendErrorResponse(res, error.status || 503, error.message, null, error);
                 }
             }
             this._updateTrackedRequest(requestId, {
@@ -2846,7 +2871,7 @@ class RequestHandler {
                         `❌ [Request] Received error from browser for input_tokens, will trigger switching logic. Status code: ${response.status}, message: ${response.message}`
                     );
 
-                    this._sendErrorResponse(res, response.status || 500, response.message);
+                    this._sendErrorResponse(res, response.status, response.message, null, response);
 
                     // Avoid switching account if the error is just a connection reset
                     if (!this._isConnectionResetError(response)) {
@@ -3072,7 +3097,7 @@ class RequestHandler {
                     if (res.headersSent) {
                         this._handleRequestError(result.error, res, proxyRequest.request_id);
                     } else {
-                        this._sendErrorResponse(res, result.error.status || 500, result.error.message);
+                        this._sendErrorResponse(res, result.error.status, result.error.message, null, result.error);
                     }
 
                     // Avoid switching account if the error is just a connection reset
@@ -3501,7 +3526,7 @@ class RequestHandler {
                         );
                     }
                 }
-                return this._sendErrorResponse(res, result.error.status || 500, result.error.message);
+                return this._sendErrorResponse(res, result.error.status, result.error.message, null, result.error);
             }
 
             // On success, reset failure count if needed
@@ -3661,9 +3686,14 @@ class RequestHandler {
                 } catch (e) {
                     // JSON parse failed - check if it's a timeout error
                     if (error.code === "QUEUE_TIMEOUT" || error instanceof QueueTimeoutError) {
-                        errorPayload = { message: error.message || "Queue timeout", status: 504 };
+                        errorPayload = {
+                            ...error,
+                            code: error.code,
+                            message: error.message || "Queue timeout",
+                            status: 504,
+                        };
                     } else {
-                        errorPayload = { message: error.message, status: 500 };
+                        errorPayload = { ...error, message: error.message, status: error.status || 500 };
                     }
                 }
 
@@ -3773,7 +3803,12 @@ class RequestHandler {
                             break;
                         }
                     } catch (switchError) {
-                        lastError = { ...errorPayload, skipAccountSwitch: true };
+                        lastError = {
+                            ...switchError,
+                            message: switchError.message,
+                            skipAccountSwitch: true,
+                            status: switchError.status || 503,
+                        };
                         this.logger.error(
                             `❌ [Request] Account switch failed during immediate-switch retry flow: ${switchError.message}`
                         );
@@ -4131,20 +4166,23 @@ class RequestHandler {
 
             if (message.event_type === "error") {
                 this.logger.error(`❌ [Adapter] Error during OpenAI non-stream conversion: ${message.message}`);
-                this._sendErrorResponse(res, 500, message.message);
+                this._handleRequestError(message, res, requestId);
                 return;
             }
 
             if (message.event_type === "chunk" && message.data) {
                 fullBody += message.data;
                 if (res.__antiAttempt && Buffer.byteLength(fullBody) > AntiTruncation.MAX_BYTES)
-                    throw Object.assign(new Error("Anti-truncation response exceeds size limit"), { status: 502 });
+                    throw Object.assign(new Error("Anti-truncation response exceeds size limit"), {
+                        code: "anti_truncation_limit",
+                        status: 502,
+                    });
             }
         }
 
         // Parse and convert to OpenAI format
         try {
-            const googleResponse = JSON.parse(fullBody);
+            const googleResponse = res.__antiAttempt ? AntiTruncation.parseResponse(fullBody) : JSON.parse(fullBody);
             const openAIResponse = res.__antiAttempt
                 ? res.__antiAttempt.nonStream(googleResponse, this.formatConverter, model)
                 : this.formatConverter.convertGoogleToOpenAINonStream(googleResponse, model);
@@ -4152,7 +4190,7 @@ class RequestHandler {
             this.logger.info(`✅ [Request] Response completed (OpenAI non-stream), request ID: ${requestId}`);
         } catch (e) {
             this.logger.error(`❌ [Adapter] Failed to parse response for OpenAI: ${e.message}`);
-            this._sendErrorResponse(res, e.status || 500, "Failed to parse backend response", e.code);
+            this._handleRequestError(e, res, requestId);
         }
     }
 
@@ -4205,182 +4243,51 @@ class RequestHandler {
 
     _handleRequestError(error, res, requestId = null) {
         const format = this._resolveErrorFormat(res);
-        // Normalize error message to handle non-Error objects and missing/non-string messages
-        const errorMsg = res.__antiAttempt
-            ? "Upstream or anti-truncation protocol failure"
-            : String(error?.message ?? error);
+        const normalized = normalizeError(error);
         const requestIdSuffix = requestId ? `, request ID: ${requestId}` : "";
-
-        // Check if this is a client disconnect - if so, just log and return
-        if (this._isConnectionResetError(error)) {
-            const isClientDisconnect = error.reason === "client_disconnect" || !this._isResponseWritable(res);
-            if (isClientDisconnect) {
-                this._markTrackedClientAbort(res, errorMsg);
-                this.logger.info(
-                    `[Request] Request terminated: Queue closed (${error.reason || "connection_lost"})${requestIdSuffix}`
-                );
-                if (!res.writableEnded) {
-                    try {
-                        res.end();
-                    } catch (e) {
-                        // Ignore end errors for disconnected clients
-                    }
-                }
-                return;
-            }
+        const isConnectionReset = this._isConnectionResetError(error);
+        if (isConnectionReset && (error.reason === "client_disconnect" || !this._isResponseWritable(res))) {
+            this._markTrackedClientAbort(res, normalized.message);
+            if (!res.writableEnded) res.end();
+            return;
         }
-
+        if (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT") {
+            normalized.status = 504;
+            normalized.type = "timeout_error";
+        } else if (isConnectionReset) {
+            normalized.status = 503;
+            normalized.type = format === "claude" ? "overloaded_error" : "service_unavailable";
+        }
+        const errorType = normalized.type || this._getDefaultErrorType(format, normalized.status);
+        this.logger.error(`❌ [Request] Request processing error: ${normalized.message}${requestIdSuffix}`);
         if (res.headersSent) {
-            this.logger.error(
-                `❌ [Request] Request processing error (headers already sent): ${errorMsg}${requestIdSuffix}`
-            );
-
-            // Try to send error in the stream format
             if (this._isResponseWritable(res)) {
                 const contentType = res.getHeader("content-type");
-
-                if (
-                    (contentType && contentType.includes("text/event-stream")) ||
-                    (res.__antiAttempt && res.__proxyResponseStreamMode)
-                ) {
-                    // SSE format - send error event
-                    try {
-                        // Determine error code and type based on error classification
-                        let errorCode = res.__streamStartSent || res.__antiAttempt ? Number(error.status) || 500 : 500;
-                        let errorType = res.__streamStartSent
-                            ? error.error?.type || this._getDefaultErrorType(format, errorCode)
-                            : "api_error";
-                        let errorMessage = `Processing failed: ${errorMsg}`;
-
-                        // Use precise error type checking instead of string matching
-                        if (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT") {
-                            errorCode = 504;
-                            errorType = "timeout_error";
-                            errorMessage = `Stream timeout: ${errorMsg}`;
-                        } else if (this._isConnectionResetError(error)) {
-                            errorCode = 503;
-                            errorType = format === "claude" ? "overloaded_error" : "service_unavailable";
-                            errorMessage = `Service unavailable: ${errorMsg}`;
-                        }
-
-                        this._markTrackedResponseError(
-                            res,
-                            errorMessage,
-                            errorCode,
-                            this._isConnectionResetError(error) ? "local_transport" : "error"
-                        );
-
-                        if (format === "response_api") {
-                            if (res.__responseApiSeq == null) res.__responseApiSeq = 0;
-                            res.__responseApiSeq += 1;
-                            res.write(
-                                `event: error\ndata: ${JSON.stringify({
-                                    code: errorType,
-                                    message: errorMessage,
-                                    param: null,
-                                    sequence_number: res.__responseApiSeq,
-                                    type: "error",
-                                })}\n\n`
-                            );
-                        } else if (format === "claude") {
-                            res.write(
-                                `event: error\ndata: ${JSON.stringify({
-                                    error: {
-                                        message: errorMessage,
-                                        type: errorType,
-                                    },
-                                    type: "error",
-                                })}\n\n`
-                            );
-                        } else if (format === "gemini") {
-                            let statusText = "INTERNAL";
-                            if (errorCode === 504) statusText = "DEADLINE_EXCEEDED";
-                            else if (errorCode === 503) statusText = "UNAVAILABLE";
-                            res.write(
-                                `data: ${JSON.stringify({
-                                    error: {
-                                        code: errorCode,
-                                        message: errorMessage,
-                                        status: statusText,
-                                    },
-                                })}\n\n`
-                            );
-                        } else {
-                            res.write(
-                                `data: ${JSON.stringify({
-                                    error: {
-                                        code: errorCode,
-                                        message: errorMessage,
-                                        type: errorType,
-                                    },
-                                })}\n\n`
-                            );
-                        }
-                        res.flush?.();
-                        this.logger.info("[Request] Error event sent to SSE stream");
-                    } catch (writeError) {
-                        const writeErrorMsg = String(writeError?.message ?? writeError);
-                        this.logger.error(
-                            `❌ [Request] Failed to write error to stream: ${writeErrorMsg}${requestIdSuffix}`
-                        );
-                    }
-                } else if (["fake", "early"].includes(res.__proxyResponseStreamMode)) {
-                    // Request-scoped fake stream mode - try to send an SSE-style error chunk
-                    try {
-                        let status = res.__streamStartSent ? Number(error.status) || 500 : 500;
-                        let errorType = res.__streamStartSent
-                            ? error.error?.type || this._getDefaultErrorType(format, status)
-                            : "api_error";
-                        if (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT") {
-                            status = 504;
-                            errorType = "timeout_error";
-                        } else if (this._isConnectionResetError(error)) {
-                            status = 503;
-                            errorType = this._getDefaultErrorType(format, status);
-                        }
-                        this._sendErrorChunkToClient(
-                            res,
-                            `Processing failed: ${errorMsg}`,
-                            status,
-                            errorType,
-                            this._isConnectionResetError(error) ? "local_transport" : "error"
-                        );
-                    } catch (writeError) {
-                        const writeErrorMsg = String(writeError?.message ?? writeError);
-                        this.logger.error(
-                            `❌ [Request] Failed to write error chunk: ${writeErrorMsg}${requestIdSuffix}`
-                        );
-                    }
+                if (contentType?.includes("text/event-stream") || res.__proxyResponseStreamMode) {
+                    this._sendErrorChunkToClient(
+                        res,
+                        normalized.message,
+                        normalized.status,
+                        errorType,
+                        isConnectionReset ? "local_transport" : "error",
+                        error
+                    );
                 }
-
-                try {
-                    res.end();
-                } catch (endError) {
-                    this.logger.debug(`[Request] Failed to end response: ${endError.message}`);
-                }
+                res.end();
             }
         } else {
-            this.logger.error(`❌ [Request] Request processing error: ${errorMsg}${requestIdSuffix}`);
-            let status = res.__antiAttempt ? Number(error.status) || 500 : 500;
-            let errorType = "api_error";
-            // Use precise error type checking instead of string matching
-            if (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT") {
-                status = 504;
-                errorType = "timeout_error";
-            } else if (this._isConnectionResetError(error)) {
-                status = 503;
-                errorType = format === "claude" ? "overloaded_error" : "service_unavailable";
-                this.logger.info(`[Request] Queue closed, returning 503 Service Unavailable.`);
-            }
-            this._sendErrorResponse(res, status, `Proxy error: ${errorMsg}`, errorType);
+            this._sendErrorResponse(res, normalized.status, normalized.message, errorType, error);
         }
     }
 
-    _sendErrorResponse(res, status, message, errorType = null) {
-        if (res.__antiAttempt) message = "Upstream or anti-truncation protocol failure";
+    _sendErrorResponse(res, status, message, errorType = null, details = null) {
+        const normalized = normalizeError({ ...details, message, status });
+        status = normalized.status;
+        message = normalized.message;
+        errorType = normalized.type || errorType;
         if (res.__streamStartSent && res.headersSent) {
             if (this._isResponseWritable(res)) {
-                this._sendErrorChunkToClient(res, message, Number(status) || 500, errorType);
+                this._sendErrorChunkToClient(res, message, status, errorType, "error", details);
                 res.end();
             }
             return;
@@ -4402,7 +4309,7 @@ class RequestHandler {
             } else if (resolvedFormat === "openai") {
                 errorPayload = {
                     error: {
-                        code: statusCode,
+                        code: normalized.code,
                         message,
                         type: resolvedErrorType,
                     },
@@ -4442,7 +4349,11 @@ class RequestHandler {
         );
     }
 
-    _sendErrorChunkToClient(res, message, statusCode = 500, errorType = null, outcome = "error") {
+    _sendErrorChunkToClient(res, message, statusCode = null, errorType = null, outcome = "error", details = null) {
+        const normalized = normalizeError({ ...details, message, status: statusCode });
+        statusCode = normalized.status;
+        message = normalized.message;
+        errorType = normalized.type || errorType;
         const format = this._resolveErrorFormat(res);
         const resolvedErrorType = errorType || this._getDefaultErrorType(format, statusCode);
         if (!res.headersSent) {
@@ -4480,15 +4391,20 @@ class RequestHandler {
                     res.write(
                         `data: ${JSON.stringify({
                             error: {
-                                code: statusCode,
+                                code: normalized.code,
                                 message,
                                 type: resolvedErrorType,
                             },
                         })}\n\n`
                     );
+                } else if (format === "gemini") {
+                    const status =
+                        statusCode === 504 ? "DEADLINE_EXCEEDED" : statusCode === 503 ? "UNAVAILABLE" : "INTERNAL";
+                    res.write(`data: ${JSON.stringify({ error: { code: statusCode, message, status } })}\n\n`);
                 } else {
                     res.write(`data: ${JSON.stringify({ error: message })}\n\n`);
                 }
+                res.flush?.();
             } catch (writeError) {
                 this.logger.debug(`[Request] Failed to write error chunk to client: ${writeError.message}`);
             }
