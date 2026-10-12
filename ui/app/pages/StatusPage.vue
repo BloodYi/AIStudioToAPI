@@ -724,7 +724,7 @@
                 <div class="status-card">
                     <span>{{ t("currentVersion") }}：{{ appVersion }}</span>
                     <button type="button" @click="copyText(appVersion)">{{ t("copy") }}</button>
-                    <a href="https://github.com/iBUHub/AIStudioToAPI/releases" target="_blank">{{
+                    <a href="https://github.com/Naoya666/AIStudioToAPI" target="_blank">{{
                         t("viewRelease")
                     }}</a>
                 </div>
