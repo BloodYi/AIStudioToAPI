@@ -20,6 +20,8 @@ class ConfigLoader {
 
     loadConfiguration(env = process.env) {
         const config = {
+            antiTruncationDefault: "off",
+            antiTruncationEnabled: true,
             apiKeys: [],
             apiKeySource: "Not set",
             browserExecutablePath: null,
@@ -94,6 +96,16 @@ class ConfigLoader {
                 }
                 return origin;
             });
+        }
+        if (env.ANTI_TRUNCATION_ENABLED !== undefined) {
+            if (!["true", "false"].includes(String(env.ANTI_TRUNCATION_ENABLED).toLowerCase()))
+                throw new Error("Invalid ANTI_TRUNCATION_ENABLED: expected true or false");
+            config.antiTruncationEnabled = String(env.ANTI_TRUNCATION_ENABLED).toLowerCase() === "true";
+        }
+        if (env.ANTI_TRUNCATION_DEFAULT !== undefined) {
+            if (!["off", "prefer"].includes(env.ANTI_TRUNCATION_DEFAULT))
+                throw new Error("Invalid ANTI_TRUNCATION_DEFAULT: expected off or prefer");
+            config.antiTruncationDefault = env.ANTI_TRUNCATION_DEFAULT;
         }
         if (env.STREAMING_MODE) config.streamingMode = env.STREAMING_MODE;
         if (env.FAILURE_THRESHOLD) {

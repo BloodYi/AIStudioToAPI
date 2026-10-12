@@ -94,6 +94,7 @@ COPY --chown=node:node main.js ./
 COPY --chown=node:node vite.config.js ./
 COPY --chown=node:node vite.public.config.js ./
 COPY --chown=node:node src ./src
+COPY --chown=node:node docs/licenses ./docs/licenses
 COPY --chown=node:node configs ./configs
 COPY --chown=node:node scripts ./scripts
 COPY --chown=node:node ui ./ui

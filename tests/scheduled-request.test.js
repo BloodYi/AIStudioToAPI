@@ -1024,3 +1024,297 @@ test("configuration changes apply to new requests while accepted early requests 
         ["fake", "real"]
     );
 });
+
+// Integrated anti transport tests use the same account/queue fixture as ordinary requests.
+function antiReply(index, request) {
+    const body = JSON.parse(request.body);
+    const synthetic = body.tools?.[0]?.functionDeclarations.find(tool => tool.name.startsWith("agw_emit_"));
+    assert.ok(synthetic);
+    assert.equal(body.anti_truncation, undefined);
+    assert.equal(
+        body.tools.flatMap(tool => tool.functionDeclarations || []).filter(tool => tool.name.startsWith("agw_emit_"))
+            .length,
+        1
+    );
+    return [
+        { event_type: "response_headers", headers: { "content-type": "application/json" }, status: 200 },
+        {
+            data: JSON.stringify({
+                candidates: [
+                    {
+                        content: {
+                            parts: [
+                                { text: "discard" },
+                                { text: "reason", thought: true },
+                                { functionCall: { args: { content: "最终😀回答" }, name: synthetic.name } },
+                            ],
+                        },
+                        finishReason: "STOP",
+                    },
+                ],
+                usageMetadata: { candidatesTokenCount: 7, promptTokenCount: 5, totalTokenCount: 12 },
+            }),
+            event_type: "chunk",
+        },
+        { event_type: "stream_close" },
+    ];
+}
+
+test("anti transport uses canonical scheduling and consistent replies for nonstream/fake/early/real", async t => {
+    for (const mode of [null, "fake", "early", "real"]) {
+        const fixture = setup(antiReply);
+        t.after(() => fixture.scheduler.close());
+        const req = request(`models/anti-gemini-2.5-flash${mode ? `-${mode}` : ""}`, Boolean(mode));
+        req.body.stream_options = { include_usage: true };
+        const res = new Response();
+        await fixture.handler.processOpenAIRequest(req, res);
+        assert.equal(res.statusCode, 200);
+        assert.equal(fixture.sent[0].request.path.includes("/gemini-2.5-flash:"), true);
+        assert.equal(res.body.includes("agw_emit_"), false);
+        assert.equal(res.body.includes("discard"), false);
+        assert.equal(res.body.includes("最终😀回答"), true);
+        if (mode) {
+            const output = res.body
+                .split("\n")
+                .filter(line => line.startsWith("data: {"))
+                .map(line => JSON.parse(line.slice(6)));
+            assert.equal(output.filter(event => event.choices?.[0]?.delta.role).length, 1);
+            assert.equal(output.filter(event => event.usage).length, 1);
+            assert.equal(new Set(output.map(event => event.id)).size, 1);
+            assert.equal(output.find(event => event.choices?.[0]?.finish_reason).choices[0].finish_reason, "stop");
+            assert.equal(res.body.match(/\[DONE\]/g).length, 1);
+        } else assert.equal(JSON.parse(res.body).choices[0].message.content, "最终😀回答");
+    }
+});
+
+test("anti admission failures occur before early start or forwarding", async t => {
+    for (const [model, fields, config] of [
+        ["anti-", {}, {}],
+        ["anti-anti-gemini-2.5-flash", {}, {}],
+        ["anti-gemini-2.5-flash", {}, { antiTruncationEnabled: false }],
+        ["anti-gemini-2.5-flash-search", {}, {}],
+        ["anti-gemini-2.5-flash-preview-tts", {}, {}],
+        ["gemini-2.5-flash", { anti_truncation: "true" }, {}],
+    ]) {
+        const fixture = setup(antiReply, { streamingMode: "early", ...config });
+        t.after(() => fixture.scheduler.close());
+        const req = request(model, true);
+        Object.assign(req.body, fields);
+        const res = new Response();
+        await fixture.handler.processOpenAIRequest(req, res);
+        assert.equal(res.statusCode, 400);
+        assert.equal(Boolean(res.__streamStartSent), false);
+        assert.equal(fixture.sent.length, 0);
+    }
+});
+
+test("anti early account retry creates a new transport and preserves one stream identity", async t => {
+    const names = [];
+    const fixture = setup((index, req) => {
+        names.push(JSON.parse(req.body).tools[0].functionDeclarations.at(-1).name);
+        return names.length === 1 ? [{ event_type: "error", message: "quota", status: 429 }] : antiReply(index, req);
+    });
+    t.after(() => fixture.scheduler.close());
+    const res = new Response();
+    await fixture.handler.processOpenAIRequest(request("anti-gemini-2.5-flash-early", true), res);
+    assert.equal(names.length, 2);
+    assert.notEqual(names[0], names[1]);
+    assert.equal(res.body.includes("最终😀回答"), true);
+    assert.equal(res.body.match(/\[DONE\]/g).length, 1);
+    assert.equal(res.body.includes(names[0]), false);
+});
+
+test("anti real handles fragmented SSE and errors after parameters without replay or DONE", async t => {
+    for (const fail of [false, true]) {
+        const fixture = setup((index, req) => {
+            const messages = antiReply(index, req);
+            const raw = `data: ${messages[1].data}\n\n`;
+            return [
+                messages[0],
+                ...Array.from(raw, char => ({ data: char, event_type: "chunk" })),
+                ...(fail ? [{ event_type: "error", message: "upstream private", status: 429 }] : [messages[2]]),
+            ];
+        });
+        t.after(() => fixture.scheduler.close());
+        const res = new Response();
+        await fixture.handler.processOpenAIRequest(request("anti-gemini-2.5-flash-real", true), res);
+        assert.equal(fixture.sent.length, 1);
+        assert.equal(res.body.includes("最终😀回答"), true);
+        assert.equal(res.body.includes("[DONE]"), !fail);
+        assert.equal(res.body.includes('"error"'), fail);
+        assert.equal(res.body.includes("upstream private"), false);
+    }
+});
+
+test("anti decoder and incomplete EOF failures are explicit with no success DONE", async t => {
+    for (const mode of ["early", "real"]) {
+        for (const malformed of ["args", "finish", "json"]) {
+            const fixture = setup((index, req) => {
+                const messages = antiReply(index, req);
+                const body = JSON.parse(messages[1].data);
+                if (malformed === "args") body.candidates[0].content.parts.at(-1).functionCall.args = { content: 1 };
+                if (malformed === "finish") delete body.candidates[0].finishReason;
+                messages[1].data = malformed === "json" ? '{"invalid":' : JSON.stringify(body);
+                return messages;
+            });
+            t.after(() => fixture.scheduler.close());
+            const res = new Response();
+            await fixture.handler.processOpenAIRequest(request(`anti-gemini-2.5-flash-${mode}`, true), res);
+            assert.equal(res.body.includes('"error"'), true);
+            assert.equal(res.body.includes("[DONE]"), false);
+            assert.equal(fixture.sent.length, 1);
+        }
+    }
+});
+
+test("anti early HTTP client receives live empty events throughout delayed upstream waiting", async t => {
+    const express = require("express");
+    const delay = Number(process.env.ANTI_TEST_DELAY_MS || 1100);
+    const fixture = setup(
+        (index, req) => {
+            const timer = setTimeout(() => {
+                for (const message of antiReply(index, req))
+                    fixture.registry._handleIncomingMessage(
+                        JSON.stringify({
+                            ...message,
+                            request_attempt_id: req.request_attempt_id,
+                            request_id: req.request_id,
+                        }),
+                        index
+                    );
+            }, delay);
+            t.after(() => clearTimeout(timer));
+            return [];
+        },
+        { fakeStreamTimeoutMs: delay + 5000 }
+    );
+    t.after(() => fixture.scheduler.close());
+    const app = express();
+    app.use(express.json());
+    app.post("/v1/chat/completions", (req, res) => fixture.handler.processOpenAIRequest(req, res));
+    const server = app.listen(0, "127.0.0.1");
+    await new Promise(resolve => server.once("listening", resolve));
+    t.after(() => {
+        server.closeAllConnections();
+        server.close();
+    });
+    const accepted = Date.now();
+    const res = await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`, {
+        body: JSON.stringify({
+            messages: [{ content: "test", role: "user" }],
+            model: "anti-gemini-2.5-flash-early",
+            stream: true,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+    });
+    const received = [];
+    let raw = "";
+    for await (const bytes of res.body) {
+        const text = Buffer.from(bytes).toString("utf8");
+        raw += text;
+        received.push({ at: Date.now() - accepted, text });
+    }
+    assert.equal(res.status, 200);
+    assert.equal(received[0].at < Math.min(delay, 1000), true);
+    assert.equal(received.filter(item => item.at < delay && item.text.includes('"content":""')).length >= 2, true);
+    assert.equal(raw.includes("最终😀回答"), true);
+    assert.equal(raw.includes("discard"), false);
+    assert.equal(raw.match(/\[DONE\]/g).length, 1);
+    assert.equal(fixture.registry.messageQueues.size, 0);
+    const waiting = received.filter(item => item.text.includes('"content":""'));
+    assert.equal(waiting.length >= Math.max(2, Math.floor(delay / 1000)), true);
+    for (let i = 1; i < waiting.length; i++) assert.equal(waiting[i].at - waiting[i - 1].at < 2000, true);
+    console.log(`anti HTTP arrival: first=${received[0].at}ms, wait=${delay}ms, reads=${received.length}`);
+});
+
+test("anti unsupported entries reject explicit activation and false overrides remove aliases", async t => {
+    for (const method of [
+        "processOpenAIResponseRequest",
+        "processClaudeRequest",
+        "processOpenAIEmbeddingsRequest",
+        "processRequest",
+    ]) {
+        const fixture = setup(() => success, { streamingMode: "early" });
+        t.after(() => fixture.scheduler.close());
+        const req = request("anti-gemini-2.5-flash", true);
+        const res = new Response();
+        await fixture.handler[method](req, res);
+        assert.equal(res.statusCode, 400);
+        assert.equal(fixture.sent.length, 0);
+        assert.equal(Boolean(res.__streamStartSent), false);
+    }
+    const fixture = setup(() => success);
+    t.after(() => fixture.scheduler.close());
+    const req = request("anti-gemini-2.5-flash-real", true);
+    req.body.anti_truncation = false;
+    const res = new Response();
+    await fixture.handler.processOpenAIRequest(req, res);
+    assert.equal(res.body.includes("hello"), true);
+    assert.equal(fixture.sent[0].request.body.includes("agw_emit_"), false);
+    assert.equal(fixture.sent[0].request.path, "/v1beta/models/gemini-2.5-flash:streamGenerateContent");
+});
+
+test("anti cancellation clears live queues and waiting heartbeats in legacy and model modes", async t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    for (const legacy of [false, true]) {
+        const fixture = setup(() => [success[0]], { streamingMode: "early" });
+        if (legacy) useLegacy(fixture);
+        t.after(() => fixture.scheduler.close());
+        const res = new Response();
+        const running = fixture.handler.processOpenAIRequest(request("anti-gemini-2.5-flash-early", true), res);
+        for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+        assert.equal(fixture.sent.length, 1);
+        res.destroyed = true;
+        res.emit("close");
+        await running;
+        const body = res.body;
+        t.mock.timers.tick(5000);
+        assert.equal(res.body, body);
+        assert.equal(fixture.registry.messageQueues.size, 0);
+        assert.equal(res.body.includes("[DONE]"), false);
+    }
+});
+
+test("concurrent anti requests keep private transports isolated and release scheduler resources", async t => {
+    const fixture = setup(antiReply);
+    t.after(() => fixture.scheduler.close());
+    const results = await Promise.all(
+        Array.from({ length: 12 }, async () => {
+            const res = new Response();
+            await fixture.handler.processOpenAIRequest(request("anti-gemini-2.5-flash-early", true), res);
+            return res;
+        })
+    );
+    assert.equal(
+        results.every(res => res.body.includes("最终😀回答") && !res.body.includes('"error"')),
+        true
+    );
+    const names = fixture.sent.map(
+        ({ request: req }) => JSON.parse(req.body).tools[0].functionDeclarations.at(-1).name
+    );
+    assert.equal(new Set(names).size, 12);
+    assert.equal(fixture.registry.messageQueues.size, 0);
+    assert.equal(fixture.scheduler.snapshot().active_workers, 0);
+});
+
+test("anti real delivery waits for drain and cleans up temporary backpressure listeners", async t => {
+    const fixture = setup(antiReply);
+    t.after(() => fixture.scheduler.close());
+    const res = new Response();
+    const write = res.write.bind(res);
+    let drains = 0;
+    res.write = value => {
+        write(value);
+        setImmediate(() => {
+            drains++;
+            res.emit("drain");
+        });
+        return false;
+    };
+    await fixture.handler.processOpenAIRequest(request("anti-gemini-2.5-flash-real", true), res);
+    assert.equal(drains > 0, true);
+    assert.equal(res.body.includes("最终😀回答"), true);
+    assert.equal(res.listenerCount("drain"), 0);
+    assert.equal(res.listenerCount("error"), 0);
+});

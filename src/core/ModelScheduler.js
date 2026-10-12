@@ -72,7 +72,7 @@ function calculateNextPacificResetAt(now, configuredTime, skipDate = null) {
 
 function normalizeModelName(model) {
     if (typeof model !== "string") throw schedulerError("Model must be a non-empty string", 400);
-    let normalized = model.trim().replace(/^models\//, "");
+    let normalized = FormatConverter.parseModelAntiPrefix(model).cleanModelName;
     normalized = FormatConverter.parseModelBuiltInToolSuffixes(normalized).cleanModelName;
     normalized = FormatConverter.parseModelStreamingModeSuffix(normalized).cleanModelName;
     normalized = FormatConverter.parseModelThinkingLevel(normalized).cleanModelName;

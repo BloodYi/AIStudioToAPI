@@ -6,6 +6,8 @@
 
 本仓库是基于 [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AIStudioToAPI) 二次开发的独立维护版本，非上游官方版本。上游进一步基于 [Ellinav/ais2api](https://github.com/Ellinav/ais2api) 开发。本版本保留上游署名和许可说明，沿用 **CC BY-NC 4.0**，仅限符合许可证的非商业用途。
 
+抗截断文本传输：支持 `anti-` 模型前缀、请求级覆盖及独立全局策略，兼容非流式和 fake/early/real。默认 off，范围及限制见 [使用说明](docs/zh/anti-truncation.md) 和 [实施验证记录](docs/zh/anti-truncation-implementation.md)。
+
 ## 功能与本版本改动
 
 继承上游的多协议 API、浏览器自动化、多账号会话、工具调用、图片及语音模型支持，具体可用能力取决于账号权限和上游模型。

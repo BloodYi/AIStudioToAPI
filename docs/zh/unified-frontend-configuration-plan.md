@@ -74,6 +74,8 @@ API Key 修改要处理现有控制台认证的关联，不能因请求重复提
 
 | 配置项 | 中文名称与含义 | 展示条件 | 保存后 |
 | --- | --- | --- | --- |
+| `ANTI_TRUNCATION_ENABLED` | 抗截断能力总开关，默认 true；关闭时拒绝显式启用 | 通用 | 热生效 |
+| `ANTI_TRUNCATION_DEFAULT` | 文本 Chat Completions 默认策略 off/prefer，默认 off | 通用 | 热生效 |
 | `STREAMING_MODE` | 流式响应模式：真实流式或缓冲结果后模拟流式 | 通用 | 热生效 |
 | `MAX_RETRIES` | 旧版请求重试设置：旧请求处理路径的重试参数 | 旧版 | 热生效 |
 | `MAX_RETRIES_PER_REQUEST` | 额外重试次数：首次失败后允许再尝试的次数，也用于限制上下文初始化尝试 | 模型调度 | 热生效 |

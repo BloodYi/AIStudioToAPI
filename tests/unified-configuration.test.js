@@ -265,3 +265,23 @@ test("all streaming modes persist, reload, reset and validate with old defaults"
     assert.equal(withEnv.service.running.streamingMode, "early");
     assert.equal(setup(t).service.running.streamingMode, "real");
 });
+
+test("anti settings persist, validate, reset and retain accepted request snapshots", t => {
+    const { service, save, system } = setup(t);
+    assert.equal(service.running.antiTruncationEnabled, true);
+    assert.equal(service.running.antiTruncationDefault, "off");
+    const accepted = structuredClone(system.config);
+    save({ ANTI_TRUNCATION_DEFAULT: "prefer", ANTI_TRUNCATION_ENABLED: false });
+    assert.equal(system.config.antiTruncationEnabled, false);
+    assert.equal(system.config.antiTruncationDefault, "prefer");
+    assert.equal(accepted.antiTruncationEnabled, true);
+    assert.equal(accepted.antiTruncationDefault, "off");
+    const loaded = new ConfigurationService({ logger }, { env: {}, file: service.file });
+    assert.equal(loaded.running.antiTruncationEnabled, false);
+    assert.equal(loaded.running.antiTruncationDefault, "prefer");
+    for (const changes of [{ ANTI_TRUNCATION_ENABLED: "false" }, { ANTI_TRUNCATION_DEFAULT: "required" }])
+        assert.throws(() => save(changes), { status: 400 });
+    service.save({ reset: ["ANTI_TRUNCATION_ENABLED", "ANTI_TRUNCATION_DEFAULT"], version: service.document.version });
+    assert.equal(service.running.antiTruncationEnabled, true);
+    assert.equal(service.running.antiTruncationDefault, "off");
+});

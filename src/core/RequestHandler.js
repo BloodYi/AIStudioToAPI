@@ -9,6 +9,7 @@
  * Request Handler Module (Refactored)
  * Main request handler that coordinates between other modules
  */
+const AntiTruncation = require("./AntiTruncation");
 const AuthSwitcher = require("../auth/AuthSwitcher");
 const FormatConverter = require("./FormatConverter");
 const { isUserAbortedError } = require("../utils/CustomErrors");
@@ -922,6 +923,7 @@ class RequestHandler {
 
     // Process standard Google API requests
     async processRequest(req, res) {
+        if (this._rejectUnsupportedAntiRequest(req, res, "gemini")) return;
         if (this.serverSystem.scheduler && !this.scheduled) {
             return require("./ScheduledRequestHandler").dispatch(this, "processRequest", req, res);
         }
@@ -1004,7 +1006,11 @@ class RequestHandler {
             } catch (error) {
                 // Handle queue timeout by notifying browser
                 this._handleQueueTimeout(error, requestId);
-
+                if (res.__antiAttempt && error.code !== "QUEUE_TIMEOUT") {
+                    const index = this.connectionRegistry.getAuthIndexForRequest(requestId);
+                    if (Number.isInteger(index))
+                        this._cancelBrowserRequest(requestId, index, proxyRequest.request_attempt_id);
+                }
                 this._handleRequestError(error, res, requestId);
             } finally {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
@@ -1026,6 +1032,7 @@ class RequestHandler {
 
     // Process OpenAI embeddings requests
     async processOpenAIEmbeddingsRequest(req, res) {
+        if (this._rejectUnsupportedAntiRequest(req, res, "embedding")) return;
         if (this.serverSystem.scheduler && !this.scheduled) {
             return require("./ScheduledRequestHandler").dispatch(this, "processOpenAIEmbeddingsRequest", req, res);
         }
@@ -1330,6 +1337,30 @@ class RequestHandler {
         res.__proxyResponseStreamMode = null;
 
         try {
+            const antiConfig = { ...this.config };
+            let policy;
+            try {
+                policy = AntiTruncation.resolve(req.body, antiConfig);
+                this.serverSystem.scheduler?.assertModelAccessible(policy.realModel);
+                if (
+                    policy.enabled &&
+                    antiConfig.modelList?.length &&
+                    !antiConfig.modelList.some(item => item.name.replace(/^models\//, "") === policy.realModel)
+                )
+                    throw Object.assign(new Error("Unknown anti-truncation model"), {
+                        code: "invalid_model",
+                        status: 400,
+                    });
+            } catch (error) {
+                return this._sendErrorResponse(res, error.status || 400, error.message, error.code);
+            }
+            this.logger.info(
+                `[Anti] request=${requestId} requested=${JSON.stringify(req.body.model)} model=${policy.realModel} enabled=${policy.enabled} source=${policy.source} reason=${policy.reason || "none"}`
+            );
+            const baseline = structuredClone(req.body);
+            baseline.model = policy.model;
+            delete baseline.anti_truncation;
+            const injected = policy.enabled ? AntiTruncation.inject(baseline) : { body: baseline };
             const suffixMode = FormatConverter.parseModelStreamingModeSuffix(
                 FormatConverter.parseModelBuiltInToolSuffixes(req.body.model).cleanModelName
             ).streamingMode;
@@ -1358,7 +1389,9 @@ class RequestHandler {
             // Translate OpenAI format to Google format (also handles model name suffix parsing)
             let googleBody, model, modelStreamingMode;
             try {
-                const result = await this.formatConverter.translateOpenAIToGoogle(req.body);
+                const result = await this.formatConverter.translateOpenAIToGoogle(injected.body, {
+                    privateTransport: policy.enabled,
+                });
                 googleBody = result.googleRequest;
                 model = result.cleanModelName;
                 modelStreamingMode = result.modelStreamingMode || null;
@@ -1391,6 +1424,17 @@ class RequestHandler {
                 request_id: requestId,
                 streaming_mode: useRealStream ? "real" : "fake",
             };
+            if (policy.enabled) {
+                const context = {
+                    baseline: proxyRequest.body,
+                    log: event => this.logger.info(`[Anti] request=${requestId} model=${model} event=${event}`),
+                    originalName: injected.name,
+                    res,
+                };
+                Object.defineProperty(proxyRequest, "__antiContext", { value: context });
+                res.__antiAttempt = new AntiTruncation.Attempt(injected.name, context.log);
+                res.__antiIncludeUsage = req.body.stream_options?.include_usage === true;
+            }
             this._initializeProxyRequestAttempt(proxyRequest);
             if (this.scheduled) {
                 try {
@@ -1606,6 +1650,11 @@ class RequestHandler {
                                     }
 
                                     if (message.event_type === "error") {
+                                        if (res.__antiAttempt) {
+                                            hadStreamError = true;
+                                            this._handleRequestError(message, res, requestId);
+                                            break;
+                                        }
                                         this.logger.error(
                                             `❌ [Request] Error received during OpenAI fake stream: ${message.message}`
                                         );
@@ -1630,25 +1679,42 @@ class RequestHandler {
                                         break;
                                     }
 
-                                    if (useEarlyStream && bufferingAttemptId !== proxyRequest.request_attempt_id) {
+                                    if (
+                                        (useEarlyStream || res.__antiAttempt) &&
+                                        bufferingAttemptId !== proxyRequest.request_attempt_id
+                                    ) {
                                         fullBody = "";
                                         bufferingAttemptId = proxyRequest.request_attempt_id;
                                     }
-                                    if (message.data) fullBody += message.data;
+                                    if (message.data) {
+                                        fullBody += message.data;
+                                        if (res.__antiAttempt && Buffer.byteLength(fullBody) > AntiTruncation.MAX_BYTES)
+                                            throw Object.assign(
+                                                new Error("Anti-truncation response exceeds size limit"),
+                                                { status: 502 }
+                                            );
+                                    }
                                 }
                                 if (hadStreamError) {
                                     // Backend errored; don't attempt to translate/send a "normal" stream afterwards.
                                     return;
                                 }
                                 const streamState = res.__earlyOpenAIStreamState || {};
-                                if (useEarlyStream)
+                                if (useEarlyStream || res.__antiAttempt)
                                     streamState.includeUsage = req.body.stream_options?.include_usage === true;
                                 if (useEarlyStream) JSON.parse(fullBody);
-                                const translatedChunk = this.formatConverter.translateGoogleToOpenAIStream(
-                                    fullBody,
-                                    model,
-                                    streamState
-                                );
+                                const translatedChunk = res.__antiAttempt
+                                    ? res.__antiAttempt.stream(
+                                          JSON.parse(fullBody),
+                                          this.formatConverter,
+                                          model,
+                                          streamState,
+                                          true
+                                      )
+                                    : this.formatConverter.translateGoogleToOpenAIStream(fullBody, model, streamState);
+                                if (res.__antiAttempt) {
+                                    res.__antiAttempt.assertComplete();
+                                }
                                 if (this._isResponseWritable(res)) {
                                     try {
                                         if (translatedChunk) {
@@ -1662,7 +1728,9 @@ class RequestHandler {
                                             }
                                             res.write(translatedChunk);
                                         }
+                                        if (res.__antiAttempt) res.write(res.__antiAttempt.usageEvent(streamState));
                                         res.write("data: [DONE]\n\n");
+                                        res.flush?.();
                                     } catch (writeError) {
                                         this.logger.debug(
                                             `[Request] Failed to write final fake OpenAI stream chunks: ${writeError.message}`
@@ -1678,7 +1746,9 @@ class RequestHandler {
                                 );
                             } catch (error) {
                                 // Classify error type and send appropriate response
-                                this._handleFakeStreamError(error, res);
+                                res.__antiAttempt
+                                    ? this._handleRequestError(error, res, requestId)
+                                    : this._handleFakeStreamError(error, res);
                             }
                         } else {
                             // Non-stream
@@ -1716,6 +1786,7 @@ class RequestHandler {
 
     // Process OpenAI Response API format requests
     async processOpenAIResponseRequest(req, res) {
+        if (this._rejectUnsupportedAntiRequest(req, res, "response_api")) return;
         if (this.serverSystem.scheduler && !this.scheduled) {
             return require("./ScheduledRequestHandler").dispatch(this, "processOpenAIResponseRequest", req, res);
         }
@@ -2162,6 +2233,7 @@ class RequestHandler {
 
     // Process Claude API format requests
     async processClaudeRequest(req, res) {
+        if (this._rejectUnsupportedAntiRequest(req, res, "claude")) return;
         if (this.serverSystem.scheduler && !this.scheduled) {
             return require("./ScheduledRequestHandler").dispatch(this, "processClaudeRequest", req, res);
         }
@@ -3872,17 +3944,62 @@ class RequestHandler {
         }
     }
 
+    async _writeAntiStreamChunk(res, chunk) {
+        if (!chunk) return;
+        if (!this._isResponseWritable(res))
+            throw Object.assign(new Error("Client disconnected"), { reason: "client_disconnect" });
+        const ready = res.write(chunk);
+        res.flush?.();
+        if (ready !== false) return;
+        await new Promise((resolve, reject) => {
+            const cleanup = () => {
+                res.removeListener("drain", drained);
+                res.removeListener("close", closed);
+                res.removeListener("error", failed);
+            };
+            const drained = () => {
+                cleanup();
+                resolve();
+            };
+            const closed = () => {
+                cleanup();
+                reject(Object.assign(new Error("Client disconnected"), { reason: "client_disconnect" }));
+            };
+            const failed = () => {
+                cleanup();
+                reject(Object.assign(new Error("Client write failed"), { reason: "client_disconnect" }));
+            };
+            res.once("drain", drained);
+            res.once("close", closed);
+            res.once("error", failed);
+            if (!this._isResponseWritable(res)) closed();
+        });
+    }
+
     async _streamOpenAIResponse(messageQueue, res, model, requestId) {
-        const streamState = {};
+        const streamState = res.__antiAttempt ? { includeUsage: res.__antiIncludeUsage } : {};
+        let attempt = res.__antiAttempt;
 
         try {
             // eslint-disable-next-line no-constant-condition
             while (true) {
                 const message = await messageQueue.dequeue(this.timeouts.STREAM_CHUNK);
+                attempt = res.__antiAttempt;
                 if (message.type === "STREAM_END") {
+                    if (attempt) {
+                        for (const response of attempt.read("", true)) {
+                            await this._writeAntiStreamChunk(
+                                res,
+                                attempt.stream(response, this.formatConverter, model, streamState)
+                            );
+                        }
+                        attempt.assertComplete();
+                    }
                     if (this._isResponseWritable(res)) {
                         try {
+                            if (attempt) res.write(attempt.usageEvent(streamState));
                             res.write("data: [DONE]\n\n");
+                            res.flush?.();
                         } catch (writeError) {
                             this.logger.debug(
                                 `[Request] Failed to write final [DONE] to OpenAI stream (connection likely closed): ${writeError.message}`
@@ -3894,30 +4011,36 @@ class RequestHandler {
                 }
 
                 if (message.event_type === "error") {
-                    this.logger.error(`❌ [Request] Error received during OpenAI stream: ${message.message}`);
-                    this._markTrackedResponseError(res, message.message, 500);
-                    // Attempt to send error event to client if headers allowed, then close
-                    // Check if response is still writable before attempting to write
-                    if (this._isResponseWritable(res)) {
-                        try {
-                            res.write(
-                                `data: ${JSON.stringify({ error: { code: 500, message: message.message, type: "api_error" } })}\n\n`
-                            );
-                        } catch (writeError) {
-                            this.logger.debug(
-                                `❌ [Request] Failed to write error to OpenAI stream: ${writeError.message}`
-                            );
-                        }
-                    }
+                    this._handleRequestError(message, res, requestId);
                     break;
                 }
 
                 if (message.data) {
-                    const openAIChunk = this.formatConverter.translateGoogleToOpenAIStream(
-                        message.data,
-                        model,
-                        streamState
-                    );
+                    let openAIChunk;
+                    if (attempt) {
+                        const responses = attempt.read(message.data);
+                        openAIChunk = "";
+                        for (const response of responses) {
+                            if (
+                                response.candidates?.some(candidate =>
+                                    candidate.content?.parts?.some(
+                                        part => part.functionCall || part.text || part.inlineData
+                                    )
+                                )
+                            ) {
+                                res.__upstreamOutputStarted = true;
+                                res.__modelOutputStarted = true;
+                                res.__stopEarlyOpenAIStream?.();
+                            }
+                            openAIChunk += attempt.stream(response, this.formatConverter, model, streamState);
+                        }
+                    } else {
+                        openAIChunk = this.formatConverter.translateGoogleToOpenAIStream(
+                            message.data,
+                            model,
+                            streamState
+                        );
+                    }
                     if (openAIChunk) {
                         if (!this._isResponseWritable(res)) {
                             this.logger.debug(
@@ -3926,7 +4049,11 @@ class RequestHandler {
                             break;
                         }
                         try {
-                            res.write(openAIChunk);
+                            if (attempt) await this._writeAntiStreamChunk(res, openAIChunk);
+                            else {
+                                res.write(openAIChunk);
+                                res.flush?.();
+                            }
                         } catch (writeError) {
                             this.logger.debug(
                                 `[Request] Failed to write OpenAI chunk to stream: ${writeError.message}`
@@ -4010,18 +4137,22 @@ class RequestHandler {
 
             if (message.event_type === "chunk" && message.data) {
                 fullBody += message.data;
+                if (res.__antiAttempt && Buffer.byteLength(fullBody) > AntiTruncation.MAX_BYTES)
+                    throw Object.assign(new Error("Anti-truncation response exceeds size limit"), { status: 502 });
             }
         }
 
         // Parse and convert to OpenAI format
         try {
             const googleResponse = JSON.parse(fullBody);
-            const openAIResponse = this.formatConverter.convertGoogleToOpenAINonStream(googleResponse, model);
+            const openAIResponse = res.__antiAttempt
+                ? res.__antiAttempt.nonStream(googleResponse, this.formatConverter, model)
+                : this.formatConverter.convertGoogleToOpenAINonStream(googleResponse, model);
             res.type("application/json").send(JSON.stringify(openAIResponse));
             this.logger.info(`✅ [Request] Response completed (OpenAI non-stream), request ID: ${requestId}`);
         } catch (e) {
             this.logger.error(`❌ [Adapter] Failed to parse response for OpenAI: ${e.message}`);
-            this._sendErrorResponse(res, 500, "Failed to parse backend response");
+            this._sendErrorResponse(res, e.status || 500, "Failed to parse backend response", e.code);
         }
     }
 
@@ -4075,7 +4206,9 @@ class RequestHandler {
     _handleRequestError(error, res, requestId = null) {
         const format = this._resolveErrorFormat(res);
         // Normalize error message to handle non-Error objects and missing/non-string messages
-        const errorMsg = String(error?.message ?? error);
+        const errorMsg = res.__antiAttempt
+            ? "Upstream or anti-truncation protocol failure"
+            : String(error?.message ?? error);
         const requestIdSuffix = requestId ? `, request ID: ${requestId}` : "";
 
         // Check if this is a client disconnect - if so, just log and return
@@ -4106,11 +4239,14 @@ class RequestHandler {
             if (this._isResponseWritable(res)) {
                 const contentType = res.getHeader("content-type");
 
-                if (contentType && contentType.includes("text/event-stream")) {
+                if (
+                    (contentType && contentType.includes("text/event-stream")) ||
+                    (res.__antiAttempt && res.__proxyResponseStreamMode)
+                ) {
                     // SSE format - send error event
                     try {
                         // Determine error code and type based on error classification
-                        let errorCode = res.__streamStartSent ? Number(error.status) || 500 : 500;
+                        let errorCode = res.__streamStartSent || res.__antiAttempt ? Number(error.status) || 500 : 500;
                         let errorType = res.__streamStartSent
                             ? error.error?.type || this._getDefaultErrorType(format, errorCode)
                             : "api_error";
@@ -4180,6 +4316,7 @@ class RequestHandler {
                                 })}\n\n`
                             );
                         }
+                        res.flush?.();
                         this.logger.info("[Request] Error event sent to SSE stream");
                     } catch (writeError) {
                         const writeErrorMsg = String(writeError?.message ?? writeError);
@@ -4224,7 +4361,7 @@ class RequestHandler {
             }
         } else {
             this.logger.error(`❌ [Request] Request processing error: ${errorMsg}${requestIdSuffix}`);
-            let status = 500;
+            let status = res.__antiAttempt ? Number(error.status) || 500 : 500;
             let errorType = "api_error";
             // Use precise error type checking instead of string matching
             if (error instanceof QueueTimeoutError || error.code === "QUEUE_TIMEOUT") {
@@ -4240,6 +4377,7 @@ class RequestHandler {
     }
 
     _sendErrorResponse(res, status, message, errorType = null) {
+        if (res.__antiAttempt) message = "Upstream or anti-truncation protocol failure";
         if (res.__streamStartSent && res.headersSent) {
             if (this._isResponseWritable(res)) {
                 this._sendErrorChunkToClient(res, message, Number(status) || 500, errorType);
@@ -4468,7 +4606,7 @@ class RequestHandler {
     }
 
     _buildProxyRequest(req, requestId) {
-        const fullPath = req.path;
+        const fullPath = req.__antiNormalizedPath || req.path;
         let cleanPath = fullPath.replace(/^\/proxy/, "");
         const bodyObj = req.body;
         let requestBodyObj = bodyObj;
@@ -4677,6 +4815,29 @@ class RequestHandler {
         };
     }
 
+    _rejectUnsupportedAntiRequest(req, res, protocol) {
+        const model = req.body?.model || req.path?.match(/\/models\/([^/:]+)/)?.[1];
+        if (!model && req.body?.anti_truncation === undefined) return false;
+        try {
+            const policy = AntiTruncation.resolve(
+                req.body || {},
+                this.config,
+                protocol,
+                model || "gemini-2.5-flash-lite"
+            );
+            if (policy.prefixed && !policy.enabled) {
+                if (req.body?.model) req.body.model = policy.model;
+                else req.__antiNormalizedPath = req.path.replace(/(\/models\/)anti-/i, "$1");
+            }
+            if (req.body && typeof req.body === "object") delete req.body.anti_truncation;
+            return false;
+        } catch (error) {
+            this._setResponseApiFormat(res, protocol);
+            this._sendErrorResponse(res, error.status || 400, error.message, error.code);
+            return true;
+        }
+    }
+
     _initializeProxyRequestAttempt(proxyRequest) {
         if (!proxyRequest.request_attempt_number) {
             proxyRequest.request_attempt_number = 1;
@@ -4688,6 +4849,13 @@ class RequestHandler {
     }
 
     _advanceProxyRequestAttempt(proxyRequest) {
+        const context = proxyRequest.__antiContext;
+        if (context) {
+            const name = `agw_emit_${require("node:crypto").randomBytes(12).toString("hex")}`;
+            proxyRequest.body = context.baseline.split(context.originalName).join(name);
+            context.res.__antiAttempt = new AntiTruncation.Attempt(name, context.log);
+            context.log("attempt_reset");
+        }
         proxyRequest.request_attempt_number = (proxyRequest.request_attempt_number || 1) + 1;
         proxyRequest.request_attempt_id = this._generateRequestAttemptId(
             proxyRequest.request_id,

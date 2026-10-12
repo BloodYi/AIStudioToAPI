@@ -86,7 +86,7 @@ class ScheduledRequestHandler extends RequestHandler {
                                     if (
                                         message.event_type === "error" &&
                                         classifyError(message) === "transport" &&
-                                        !this.response.__modelOutputStarted
+                                        !(this.response.__modelOutputStarted || this.response.__upstreamOutputStarted)
                                     ) {
                                         activeQueue = await this._retryTransportQueue(message, target);
                                         dequeue = activeQueue.dequeue.bind(activeQueue);
@@ -94,10 +94,34 @@ class ScheduledRequestHandler extends RequestHandler {
                                     }
                                     break;
                                 } catch (error) {
-                                    if (classifyError(error) !== "transport" || this.response.__modelOutputStarted)
+                                    if (
+                                        classifyError(error) !== "transport" ||
+                                        this.response.__modelOutputStarted ||
+                                        this.response.__upstreamOutputStarted
+                                    )
                                         throw error;
                                     activeQueue = await this._retryTransportQueue(error, target);
                                     dequeue = activeQueue.dequeue.bind(activeQueue);
+                                }
+                            }
+                            if (this.response.__antiAttempt && message.data) {
+                                let hasOutput = false;
+                                try {
+                                    const raw = JSON.parse(message.data.replace(/^data:\s*/, "").trim());
+                                    hasOutput = raw.candidates?.some(candidate =>
+                                        candidate.content?.parts?.some(
+                                            part => part.functionCall || part.text || part.inlineData
+                                        )
+                                    );
+                                } catch {
+                                    hasOutput = Boolean(
+                                        message.data.trim() && !message.data.trimStart().startsWith(":")
+                                    );
+                                }
+                                if (hasOutput) {
+                                    this.response.__upstreamOutputStarted = true;
+                                    this._stopEarlyStreamKeepalive();
+                                    this.response.__stopEarlyOpenAIStream?.();
                                 }
                             }
                             if (message.event_type === "error") await this.scheduler.failure(this.lease, message);
@@ -220,6 +244,7 @@ class ScheduledRequestHandler extends RequestHandler {
             !this._shouldRetryError(error) ||
             this.controller.signal.aborted ||
             this.response.__modelOutputStarted ||
+            this.response.__upstreamOutputStarted ||
             this.excluded.size > this.acceptedSchedulerConfig.maxRetries
         )
             return false;
@@ -323,6 +348,7 @@ class ScheduledRequestHandler extends RequestHandler {
         if (
             this.controller.signal.aborted ||
             this.response.__modelOutputStarted ||
+            this.response.__upstreamOutputStarted ||
             this.excluded.size > this.acceptedSchedulerConfig.maxRetries
         )
             throw error;
@@ -370,7 +396,12 @@ class ScheduledRequestHandler extends RequestHandler {
         this.response.write(": accepted\n\n");
         this.scheduler.observe("http_headers_ms", Date.now() - this._acceptedAt);
         const sendKeepalive = () => {
-            if (this.controller.signal.aborted || this.response.writableEnded || this.response.__modelOutputStarted) {
+            if (
+                this.controller.signal.aborted ||
+                this.response.writableEnded ||
+                this.response.__modelOutputStarted ||
+                this.response.__upstreamOutputStarted
+            ) {
                 this._stopEarlyStreamKeepalive();
                 return;
             }

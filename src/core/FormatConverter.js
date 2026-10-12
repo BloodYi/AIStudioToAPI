@@ -28,6 +28,17 @@ class FormatConverter {
         "url_context",
     ];
 
+    static parseModelAntiPrefix(modelName) {
+        if (typeof modelName !== "string" || !modelName.trim())
+            throw Object.assign(new Error("Model must be a non-empty string"), { code: "invalid_model", status: 400 });
+        let cleanModelName = modelName.trim().replace(/^models\//, "");
+        const antiTruncation = /^anti-/i.test(cleanModelName);
+        if (antiTruncation) cleanModelName = cleanModelName.slice(5);
+        if (!cleanModelName || /^anti-/i.test(cleanModelName))
+            throw Object.assign(new Error("Invalid anti model alias"), { code: "invalid_model", status: 400 });
+        return { antiTruncation, cleanModelName };
+    }
+
     // ThinkingLevel suffix mapping (lowercase -> uppercase API value)
     static THINKING_LEVEL_MAP = {
         high: "HIGH",
@@ -536,11 +547,12 @@ class FormatConverter {
      * @returns {Promise<{ googleRequest: object, cleanModelName: string, modelStreamingMode: ("real"|"fake"|"early"|null) }>}
      *          - modelStreamingMode: Streaming mode override parsed from model name suffix, or null
      */
-    async translateOpenAIToGoogle(openaiBody) {
+    async translateOpenAIToGoogle(openaiBody, { privateTransport = false } = {}) {
         this.logger.info("[Adapter] Starting translation of OpenAI request format to Google format...");
 
         // [DEBUG] Log incoming messages for troubleshooting
-        this.logger.debug(`[Adapter] Debug: incoming OpenAI Body = ${JSON.stringify(openaiBody, null, 2)}`);
+        if (!privateTransport)
+            this.logger.debug(`[Adapter] Debug: incoming OpenAI Body = ${JSON.stringify(openaiBody, null, 2)}`);
 
         // Parse model suffixes in reverse stripping order:
         // 1) built-in tool overrides: trailing `-search` / `-code`
@@ -665,9 +677,7 @@ class FormatConverter {
                             // To keep behavior consistent with the multiple-items case, stringify the array
                             // (e.g. returns { result: "[]" })
                             responseContent = { result: JSON.stringify(responseContent) };
-                            this.logger.info(
-                                `[Adapter] Empty/Unforeseen tool response structure. Wrapping in JSON string: ${JSON.stringify(responseContent)}`
-                            );
+                            this.logger.info("[Adapter] Tool response wrapped in JSON string.");
                         }
                     }
                 } catch (e) {
@@ -949,9 +959,10 @@ class FormatConverter {
 
             if (Object.keys(functionCallingConfig).length > 0) {
                 googleRequest.toolConfig = { functionCallingConfig };
-                this.logger.debug(
-                    `[Adapter] Converted tool_choice to Gemini toolConfig: ${JSON.stringify(functionCallingConfig)}`
-                );
+                if (!privateTransport)
+                    this.logger.debug(
+                        `[Adapter] Converted tool_choice to Gemini toolConfig: ${JSON.stringify(functionCallingConfig)}`
+                    );
             }
         }
 
@@ -1100,7 +1111,7 @@ class FormatConverter {
         // Safety settings
         googleRequest.safetySettings = this.getDefaultSafetySettings();
 
-        this.logger.debug(`[Adapter] Debug: Final Gemini Request = ${JSON.stringify(googleRequest, null, 2)}`);
+        this.logger.debug("[Adapter] Gemini request finalized.");
     }
 
     /**
@@ -1109,8 +1120,13 @@ class FormatConverter {
      * @param {string} modelName - The model name
      * @param {object} streamState - Optional state object to track thought mode
      */
-    translateGoogleToOpenAIStream(googleChunk, modelName = "gemini-2.5-flash-lite", streamState = null) {
-        this.logger.debug(`[Adapter] Debug: Received Google chunk for OpenAI: ${googleChunk}`);
+    translateGoogleToOpenAIStream(
+        googleChunk,
+        modelName = "gemini-2.5-flash-lite",
+        streamState = null,
+        { privateTransport = false } = {}
+    ) {
+        if (!privateTransport) this.logger.debug(`[Adapter] Debug: Received Google chunk for OpenAI: ${googleChunk}`);
 
         // Ensure streamState exists to properly track tool call indices
         if (!streamState) {
@@ -1199,7 +1215,7 @@ class FormatConverter {
                 } else if (part.functionCall) {
                     // Convert Gemini functionCall to OpenAI tool_calls format
                     const funcCall = part.functionCall;
-                    const toolCallId = `call_${this._generateRequestId()}`;
+                    const toolCallId = funcCall.id || `call_${this._generateRequestId()}`;
 
                     // Track tool call index for multiple function calls
                     const toolCallIndex = streamState.toolCallIndex ?? 0;
@@ -1776,18 +1792,23 @@ class FormatConverter {
     /**
      * Convert Google non-stream response to OpenAI format
      */
-    convertGoogleToOpenAINonStream(googleResponse, modelName = "gemini-2.5-flash-lite") {
-        try {
-            this.logger.debug(
-                `[Adapter] Debug: Received Google response for OpenAI non-stream: ${JSON.stringify(googleResponse)}`
-            );
-        } catch (e) {
-            this.logger.debug(
-                `[Adapter] Debug: Received Google response for OpenAI non-stream (non-serializable): ${String(
-                    googleResponse
-                )}`
-            );
-        }
+    convertGoogleToOpenAINonStream(
+        googleResponse,
+        modelName = "gemini-2.5-flash-lite",
+        { privateTransport = false } = {}
+    ) {
+        if (!privateTransport)
+            try {
+                this.logger.debug(
+                    `[Adapter] Debug: Received Google response for OpenAI non-stream: ${JSON.stringify(googleResponse)}`
+                );
+            } catch (e) {
+                this.logger.debug(
+                    `[Adapter] Debug: Received Google response for OpenAI non-stream (non-serializable): ${String(
+                        googleResponse
+                    )}`
+                );
+            }
 
         const candidate = googleResponse.candidates?.[0];
 
@@ -1829,7 +1850,7 @@ class FormatConverter {
                 } else if (part.functionCall) {
                     // Convert Gemini functionCall to OpenAI tool_calls format
                     const funcCall = part.functionCall;
-                    const toolCallId = `call_${this._generateRequestId()}`;
+                    const toolCallId = funcCall.id || `call_${this._generateRequestId()}`;
 
                     const toolCallObj = {
                         function: {
