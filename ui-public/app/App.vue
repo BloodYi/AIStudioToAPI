@@ -176,7 +176,7 @@ async function refresh() {
         });
         if (!response.ok) throw new Error("unavailable");
         data.value = await response.json();
-        error.value = false;
+        error.value = Boolean(data.value.stale);
     } catch (fetchError) {
         if (fetchError.name !== "AbortError") error.value = true;
     } finally {
@@ -242,7 +242,10 @@ function onMockChange() {
                 <p class="updated">数据更新时间：{{ updatedAt }} (本地) · 配额重置倒计时：{{ resetCountdown }}</p>
             </div>
             <div class="header-actions">
-                <span class="status" :class="{ warning: error || partialUnavailable }">
+                <span
+                    class="status"
+                    :class="{ warning: error || partialUnavailable || data?.service_status === 'unavailable' }"
+                >
                     <span class="status-dot"></span>
                     {{
                         loading
@@ -251,9 +254,11 @@ function onMockChange() {
                               ? data
                                   ? "数据暂时中断，显示上次结果"
                                   : "暂时无法获取数据"
-                              : partialUnavailable
-                                ? "部分统计不可用"
-                                : "服务正常运行"
+                              : data?.service_status === "unavailable"
+                                ? "服务暂时不可用"
+                                : partialUnavailable
+                                  ? "部分统计不可用"
+                                  : "服务正常运行"
                     }}
                 </span>
                 <button

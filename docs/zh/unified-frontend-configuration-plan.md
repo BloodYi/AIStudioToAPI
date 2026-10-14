@@ -16,11 +16,11 @@
 
 ## 2. 统一交互规则
 
-| 操作 | 热修改配置 | 重启生效配置 |
-| --- | --- | --- |
-| 编辑 | 仅改变草稿 | 仅改变草稿 |
+| 操作 | 热修改配置         | 重启生效配置           |
+| ---- | ------------------ | ---------------------- |
+| 编辑 | 仅改变草稿         | 仅改变草稿             |
 | 保存 | 校验、持久化并应用 | 校验、持久化，等待重启 |
-| 重启 | 继续使用已保存值 | 加载已保存值并应用 |
+| 重启 | 继续使用已保存值   | 加载已保存值并应用     |
 
 “保存”实际由后端将配置持久化到服务端；浏览器本地存储至多用于恢复未提交草稿，不能作为服务配置的权威来源。
 
@@ -63,79 +63,79 @@
 
 ### 4.1 服务及认证
 
-| 配置项 | 中文名称与含义 | 展示条件 | 保存后 |
-| --- | --- | --- | --- |
-| `PUBLIC_DASHBOARD_ENABLED` | 启用公开用量看板：启动无需登录的独立只读用量看板 | 通用 | 重启生效 |
-| `API_KEYS` | API 访问密钥：调用 API 使用的密钥；未设置独立控制台密码时也用于控制台登录 | 通用 | 热生效 |
+| 配置项                     | 中文名称与含义                                                            | 展示条件 | 保存后   |
+| -------------------------- | ------------------------------------------------------------------------- | -------- | -------- |
+| `PUBLIC_DASHBOARD_ENABLED` | 启用公开用量看板：启动无需登录的独立只读用量看板                          | 通用     | 重启生效 |
+| `API_KEYS`                 | API 访问密钥：调用 API 使用的密钥；未设置独立控制台密码时也用于控制台登录 | 通用     | 热生效   |
 
 API Key 修改要处理现有控制台认证的关联，不能因请求重复提交而重复执行切换操作。接口必须设置明确目标值。
 
 ### 4.2 请求处理与模型功能
 
-| 配置项 | 中文名称与含义 | 展示条件 | 保存后 |
-| --- | --- | --- | --- |
-| `ANTI_TRUNCATION_ENABLED` | 抗截断能力总开关，默认 true；关闭时拒绝显式启用 | 通用 | 热生效 |
-| `ANTI_TRUNCATION_DEFAULT` | 文本 Chat Completions 默认策略 off/prefer，默认 off | 通用 | 热生效 |
-| `STREAMING_MODE` | 流式响应模式：真实流式或缓冲结果后模拟流式 | 通用 | 热生效 |
-| `MAX_RETRIES` | 旧版请求重试设置：旧请求处理路径的重试参数 | 旧版 | 热生效 |
-| `MAX_RETRIES_PER_REQUEST` | 额外重试次数：首次失败后允许再尝试的次数，也用于限制上下文初始化尝试 | 模型调度 | 热生效 |
-| `STREAM_TIMEOUT_MS` | 真实流式响应超时：等待后续流式数据的超时，毫秒 | 通用 | 热生效 |
-| `FAKE_STREAM_TIMEOUT_MS` | 缓冲响应超时：假流式或非流式等待结果的超时，毫秒 | 通用 | 热生效 |
-| `FORCE_THINKING` | 强制启用思考：在请求转换时强制开启模型思考功能 | 通用 | 热生效 |
-| `FORCE_WEB_SEARCH` | 强制启用联网搜索：为请求加入联网搜索工具 | 通用 | 热生效 |
-| `FORCE_URL_CONTEXT` | 强制启用网址上下文：为请求加入网址内容读取能力 | 通用 | 热生效 |
-| `FORCE_CODE_EXECUTION` | 强制启用代码执行：为请求加入代码执行工具 | 通用 | 热生效 |
-| `SAFETY_SETTINGS_THRESHOLD` | 默认内容安全阈值：请求未自行提供安全设置时使用的拦截等级 | 通用 | 热生效 |
+| 配置项                      | 中文名称与含义                                                       | 展示条件 | 保存后 |
+| --------------------------- | -------------------------------------------------------------------- | -------- | ------ |
+| `ANTI_TRUNCATION_ENABLED`   | 抗截断能力总开关，默认 true；关闭时拒绝显式启用                      | 通用     | 热生效 |
+| `ANTI_TRUNCATION_DEFAULT`   | 文本 Chat Completions 默认策略 off/prefer，默认 off                  | 通用     | 热生效 |
+| `STREAMING_MODE`            | 流式响应模式：真实流式或缓冲结果后模拟流式                           | 通用     | 热生效 |
+| `MAX_RETRIES`               | 旧版请求重试设置：旧请求处理路径的重试参数                           | 旧版     | 热生效 |
+| `MAX_RETRIES_PER_REQUEST`   | 额外重试次数：首次失败后允许再尝试的次数，也用于限制上下文初始化尝试 | 模型调度 | 热生效 |
+| `STREAM_TIMEOUT_MS`         | 真实流式响应超时：等待后续流式数据的超时，毫秒                       | 通用     | 热生效 |
+| `FAKE_STREAM_TIMEOUT_MS`    | 缓冲响应超时：假流式或非流式等待结果的超时，毫秒                     | 通用     | 热生效 |
+| `FORCE_THINKING`            | 强制启用思考：在请求转换时强制开启模型思考功能                       | 通用     | 热生效 |
+| `FORCE_WEB_SEARCH`          | 强制启用联网搜索：为请求加入联网搜索工具                             | 通用     | 热生效 |
+| `FORCE_URL_CONTEXT`         | 强制启用网址上下文：为请求加入网址内容读取能力                       | 通用     | 热生效 |
+| `FORCE_CODE_EXECUTION`      | 强制启用代码执行：为请求加入代码执行工具                             | 通用     | 热生效 |
+| `SAFETY_SETTINGS_THRESHOLD` | 默认内容安全阈值：请求未自行提供安全设置时使用的拦截等级             | 通用     | 热生效 |
 
 `MAX_RETRIES` 与 `MAX_RETRIES_PER_REQUEST` 的既有计数口径不同，实现时根据旧路径的实际循环和退出条件准确说明，不能仅改标签就宣称两者等价，也不在本次统一计数算法。
 
 ### 4.3 账号切换与认证维护
 
-| 配置项 | 中文名称与含义 | 展示条件 | 保存后 |
-| --- | --- | --- | --- |
-| `ENABLE_AUTH_UPDATE` | 自动更新认证文件：控制登录、切换及定期维护中的认证状态刷新 | 通用 | 热生效 |
-| `SWITCH_ON_USES` | 按请求次数切换账号：达到请求次数后切换，0 表示关闭 | 旧版 | 热生效 |
-| `FAILURE_THRESHOLD` | 连续失败切换阈值：达到连续失败次数后切换，0 表示关闭 | 旧版 | 热生效 |
-| `IMMEDIATE_SWITCH_STATUS_CODES` | 立即切换账号的错误码：遇到指定 HTTP 错误码时切换，空值关闭 | 旧版 | 热生效 |
-| `ACCOUNT_ROTATION_STRATEGY` | 账号调度模式：较久未使用优先、较少使用优先、旧版切换 | 通用 | 重启生效 |
+| 配置项                          | 中文名称与含义                                             | 展示条件 | 保存后   |
+| ------------------------------- | ---------------------------------------------------------- | -------- | -------- |
+| `ENABLE_AUTH_UPDATE`            | 自动更新认证文件：控制登录、切换及定期维护中的认证状态刷新 | 通用     | 热生效   |
+| `SWITCH_ON_USES`                | 按请求次数切换账号：达到请求次数后切换，0 表示关闭         | 旧版     | 热生效   |
+| `FAILURE_THRESHOLD`             | 连续失败切换阈值：达到连续失败次数后切换，0 表示关闭       | 旧版     | 热生效   |
+| `IMMEDIATE_SWITCH_STATUS_CODES` | 立即切换账号的错误码：遇到指定 HTTP 错误码时切换，空值关闭 | 旧版     | 热生效   |
+| `ACCOUNT_ROTATION_STRATEGY`     | 账号调度模式：较久未使用优先、较少使用优先、旧版切换       | 通用     | 重启生效 |
 
 首版任何策略变更都等待重启，包括两个模型调度策略之间的切换。
 
 ### 4.4 浏览器资源与初始化
 
-| 配置项 | 中文名称与含义 | 展示条件 | 保存后 |
-| --- | --- | --- | --- |
-| `MAX_CONTEXTS` | 旧版账号上下文上限：旧版同时保留的账号上下文数量，0 表示不限 | 旧版 | 重启生效 |
-| `MAX_BROWSER_WORKERS` | 浏览器工作池上限：模型调度下可使用的账号上下文工作池规模 | 模型调度 | 重启生效 |
-| `CONTEXT_POOL_MIN_READY` | 预热上下文目标数：后台尽量维持的就绪上下文数量 | 模型调度 | 重启生效 |
-| `CONTEXT_INIT_CONCURRENCY` | 上下文初始化并发数：同时初始化的账号上下文数量 | 模型调度 | 重启生效 |
-| `CONTEXT_OPERATION_TIMEOUT_MS` | 初始化单步操作超时：单次浏览器初始化操作的等待上限，毫秒 | 通用 | 重启生效 |
-| `CONTEXT_INIT_TOTAL_TIMEOUT_MS` | 上下文初始化总超时：一次完整初始化的总时间上限，毫秒 | 通用 | 重启生效 |
+| 配置项                          | 中文名称与含义                                               | 展示条件 | 保存后   |
+| ------------------------------- | ------------------------------------------------------------ | -------- | -------- |
+| `MAX_CONTEXTS`                  | 旧版账号上下文上限：旧版同时保留的账号上下文数量，0 表示不限 | 旧版     | 重启生效 |
+| `MAX_BROWSER_WORKERS`           | 浏览器工作池上限：模型调度下可使用的账号上下文工作池规模     | 模型调度 | 重启生效 |
+| `CONTEXT_POOL_MIN_READY`        | 预热上下文目标数：后台尽量维持的就绪上下文数量               | 模型调度 | 重启生效 |
+| `CONTEXT_INIT_CONCURRENCY`      | 上下文初始化并发数：同时初始化的账号上下文数量               | 模型调度 | 重启生效 |
+| `CONTEXT_OPERATION_TIMEOUT_MS`  | 初始化单步操作超时：单次浏览器初始化操作的等待上限，毫秒     | 通用     | 重启生效 |
+| `CONTEXT_INIT_TOTAL_TIMEOUT_MS` | 上下文初始化总超时：一次完整初始化的总时间上限，毫秒         | 通用     | 重启生效 |
 
 ### 4.5 并发与调度资源
 
 下列配置仅在模型调度模式展示。
 
-| 配置项 | 中文名称与含义 | 保存后 |
-| --- | --- | --- |
-| `GLOBAL_MAX_CONCURRENCY` | 全局请求并发上限：同时处理的逻辑请求数量，与浏览器数量不同 | 重启生效 |
-| `CONTEXT_MAX_CONCURRENCY` | 单上下文请求并发上限：0 表示不设置该级硬上限 | 热生效 |
-| `ACCOUNT_MAX_CONCURRENCY` | 单账号请求并发上限：0 表示不设置该级硬上限 | 热生效 |
-| `ACCOUNT_MODEL_MAX_CONCURRENCY` | 单账号各模型并发上限：未单独设置的模型继承账号并发上限 | 热生效 |
-| `MODEL_MAX_CONCURRENCY` | 各模型总并发上限：跨账号限制模型并发，未设置时继承全局上限 | 热生效 |
-| `MODEL_WORKER_ALLOCATION` | 模型调度资源分配：设置最低保障和优先分配数量 | 重启生效 |
-| `ENABLE_DYNAMIC_WORKER_ALLOCATION` | 动态分配调度资源：允许模型按需求使用额外可用资源 | 重启生效 |
-| `SCHEDULER_READY_CONTEXT_ONLY` | 就绪上下文调度：采用等待就绪上下文并派发的处理路径 | 重启生效 |
+| 配置项                             | 中文名称与含义                                             | 保存后   |
+| ---------------------------------- | ---------------------------------------------------------- | -------- |
+| `GLOBAL_MAX_CONCURRENCY`           | 全局请求并发上限：同时处理的逻辑请求数量，与浏览器数量不同 | 重启生效 |
+| `CONTEXT_MAX_CONCURRENCY`          | 单上下文请求并发上限：0 表示不设置该级硬上限               | 热生效   |
+| `ACCOUNT_MAX_CONCURRENCY`          | 单账号请求并发上限：0 表示不设置该级硬上限                 | 热生效   |
+| `ACCOUNT_MODEL_MAX_CONCURRENCY`    | 单账号各模型并发上限：未单独设置的模型继承账号并发上限     | 热生效   |
+| `MODEL_MAX_CONCURRENCY`            | 各模型总并发上限：跨账号限制模型并发，未设置时继承全局上限 | 热生效   |
+| `MODEL_WORKER_ALLOCATION`          | 模型调度资源分配：设置最低保障和优先分配数量               | 重启生效 |
+| `ENABLE_DYNAMIC_WORKER_ALLOCATION` | 动态分配调度资源：允许模型按需求使用额外可用资源           | 重启生效 |
+| `SCHEDULER_READY_CONTEXT_ONLY`     | 就绪上下文调度：采用等待就绪上下文并派发的处理路径         | 重启生效 |
 
 ### 4.6 排队与等待保活
 
 下列配置仅在模型调度模式展示。
 
-| 配置项 | 中文名称与含义 | 保存后 |
-| --- | --- | --- |
-| `MODEL_QUEUE_SIZE` | 单模型等待队列上限：允许等待调度的请求数量，0 不提供额外等待名额 | 热生效 |
-| `REQUEST_DISPATCH_TIMEOUT_MS` | 请求派发超时：当前同时用于模型排队及等待可用上下文，毫秒 | 热生效 |
-| `STREAM_EARLY_HEADERS` | 提前发送流式响应头：等待调度时提前建立 SSE 响应并发送接受注释 | 热生效 |
+| 配置项                         | 中文名称与含义                                                    | 保存后 |
+| ------------------------------ | ----------------------------------------------------------------- | ------ |
+| `MODEL_QUEUE_SIZE`             | 单模型等待队列上限：允许等待调度的请求数量，0 不提供额外等待名额  | 热生效 |
+| `REQUEST_DISPATCH_TIMEOUT_MS`  | 请求派发超时：当前同时用于模型排队及等待可用上下文，毫秒          | 热生效 |
+| `STREAM_EARLY_HEADERS`         | 提前发送流式响应头：等待调度时提前建立 SSE 响应并发送接受注释     | 热生效 |
 | `STREAM_KEEPALIVE_INTERVAL_MS` | 流式等待保活间隔：提前建立 SSE 后、实际内容输出前的保活间隔，毫秒 | 热生效 |
 
 重要约束：
@@ -150,15 +150,15 @@ API Key 修改要处理现有控制台认证的关联，不能因请求重复提
 
 下列配置仅在模型调度模式展示。
 
-| 配置项 | 中文名称与含义 | 保存后 |
-| --- | --- | --- |
-| `RATE_LIMIT_COOLDOWN` | 限流冷却时间：账号对应模型遭遇 429 后的冷却时长，秒 | 热生效 |
-| `RISK_CONTROL_COOLDOWN` | 风控基础冷却时间：重复风控时递增使用的基础时长，秒 | 热生效 |
-| `RISK_CONTROL_MAX_COOLDOWN` | 风控最长冷却时间：递增冷却的上限，秒 | 热生效 |
-| `RISK_CONTROL_JITTER` | 风控冷却随机浮动：是否加入约 ±10% 的时长浮动 | 热生效 |
-| `TEMP_ERROR_COOLDOWN` | 临时错误基础冷却时间：临时错误的短暂冷却，秒 | 热生效 |
-| `SCHEDULER_DAILY_RESET_ENABLED` | 启用每日冷却重置：定时清理可自动恢复的调度冷却 | 热生效 |
-| `SCHEDULER_DAILY_RESET_TIME` | 每日冷却重置时间：洛杉矶时区的 HH:mm 时间 | 热生效 |
+| 配置项                          | 中文名称与含义                                      | 保存后 |
+| ------------------------------- | --------------------------------------------------- | ------ |
+| `RATE_LIMIT_COOLDOWN`           | 限流冷却时间：账号对应模型遭遇 429 后的冷却时长，秒 | 热生效 |
+| `RISK_CONTROL_COOLDOWN`         | 风控基础冷却时间：重复风控时递增使用的基础时长，秒  | 热生效 |
+| `RISK_CONTROL_MAX_COOLDOWN`     | 风控最长冷却时间：递增冷却的上限，秒                | 热生效 |
+| `RISK_CONTROL_JITTER`           | 风控冷却随机浮动：是否加入约 ±10% 的时长浮动        | 热生效 |
+| `TEMP_ERROR_COOLDOWN`           | 临时错误基础冷却时间：临时错误的短暂冷却，秒        | 热生效 |
+| `SCHEDULER_DAILY_RESET_ENABLED` | 启用每日冷却重置：定时清理可自动恢复的调度冷却      | 热生效 |
+| `SCHEDULER_DAILY_RESET_TIME`    | 每日冷却重置时间：洛杉矶时区的 HH:mm 时间           | 热生效 |
 
 每日重置不会重置上游真实配额；修改启用状态和时间后，需要重新安排既有定时任务。
 
@@ -166,33 +166,47 @@ API Key 修改要处理现有控制台认证的关联，不能因请求重复提
 
 下列配置所有模式均展示，全部保存后热生效。
 
-| 配置项 | 中文名称与含义 |
-| --- | --- |
-| `ACCOUNT_AUTO_RELOGIN_ENABLED` | 自动登录与重登：为新增账号及认证失效账号自动安排登录任务 |
-| `ACCOUNT_LOGIN_CONCURRENCY` | 登录任务并发数：同时执行的独立登录任务上限 |
-| `ACCOUNT_LOGIN_STEP_TIMEOUT_MS` | 登录单步骤超时：单个登录步骤的等待上限，毫秒 |
-| `ACCOUNT_LOGIN_ATTEMPT_TIMEOUT_MS` | 单次登录尝试超时：一次尝试的总时间上限，毫秒 |
-| `ACCOUNT_LOGIN_RECOVERY_TIMEOUT_MS` | 登录恢复总期限：包含等待和重试的恢复任务时间预算，毫秒 |
-| `ACCOUNT_LOGIN_MAX_ATTEMPTS` | 登录最大尝试次数：包含首次尝试的总次数 |
-| `ACCOUNT_LOGIN_LOG_RETENTION_DAYS` | 登录日志保留天数：登录任务日志的保留时间 |
+| 配置项                              | 中文名称与含义                                           |
+| ----------------------------------- | -------------------------------------------------------- |
+| `ACCOUNT_AUTO_RELOGIN_ENABLED`      | 自动登录与重登：为新增账号及认证失效账号自动安排登录任务 |
+| `ACCOUNT_LOGIN_CONCURRENCY`         | 登录任务并发数：同时执行的独立登录任务上限               |
+| `ACCOUNT_LOGIN_STEP_TIMEOUT_MS`     | 登录单步骤超时：单个登录步骤的等待上限，毫秒             |
+| `ACCOUNT_LOGIN_ATTEMPT_TIMEOUT_MS`  | 单次登录尝试超时：一次尝试的总时间上限，毫秒             |
+| `ACCOUNT_LOGIN_RECOVERY_TIMEOUT_MS` | 登录恢复总期限：包含等待和重试的恢复任务时间预算，毫秒   |
+| `ACCOUNT_LOGIN_MAX_ATTEMPTS`        | 登录最大尝试次数：包含首次尝试的总次数                   |
+| `ACCOUNT_LOGIN_LOG_RETENTION_DAYS`  | 登录日志保留天数：登录任务日志的保留时间                 |
 
 ### 4.9 用量统计
 
-| 配置项 | 中文名称与含义 | 展示条件 | 保存后 |
-| --- | --- | --- | --- |
-| `USAGE_LOG_RETENTION_DAYS` | 请求明细保留天数：按连续 24 小时计算，0 永久保留，已删除数据无法恢复 | 通用 | 重启生效 |
+| 配置项                     | 中文名称与含义                                                       | 展示条件 | 保存后   |
+| -------------------------- | -------------------------------------------------------------------- | -------- | -------- |
+| `USAGE_LOG_RETENTION_DAYS` | 请求明细保留天数：按连续 24 小时计算，0 永久保留，已删除数据无法恢复 | 通用     | 重启生效 |
 
 未启用统计时，说明本项暂不产生清理效果，不额外展示 `ENABLE_USAGE_STATS`。
+
+### 故障恢复与调度预算（2026-10-14 新增）
+
+| 环境变量                        | 作用                               | 生效方式 |
+| ------------------------------- | ---------------------------------- | -------- |
+| `SCHEDULER_DRAIN_BUDGET_MS`     | 见浏览器恢复优化方案及配置面板说明 | 重启     |
+| `GLOBAL_QUEUE_SIZE`             | 见浏览器恢复优化方案及配置面板说明 | 重启     |
+| `BROWSER_RECOVERY_MAX_ATTEMPTS` | 见浏览器恢复优化方案及配置面板说明 | 重启     |
+| `BROWSER_RECOVERY_BACKOFF_MS`   | 见浏览器恢复优化方案及配置面板说明 | 重启     |
+| `BROWSER_RECOVERY_STABLE_MS`    | 见浏览器恢复优化方案及配置面板说明 | 重启     |
+| `SUPERVISOR_HEARTBEAT_MS`       | 见浏览器恢复优化方案及配置面板说明 | 重启     |
+| `SUPERVISOR_TIMEOUT_MS`         | 见浏览器恢复优化方案及配置面板说明 | 重启     |
+| `SUPERVISOR_MAX_RESTARTS`       | 见浏览器恢复优化方案及配置面板说明 | 重启     |
+| `SUPERVISOR_SHUTDOWN_MS`        | 见浏览器恢复优化方案及配置面板说明 | 重启     |
 
 ## 5. 结构化输入
 
 模型配置不要求用户编写 JSON。虽然存储格式是 JSON 对象，前端使用可增加、删除的行输入。
 
-| 配置项 | 输入列 |
-| --- | --- |
-| `ACCOUNT_MODEL_MAX_CONCURRENCY` | 模型名、单账号并发上限 |
-| `MODEL_MAX_CONCURRENCY` | 模型名、模型总并发上限 |
-| `MODEL_WORKER_ALLOCATION` | 模型名、最低保障数量、优先分配数量 |
+| 配置项                          | 输入列                             |
+| ------------------------------- | ---------------------------------- |
+| `ACCOUNT_MODEL_MAX_CONCURRENCY` | 模型名、单账号并发上限             |
+| `MODEL_MAX_CONCURRENCY`         | 模型名、模型总并发上限             |
+| `MODEL_WORKER_ALLOCATION`       | 模型名、最低保障数量、优先分配数量 |
 
 模型名支持从现有模型选择及手动输入真实上游模型 ID；保持现有键名规范，不使用带工具、思考或流式后缀的请求别名。不得仅因下拉列表缺少某个有效上游模型而强制拒绝手动输入。
 
@@ -315,25 +329,25 @@ API Key 修改要处理现有控制台认证的关联，不能因请求重复提
 
 ## 13. 实现定位
 
-| 文件 | 相关职责 |
-| --- | --- |
-| `main.js` | 环境加载、启动、信号退出 |
-| `src/utils/ConfigLoader.js` | 主配置加载与校验 |
-| `src/core/SchedulerConfig.js` | 调度配置、模型映射校验、两种超时的合并读取 |
-| `src/core/ProxyServerSystem.js` | 组件创建、调度模式、服务资源生命周期 |
-| `src/routes/StatusRoutes.js` | 当前设置接口，多数仅修改内存 |
-| `ui/app/pages/StatusPage.vue` | 现有管理设置界面 |
-| `src/core/ModelScheduler.js` | 并发槽位、排队、冷却与每日重置 |
-| `src/core/BrowserManager.js` | 初始化配置快照、工作池和上下文等待 |
-| `src/core/RequestHandler.js` | 请求策略和假流式独立保活 |
-| `src/core/ScheduledRequestHandler.js` | 提前响应头及等待保活 |
-| `src/accounts/AccountConfig.js` | 登录任务环境配置 |
-| `src/accounts/AccountLoginService.js` | 登录配置加载、数据库保存和任务维护 |
-| `src/accounts/AccountLoginQueue.js` | 登录尝试配置快照和并发派发 |
-| `src/routes/AccountRoutes.js` | 已有自动恢复、并发、暂停设置接口 |
-| `ui/app/pages/AccountsPage.vue` | 账号页便捷配置和运行操作 |
-| `src/proxy/ProxyPoolService.js` | 代理池保存和 Mihomo 应用流程 |
-| `ui/app/components/proxy/ProxyPoolPanel.vue` | 原有代理池设置入口 |
+| 文件                                         | 相关职责                                   |
+| -------------------------------------------- | ------------------------------------------ |
+| `main.js`                                    | 环境加载、启动、信号退出                   |
+| `src/utils/ConfigLoader.js`                  | 主配置加载与校验                           |
+| `src/core/SchedulerConfig.js`                | 调度配置、模型映射校验、两种超时的合并读取 |
+| `src/core/ProxyServerSystem.js`              | 组件创建、调度模式、服务资源生命周期       |
+| `src/routes/StatusRoutes.js`                 | 当前设置接口，多数仅修改内存               |
+| `ui/app/pages/StatusPage.vue`                | 现有管理设置界面                           |
+| `src/core/ModelScheduler.js`                 | 并发槽位、排队、冷却与每日重置             |
+| `src/core/BrowserManager.js`                 | 初始化配置快照、工作池和上下文等待         |
+| `src/core/RequestHandler.js`                 | 请求策略和假流式独立保活                   |
+| `src/core/ScheduledRequestHandler.js`        | 提前响应头及等待保活                       |
+| `src/accounts/AccountConfig.js`              | 登录任务环境配置                           |
+| `src/accounts/AccountLoginService.js`        | 登录配置加载、数据库保存和任务维护         |
+| `src/accounts/AccountLoginQueue.js`          | 登录尝试配置快照和并发派发                 |
+| `src/routes/AccountRoutes.js`                | 已有自动恢复、并发、暂停设置接口           |
+| `ui/app/pages/AccountsPage.vue`              | 账号页便捷配置和运行操作                   |
+| `src/proxy/ProxyPoolService.js`              | 代理池保存和 Mihomo 应用流程               |
+| `ui/app/components/proxy/ProxyPoolPanel.vue` | 原有代理池设置入口                         |
 
 以上定位用于实施前核查，不授权修改本方案明确排除的后端算法和保活语义。
 

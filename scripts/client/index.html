@@ -17,6 +17,8 @@
                         if (!isNaN(authIndex) && authIndex >= 0) {
                             if (!window.chrome) window.chrome = {};
                             window.chrome._contextId = authIndex;
+                            window.chrome._browserGeneration = event.data.browserGeneration;
+                            window.chrome._browserAttemptId = event.data.attemptId;
                             console.log("[Init] ✅ Got authIndex:", authIndex);
                             resolveAuthIndex(authIndex);
                         }

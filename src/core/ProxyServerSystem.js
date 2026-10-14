@@ -23,7 +23,7 @@ const RequestHandler = require("./RequestHandler");
 const UsageStatsService = require("./UsageStatsService");
 const { ConfigurationService } = require("../config/ConfigurationService");
 const WebRoutes = require("../routes/WebRoutes");
-const PublicDashboardServer = require("../public/PublicDashboardServer");
+const PublicDashboardServer = require("../public/IsolatedPublicDashboard");
 const ProxyPoolService = require("../proxy/ProxyPoolService");
 const AccountLoginService = require("../accounts/AccountLoginService");
 
@@ -142,6 +142,7 @@ class ProxyServerSystem extends EventEmitter {
             await this._startWebSocketServer();
             if (this.config.publicDashboard.enabled) {
                 this.publicDashboardServer = new PublicDashboardServer({
+                    browserManager: this.browserManager,
                     config: this.config.publicDashboard,
                     logger: this.logger,
                     scheduler: this.scheduler,
@@ -414,6 +415,7 @@ class ProxyServerSystem extends EventEmitter {
                 req.path !== "/favicon.ico" &&
                 req.path !== "/login" &&
                 req.path !== "/health" &&
+                req.path !== "/livez" &&
                 !req.path.startsWith("/locales/") &&
                 !req.path.startsWith("/assets/") &&
                 req.path !== "/AIStudio_logo.svg" &&
@@ -656,7 +658,11 @@ class ProxyServerSystem extends EventEmitter {
 
                 this.connectionRegistry.addConnection(ws, {
                     address: req.socket.remoteAddress,
+                    attemptId: url.searchParams.get("attemptId") || undefined,
                     authIndex,
+                    browserGeneration: url.searchParams.has("generation")
+                        ? Number(url.searchParams.get("generation"))
+                        : undefined,
                 });
             });
         });

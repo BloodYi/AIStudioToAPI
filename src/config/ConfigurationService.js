@@ -164,8 +164,9 @@ class ConfigurationService {
     operational() {
         if (!this.system.ready) return false;
         if (!this.system.authSource?.availableIndices?.length) return true; // Account binding mode is healthy.
-        if (this.system.scheduler && this.running.scheduler.contextPoolMinReady === 0) return true; // Intentional lazy initialization.
         const health = this.system.browserManager?.getContextInitHealth?.();
+        if (health?.recovering) return false;
+        if (this.system.scheduler && this.running.scheduler.contextPoolMinReady === 0) return true; // Intentional lazy initialization.
         return (health?.ready || 0) > 0 && !(health?.staleInitializing > 0);
     }
     snapshot(reveal = false) {

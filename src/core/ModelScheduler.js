@@ -70,8 +70,10 @@ function calculateNextPacificResetAt(now, configuredTime, skipDate = null) {
     throw new Error(`Cannot calculate next ${PACIFIC_TIMEZONE} reset time`);
 }
 
+const normalizedModels = new Map();
 function normalizeModelName(model) {
     if (typeof model !== "string") throw schedulerError("Model must be a non-empty string", 400);
+    if (normalizedModels.has(model)) return normalizedModels.get(model);
     let normalized = FormatConverter.parseModelAntiPrefix(model).cleanModelName;
     normalized = FormatConverter.parseModelBuiltInToolSuffixes(normalized).cleanModelName;
     normalized = FormatConverter.parseModelStreamingModeSuffix(normalized).cleanModelName;
@@ -80,6 +82,8 @@ function normalizeModelName(model) {
         throw schedulerError(`Model must contain 1-${MAX_MODEL_NAME_LENGTH} characters`, 400);
     if (normalized.startsWith("__") || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(normalized))
         throw schedulerError("Invalid model name", 400);
+    if (normalizedModels.size >= 1024) normalizedModels.delete(normalizedModels.keys().next().value);
+    normalizedModels.set(model, normalized);
     return normalized;
 }
 
@@ -264,11 +268,12 @@ class ModelScheduler {
     }
 
     getVisibleModels() {
-        return new Set(
-            [...this._snapshotModels()]
-                .filter(model => !model.startsWith("__"))
-                .filter(model => !this.hiddenModels.has(model))
+        if (this._roundVisibleModels) return this._roundVisibleModels;
+        const models = new Set(
+            [...this._snapshotModels()].filter(model => !model.startsWith("__") && !this.hiddenModels.has(model))
         );
+        if (this._draining) this._roundVisibleModels = models;
+        return models;
     }
 
     isAccountQuotaExhausted(account, now = this.now(), models = this.getVisibleModels()) {
@@ -313,9 +318,9 @@ class ModelScheduler {
     coordinateContextPool() {
         if (this.closed || this.poolCoordinationQueued) return;
         this.poolCoordinationQueued = true;
-        queueMicrotask(() => {
+        setImmediate(() => {
             this.poolCoordinationQueued = false;
-            if (this.closed) return;
+            if (this.closed || this.recovering || this.paused) return;
             this._scheduleCooldownWake();
             this.browserManager?.reconcileContextPool?.();
         });
@@ -360,10 +365,15 @@ class ModelScheduler {
     }
 
     eligibleAccounts(model, excluded = new Set()) {
-        return this.authSource
-            .getRotationIndices()
-            .map(index => this.account(index))
-            .filter(account => !excluded.has(account.key) && this.isResourceEligible(account, model));
+        let eligible = this._eligibleRound?.get(model);
+        if (!eligible) {
+            eligible = this.authSource
+                .getRotationIndices()
+                .map(index => this.account(index))
+                .filter(account => this.isResourceEligible(account, model));
+            this._eligibleRound?.set(model, eligible);
+        }
+        return excluded.size ? eligible.filter(account => !excluded.has(account.key)) : eligible;
     }
 
     candidates(model, excluded = new Set()) {
@@ -390,7 +400,9 @@ class ModelScheduler {
         }
         return (
             account.inflight > 0 ||
-            [...this.accounts.values()].filter(entry => entry.inflight > 0).length < this.config.maxWorkers
+            (this._draining
+                ? this._roundActiveAccountCount
+                : [...this.accounts.values()].filter(entry => entry.inflight > 0).length) < this.config.maxWorkers
         );
     }
 
@@ -400,11 +412,21 @@ class ModelScheduler {
 
     acquire(model, excluded = new Set(), signal) {
         if (this.closed) return Promise.reject(schedulerError("Scheduler is shutting down"));
+        if (this.recovering) return Promise.reject(schedulerError("Service recovering", 503));
         try {
             model = this.assertModelAccessible(model);
         } catch (error) {
             return Promise.reject(error);
         }
+        const atLimit =
+            this.pending.length >= (this.config.globalQueueSize ?? 1000) ||
+            this.pending.filter(item => item.model === model).length >= this.config.queueSize;
+        const immediate =
+            atLimit &&
+            !this.paused &&
+            this.workers.some(worker => !worker.lease) &&
+            this.readyCandidates(model, excluded).some(account => this.canLease(account, model));
+        if (atLimit && !immediate) return Promise.reject(schedulerError("Queue full", 429));
         if (signal?.aborted) return Promise.reject(schedulerError("Client disconnected", 499));
         const eligible = this.eligibleAccounts(model, excluded);
         if (!eligible.length) return Promise.reject(schedulerError(`No eligible accounts for model ${model}`));
@@ -419,10 +441,18 @@ class ModelScheduler {
                 this.drain();
             };
             signal?.addEventListener("abort", item.abort, { once: true });
+            if (this.pending.length >= (this.config.globalQueueSize ?? 1000) && !immediate) {
+                signal?.removeEventListener("abort", item.abort);
+                reject(schedulerError("Queue full", 429));
+                return;
+            }
             this.pending.push(item);
             this.drain();
             if (this.pending.includes(item)) {
-                if (this.pending.filter(entry => entry.model === model).length > this.config.queueSize) {
+                if (
+                    this.pending.filter(entry => entry.model === model).length > this.config.queueSize ||
+                    this.pending.length > (this.config.globalQueueSize ?? 1000)
+                ) {
                     this.remove(item);
                     reject(schedulerError(`Queue full for model ${model}`, 429));
                 } else {
@@ -445,10 +475,47 @@ class ModelScheduler {
     }
 
     drain() {
+        if (this.closed || this.recovering || this.paused || this._draining) return;
+        this._draining = true;
+        const started = performance.now();
+        const deadline = started + (this.config.drainBudgetMs ?? 8);
+        this._roundModels = null;
+        this._eligibleRound = new Map();
+        this._roundActiveAccountCount = [...this.accounts.values()].filter(account => account.inflight > 0).length;
+        try {
+            this._drainRound(deadline);
+        } finally {
+            this._roundModels = null;
+            this._roundVisibleModels = null;
+            this._eligibleRound = null;
+            this._draining = false;
+            this.metrics.drain_rounds = (this.metrics.drain_rounds || 0) + 1;
+            this.metrics.last_drain_ms = performance.now() - started;
+        }
+    }
+
+    _continueDrain() {
+        if (this._drainQueued || this.closed) return;
+        this._drainQueued = setImmediate(() => {
+            this._drainQueued = null;
+            this.drain();
+        });
+    }
+
+    _drainRound(deadline) {
         if (this.closed) return;
         this.coordinateContextPool();
         // Reservation and selection are synchronous: there is no await between checking and leasing.
-        for (const item of [...this.pending]) {
+        // Resume a finite validation pass instead of rescanning its prefix forever.
+        this._validationQueue ||= [...this.pending];
+        this._validationCursor ||= 0;
+        while (this._validationCursor < this._validationQueue.length) {
+            if (this._validationCursor && performance.now() >= deadline) {
+                this._continueDrain();
+                return;
+            }
+            const item = this._validationQueue[this._validationCursor++];
+            if (!this.pending.includes(item)) continue;
             if (this.hiddenModels.has(item.model)) {
                 this.remove(item);
                 item.reject(schedulerError(`Model ${item.model} is disabled`, 403));
@@ -458,7 +525,11 @@ class ModelScheduler {
             }
         }
         if (this.paused) return;
-        this._signalContextDemand();
+        if (performance.now() >= deadline) {
+            this._continueDrain();
+            return;
+        }
+        this._signalContextDemand(deadline);
         // Stop replenishing one context when a waiting model needs a different account.
         // Existing streams finish normally; this prevents permanent starvation at capacity.
         const activeAccounts = [...this.accounts.values()].filter(account => account.inflight > 0);
@@ -479,30 +550,23 @@ class ModelScheduler {
             this.drainingAccount = null;
         }
         for (const worker of this.workers.filter(entry => !entry.lease)) {
-            const options = this.pending.filter(item => {
-                const active = this.active(item.model);
-                const allocation = this.config.allocation[item.model];
-                const staticLimit =
-                    allocation?.preferred ??
-                    Math.max(
-                        1,
-                        this.config.globalConcurrency -
-                            Object.values(this.config.allocation).reduce((sum, entry) => sum + entry.preferred, 0)
-                    );
-                return (
-                    active < (this.config.modelConcurrency[item.model] ?? this.config.globalConcurrency) &&
-                    (this.config.dynamic || active < staticLimit) &&
-                    this.readyCandidates(item.model, item.excluded).some(account => this.canLease(account, item.model))
-                );
-            });
-            const priority = item => {
-                const active = this.active(item.model);
-                const allocation = this.config.allocation[item.model] || { min: 0, preferred: 1 };
-                return active < allocation.min ? 0 : active < allocation.preferred ? 1 : 2;
-            };
-            options.sort((a, b) => priority(a) - priority(b) || a.order - b.order);
-            const item = options[0];
+            if (performance.now() >= deadline) {
+                if (
+                    !this.browserManager ||
+                    !this.config.readyContextOnly ||
+                    [...(this.browserManager.contexts?.values() || [])].some(data => data.state === "READY")
+                )
+                    this._continueDrain();
+                break;
+            }
+            const selection = this._selectPendingItem(deadline);
+            if (!selection.done) {
+                this._continueDrain();
+                break;
+            }
+            const item = selection.item;
             if (!item) break;
+            if (!this.pending.includes(item) || !this._canDispatchItem(item)) continue;
             const accounts = this.readyCandidates(item.model, item.excluded).filter(account =>
                 this.canLease(account, item.model)
             );
@@ -525,6 +589,7 @@ class ModelScheduler {
             });
             const account = accounts[0];
             const slot = this.slot(account, item.model);
+            if (!account.inflight) this._roundActiveAccountCount++;
             account.inflight++;
             slot.inflight++;
             slot.last_used_at = Date.now();
@@ -544,12 +609,58 @@ class ModelScheduler {
             this.observe("context_wait_ms", Date.now() - item.createdAt);
             item.resolve(lease);
         }
+        if (!this._drainQueued) {
+            this._validationQueue = null;
+            this._validationCursor = 0;
+        }
     }
 
-    _signalContextDemand() {
+    _canDispatchItem(item) {
+        if (item.signal?.aborted || this.hiddenModels.has(item.model)) return false;
+        const active = this.active(item.model);
+        const allocation = this.config.allocation[item.model];
+        const staticLimit =
+            allocation?.preferred ??
+            Math.max(
+                1,
+                this.config.globalConcurrency -
+                    Object.values(this.config.allocation).reduce((sum, entry) => sum + entry.preferred, 0)
+            );
+        return (
+            active < (this.config.modelConcurrency[item.model] ?? this.config.globalConcurrency) &&
+            (this.config.dynamic || active < staticLimit) &&
+            this.readyCandidates(item.model, item.excluded).some(account => this.canLease(account, item.model))
+        );
+    }
+
+    _selectPendingItem(deadline) {
+        const pass = (this._selectionPass ||= { best: null, cursor: 0, items: [...this.pending], priority: Infinity });
+        while (pass.cursor < pass.items.length) {
+            if (performance.now() >= deadline) return { done: false };
+            const item = pass.items[pass.cursor++];
+            if (!this.pending.includes(item) || !this._canDispatchItem(item)) continue;
+            const active = this.active(item.model);
+            const allocation = this.config.allocation[item.model] || { min: 0, preferred: 1 };
+            const priority = active < allocation.min ? 0 : active < allocation.preferred ? 1 : 2;
+            if (priority < pass.priority || (priority === pass.priority && item.order < pass.best.order)) {
+                pass.best = item;
+                pass.priority = priority;
+            }
+        }
+        this._selectionPass = null;
+        return { done: true, item: pass.best };
+    }
+
+    _signalContextDemand(deadline = Infinity) {
         if (!this.browserManager || !this.config.readyContextOnly) return;
+        if (this.browserManager._contextInitTasks?.size >= this.config.contextInitConcurrency) return;
         const demanded = new Set();
-        for (const item of this.pending) {
+        const requests = [];
+        const offset = this._demandOffset || 0;
+        for (let n = 0; n < this.pending.length; n++) {
+            if (performance.now() >= deadline) break;
+            const item = this.pending[(offset + n) % this.pending.length];
+            this._demandOffset = (offset + n + 1) % this.pending.length;
             if (this.readyCandidates(item.model, item.excluded).some(account => this.canLease(account, item.model)))
                 continue;
             const cold = this.eligibleAccounts(item.model, item.excluded).find(
@@ -557,7 +668,37 @@ class ModelScheduler {
             );
             if (cold && !demanded.has(cold.index)) {
                 demanded.add(cold.index);
-                this.browserManager.requestContext(cold.index, item.model);
+                requests.push({ authIndex: cold.index, model: item.model });
+                if (requests.length >= this.config.contextInitConcurrency) break;
+            }
+        }
+        if (this.browserManager.requestContexts) this.browserManager.requestContexts(requests);
+        else for (const { authIndex, model } of requests) this.browserManager.requestContext(authIndex, model);
+    }
+
+    beginRecovery(reason) {
+        this.recovering = true;
+        this._selectionPass = null;
+        this._validationQueue = null;
+        this._validationCursor = 0;
+        const error = Object.assign(schedulerError(`Service recovering: ${reason}`, 503), {
+            kind: "transport",
+            reason: "service_recovery",
+        });
+        for (const item of [...this.pending]) {
+            this.remove(item);
+            item.reject(error);
+        }
+        for (const worker of this.workers) {
+            const lease = worker.lease;
+            if (lease) {
+                try {
+                    lease.abort?.(error);
+                } catch (cause) {
+                    this.logger.error?.(`[Scheduler] Recovery abort failed: ${cause.message}`);
+                } finally {
+                    this.release(lease);
+                }
             }
         }
     }
@@ -669,6 +810,7 @@ class ModelScheduler {
     release(lease, success = false) {
         if (!lease || lease.released) return;
         lease.released = true;
+        this.metrics.completed = (this.metrics.completed || 0) + 1;
         if (success && lease.attempted && !lease.recorded) {
             this._recordAccountObservedResult(lease.account, 200);
             lease.slot.success_count++;
@@ -908,13 +1050,15 @@ class ModelScheduler {
     }
 
     _snapshotModels() {
-        return new Set(
-            [
-                ...Object.keys(this.config.allocation),
-                ...this.pending.map(item => item.model),
-                ...[...this.accounts.values()].flatMap(account => Object.keys(account.models)),
-            ].map(model => (model.startsWith("__") ? model : normalizeModelName(model)))
-        );
+        if (this._roundModels) return this._roundModels;
+        const names = new Set([
+            ...Object.keys(this.config.allocation),
+            ...this.pending.map(item => item.model),
+            ...[...this.accounts.values()].flatMap(account => Object.keys(account.models)),
+        ]);
+        const models = new Set([...names].map(model => (model.startsWith("__") ? model : normalizeModelName(model))));
+        if (this._draining) this._roundModels = models;
+        return models;
     }
 
     _visibleSnapshotModels() {
@@ -926,6 +1070,11 @@ class ModelScheduler {
         if (!this._snapshotModels().has(normalized)) throw schedulerError(`Unknown scheduler model ${normalized}`, 404);
         if (this.hiddenModels.has(normalized)) return { changed: false, hidden: true, model: normalized };
         this.hiddenModels.add(normalized);
+        for (const item of [...this.pending]) {
+            if (item.model !== normalized) continue;
+            this.remove(item);
+            item.reject(schedulerError(`Model ${normalized} is disabled`, 403));
+        }
         this.sequence++;
         this.flush();
         this.drain();
@@ -1432,6 +1581,7 @@ class ModelScheduler {
 
     close() {
         this.closed = true;
+        clearImmediate(this._drainQueued);
         this.clearTimer(this.cooldownWakeTimer);
         this.cooldownWakeTimer = null;
         this.nextCooldownCheckAt = null;

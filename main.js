@@ -26,6 +26,33 @@ const initializeServer = async () => {
     let serverSystem;
     try {
         serverSystem = new ProxyServerSystem();
+        const { monitorEventLoopDelay } = require("node:perf_hooks");
+        const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+        eventLoopDelay.enable();
+        const runtimeTimer = setInterval(() => {
+            serverSystem.runtimeHealth = {
+                event_loop_max_ms: Number((eventLoopDelay.max / 1e6).toFixed(2)),
+                event_loop_p99_ms: Number((eventLoopDelay.percentile(99) / 1e6).toFixed(2)),
+                updated_at: new Date().toISOString(),
+            };
+            eventLoopDelay.reset();
+        }, 5000);
+        runtimeTimer.unref();
+        process.send?.({ policy: serverSystem.config.scheduler, type: "supervision-policy" });
+        process.on("message", message => {
+            if (message?.type !== "health-probe") return;
+            const health = serverSystem.browserManager.getContextInitHealth();
+            process.send?.({
+                progress: {
+                    completed: serverSystem.scheduler?.metrics.completed || 0,
+                    generation: health.generation,
+                    pending: (serverSystem.scheduler?.pending.length || 0) + health.initializing,
+                    ready: health.ready,
+                },
+                sequence: message.sequence,
+                type: "health-reply",
+            });
+        });
         await serverSystem.start(initialAuthIndex);
 
         let shuttingDown = false;
@@ -58,7 +85,15 @@ const initializeServer = async () => {
         if (shuttingDown) return;
         if (!serverSystem.configurationService.operational())
             throw new Error("Service contexts did not become healthy within startup deadline");
-        process.send?.({ configuration: serverSystem.configurationService.runningDocument(), type: "ready" });
+        const address = serverSystem.httpServer.address();
+        process.send?.({
+            configuration: serverSystem.configurationService.runningDocument(),
+            healthEndpoint: {
+                host: address.address === "0.0.0.0" ? "127.0.0.1" : address.address === "::" ? "::1" : address.address,
+                port: address.port,
+            },
+            type: "ready",
+        });
     } catch (error) {
         console.error("❌ Server startup failed:", error.message);
         process.send?.({ error: error.message, type: "startup-error" });

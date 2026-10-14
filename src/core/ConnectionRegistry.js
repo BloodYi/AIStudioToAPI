@@ -53,6 +53,18 @@ class ConnectionRegistry extends EventEmitter {
             return;
         }
 
+        const manager = this.browserManager;
+        const owner = manager?._contextInitAttempts?.get(authIndex) || manager?.contexts?.get(authIndex);
+        if (
+            clientInfo.browserGeneration !== undefined &&
+            (clientInfo.browserGeneration !== manager?.browserGeneration ||
+                (clientInfo.attemptId && clientInfo.attemptId !== (owner?.id || owner?.attemptId)))
+        ) {
+            this._safeCloseWebSocket(websocket, 1008, "Stale browser resource");
+            return;
+        }
+        websocket._browserGeneration = clientInfo.browserGeneration;
+
         // Check if there's already a connection for this authIndex
         const existingConnection = this.connectionsByAuth.get(authIndex);
         if (existingConnection && existingConnection !== websocket) {

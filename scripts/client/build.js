@@ -139,7 +139,11 @@ class ConnectionManager extends EventTarget {
         }
 
         // Add authIndex to WebSocket URL for server-side identification
-        const wsUrl = this.authIndex >= 0 ? `${this.endpoint}?authIndex=${this.authIndex}` : this.endpoint;
+        const ownership =
+            window.chrome?._browserGeneration === undefined
+                ? ""
+                : `&generation=${window.chrome._browserGeneration}&attemptId=${encodeURIComponent(window.chrome._browserAttemptId || "")}`;
+        const wsUrl = this.authIndex >= 0 ? `${this.endpoint}?authIndex=${this.authIndex}${ownership}` : this.endpoint;
         Logger.output("Connecting to server:", wsUrl);
         return new Promise((resolve, reject) => {
             try {

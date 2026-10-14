@@ -42,6 +42,10 @@ class BrowserManager {
         this.stickyProxyManager = new StickyProxyManager(logger, authSource);
         this.stickyProxyManager.isEnabled();
         this.browser = null;
+        this.browserGeneration = 0;
+        this.browserState = "STOPPED";
+        this._lifecycleTail = Promise.resolve();
+        this.poolMetrics = { capacity_skips: 0, demand_batches: 0, scans: 0 };
 
         // Multi-context architecture: Store all initialized contexts
         // Map: authIndex -> {context, page, healthMonitorInterval}
@@ -240,6 +244,8 @@ class BrowserManager {
     }
 
     _isCurrentInitAttempt(attempt) {
+        if (attempt?.browserGeneration !== undefined && attempt.browserGeneration !== this.browserGeneration)
+            return false;
         const service = this.authSource?.accountLoginService;
         if (service?.state && attempt?.sessionVersion !== undefined) {
             const account = service.state.accounts.find(item => item.authIndex === attempt.authIndex);
@@ -260,13 +266,13 @@ class BrowserManager {
     }
 
     async _runInitOperation(attempt, operation, task, timeoutMs = this.contextOperationTimeoutMs) {
-        if (!attempt) return task();
+        if (!attempt) return withHardTimeout(task, timeoutMs || 10000, { operation, reason: "page_operation_timeout" });
         timeoutMs = timeoutMs || 10000;
         this._assertCurrentInitAttempt(attempt);
         attempt.operation = operation;
         attempt.operationStartedAt = Date.now();
         try {
-            return await withHardTimeout(task, timeoutMs, {
+            const result = await withHardTimeout(task, timeoutMs, {
                 attemptId: attempt.id,
                 authIndex: attempt.authIndex,
                 code: "PLAYWRIGHT_RPC_TIMEOUT",
@@ -274,6 +280,8 @@ class BrowserManager {
                 phase: attempt.phase,
                 reason: "playwright_rpc_timeout",
             });
+            this._assertCurrentInitAttempt(attempt);
+            return result;
         } catch (error) {
             if (error?.code === "PLAYWRIGHT_RPC_TIMEOUT") {
                 const now = Date.now();
@@ -290,50 +298,130 @@ class BrowserManager {
     }
 
     _recordBrowserRpcTimeout(attempt, error) {
+        if (attempt.browserGeneration !== undefined && attempt.browserGeneration !== this.browserGeneration) return;
+        // Mouse is mandatory, but a failed page action is not proof of browser failure.
+        if (error.operation?.startsWith("mouse.") || error.operation === "context.storageState") return;
         const now = Date.now();
-        const windowMs = this.browserRpcFailureWindowMs || 60000;
-        this._browserRpcFailures = (this._browserRpcFailures || []).filter(item => now - item.at <= windowMs);
+        this._browserRpcFailures = (this._browserRpcFailures || []).filter(
+            item => now - item.at <= (this.browserRpcFailureWindowMs || 60000)
+        );
         this._browserRpcFailures.push({ at: now, authIndex: attempt.authIndex });
-        const affectedAccounts = new Set(this._browserRpcFailures.map(item => item.authIndex));
-        if (affectedAccounts.size >= (this.browserRpcFailureThreshold || 2)) {
-            this.logger.error(
-                `[Browser] browser_transport_suspect reason=playwright_rpc_timeout accounts=${[
-                    ...affectedAccounts,
-                ].join(",")} window_ms=${windowMs} last_operation=${error.operation || "unknown"}`
-            );
-            this._triggerBrowserRecovery("playwright_rpc_timeout");
-        }
+        if (new Set(this._browserRpcFailures.map(item => item.authIndex)).size < (this.browserRpcFailureThreshold || 2))
+            return;
+        this._confirmBrowserFault("playwright_rpc_timeout");
+    }
+
+    _confirmBrowserFault(reason) {
+        if (this._browserProbeTask || this._recovering || !this.browser) return;
+        const browser = this.browser;
+        const pages = [...this.contexts.values(), ...(this._contextInitAttempts?.values() || [])]
+            .map(data => data.page)
+            .filter(page => page && !page.isClosed());
+        if (!pages.length) return;
+        this._browserProbeTask = Promise.all(
+            pages.slice(0, 3).map(page =>
+                withHardTimeout(() => page.evaluate(() => true), this.contextCleanupTimeoutMs || 5000).then(
+                    () => true,
+                    () => false
+                )
+            )
+        )
+            .then(results => {
+                if (this.browser === browser && !results.some(Boolean)) this._triggerBrowserRecovery(reason);
+            })
+            .finally(() => {
+                this._browserProbeTask = null;
+            });
+    }
+
+    _requestApplicationRecovery(reason) {
+        this.browserState = "FAILED";
+        this._recovering = true;
+        this.scheduler?.beginRecovery?.(reason);
+        this.logger.error(
+            `[Browser] application_recovery_requested reason=${reason} generation=${this.browserGeneration}`
+        );
+        process.send?.({ reason, type: "runtime-recovery" });
     }
 
     _triggerBrowserRecovery(reason) {
-        if (!this.browser || this._browserRecoveryTask) return this._browserRecoveryTask;
-        const scheduler = this.scheduler;
-        const wasPaused = scheduler?.paused === true;
-        if (scheduler) scheduler.paused = true;
+        if (this._browserRecoveryTask) return this._browserRecoveryTask;
+        if (this.scheduler?.closed) return;
+        const policy = this.config?.scheduler || this.scheduler?.config || {};
+        if (this._recoveryStableAt && Date.now() - this._recoveryStableAt >= (policy.browserRecoveryStableMs || 300000))
+            this._recoveryAttempts = 0;
+        this._recoveryStableAt = null;
+        this._recoveryAttempts = (this._recoveryAttempts || 0) + 1;
+        this._recovering = true;
         for (const data of this.contexts.values()) {
-            data.lastDisconnectReason = "browser_recovery";
             data.state = "RECONNECTING";
+            data.lastDisconnectReason = "browser_recovery";
         }
-        this.logger.error(`[Browser] browser_recovery_started reason=${reason}`);
-        this._browserRecoveryTask = Promise.resolve()
-            .then(async () => {
-                await this.closeBrowser();
-                if (scheduler?.closed) return;
-                await this._ensureBrowser();
-            })
+        this.browserState = "RECOVERING";
+        this.scheduler?.beginRecovery?.(reason);
+        if (this._recoveryAttempts > (policy.browserRecoveryMaxAttempts || 3)) {
+            this._requestApplicationRecovery("browser_recovery_budget_exhausted");
+            return;
+        }
+        this.logger.error(
+            `[Browser] browser_recovery_started reason=${reason} generation=${this.browserGeneration} attempt=${this._recoveryAttempts}`
+        );
+        this._browserRecoveryTask = (async () => {
+            await this.closeBrowser();
+            if (this.scheduler?.closed) return;
+            const delay = Math.min(
+                60000,
+                (policy.browserRecoveryBackoffMs || 5000) * 2 ** (this._recoveryAttempts - 1)
+            );
+            await new Promise(resolve => {
+                this._recoveryTimer = setTimeout(resolve, delay + Math.floor(Math.random() * delay * 0.2));
+            });
+            if (this.scheduler?.closed) return;
+            await this._ensureBrowser({ recovery: true });
+            if (this.scheduler) {
+                const index =
+                    this._poolCandidates()[0] ??
+                    this.authSource
+                        .getRotationIndices()
+                        .find(authIndex => this.scheduler.isAccountPoolResident?.(authIndex) !== false);
+                if (index !== undefined) this.contextUnavailable.delete(index);
+                if (index === undefined) throw new Error("No context available for recovery readiness");
+                this._recoveryAuthIndex = index;
+                try {
+                    await this._startPooledContext(index);
+                } finally {
+                    this._recoveryAuthIndex = undefined;
+                }
+                if (!this.isContextReady(index)) throw new Error("Recovery context did not become ready");
+            } else {
+                const index = this.authSource.getRotationIndices()[0];
+                this._recoveryAuthIndex = index;
+                try {
+                    await this._getOrStartContextInit(index);
+                } finally {
+                    this._recoveryAuthIndex = undefined;
+                }
+            }
+            this._recovering = false;
+            this.browserState = "RUNNING";
+            this._recoveryStableAt = Date.now();
+            if (this.scheduler) this.scheduler.recovering = false;
+            this.logger.info(
+                `[Browser] browser_recovery_service_ready reason=${reason} generation=${this.browserGeneration}`
+            );
+            this.scheduler?.drain?.();
+        })()
             .catch(error => {
                 this.logger.error(
                     `[Browser] browser_recovery_failed reason=${reason} error=${JSON.stringify(error.message)}`
                 );
+                this._requestApplicationRecovery("browser_recovery_failed");
             })
             .finally(() => {
                 this._browserRpcFailures = [];
                 this._contextCleanupTimeoutCount = 0;
                 this._browserRecoveryTask = null;
-                if (scheduler && !wasPaused && !scheduler.closed) scheduler.paused = false;
-                scheduler?.drain?.();
-                this._pumpContextPool?.();
-                this.logger.info(`[Browser] browser_recovery_finished reason=${reason}`);
+                if (!this._recovering) this._pumpContextPool();
             });
         return this._browserRecoveryTask;
     }
@@ -364,6 +452,14 @@ class BrowserManager {
         }
     }
 
+    _considerCleanupRecovery() {
+        const healthy = [...(this.contexts?.keys() || [])].some(index => this.isContextReady(index));
+        const capacity = this.scheduler?.config?.maxWorkers || this.config?.maxContexts || 1;
+        if (!healthy && (this._contextCapacityClosures?.size || 0) >= capacity)
+            this._triggerBrowserRecovery("context_cleanup_timeout");
+        else this._confirmBrowserFault("context_cleanup_timeout");
+    }
+
     async _closeAttemptContext(attempt) {
         if (!attempt?.context) return { closed: false, skipped: true };
         if (attempt.cleanupTask) return attempt.cleanupTask;
@@ -372,14 +468,18 @@ class BrowserManager {
         attempt.cleanupTask = (async () => {
             this._contextCapacityClosures ??= new Map();
             this._contextCapacityClosures.set(attempt, attempt.authIndex);
+            let physicallyClosed = false;
             const closeTask = Promise.resolve()
                 .then(() => attempt.context.close())
-                .then(() => ({ closed: true }))
+                .then(() => {
+                    physicallyClosed = true;
+                    return { closed: true };
+                })
                 .catch(error => ({ closed: false, error }))
                 .finally(() => {
                     // A cleanup watchdog may finish before the physical close does.
                     // Retain capacity until that close actually settles or the browser resets.
-                    if (!this._contextCapacityClosures.delete(attempt)) return;
+                    if (!physicallyClosed || !this._contextCapacityClosures.delete(attempt)) return;
                     this.scheduler?.coordinateContextPool?.();
                     this._pumpContextPool();
                 });
@@ -390,15 +490,16 @@ class BrowserManager {
                     cleanupTimer = setTimeout(() => resolve({ closed: false, timedOut: true }), cleanupTimeoutMs);
                 }),
             ]).finally(() => clearTimeout(cleanupTimer));
+            if (attempt.browserGeneration !== undefined && attempt.browserGeneration !== this.browserGeneration)
+                return result;
             if (result.timedOut) {
                 this._contextCleanupTimeoutCount = (this._contextCleanupTimeoutCount || 0) + 1;
                 this.logger.error(
                     `[Context#${attempt.authIndex}] context_cleanup_timeout attempt=${attempt.id} timeout_ms=${cleanupTimeoutMs} browser_suspect=true`
                 );
-                if (this._contextCleanupTimeoutCount >= 2) {
-                    this._triggerBrowserRecovery("context_cleanup_timeout");
-                }
+                if (this._contextCleanupTimeoutCount >= 2) this._considerCleanupRecovery();
             } else if (result.error) {
+                this._considerCleanupRecovery();
                 this.logger.warn(
                     `[Context#${attempt.authIndex}] context_init_cleanup attempt=${attempt.id} context_closed=false duration_ms=${Date.now() - startedAt} error=${JSON.stringify(result.error.message)}`
                 );
@@ -435,9 +536,15 @@ class BrowserManager {
         const staleAfter = (this.contextInitTotalTimeoutMs || 180000) + 10000;
         const ages = attempts.map(attempt => now - attempt.startedAt);
         return {
+            browserState: this.browserState || "STOPPED",
+            cleanupPending: this._contextCapacityClosures?.size || 0,
+            generation: this.browserGeneration || 0,
             initializing: attempts.length,
+            metrics: this.poolMetrics || {},
             oldestInitializingMs: ages.length ? Math.max(...ages) : 0,
-            ready: [...this.contexts.values()].filter(data => data.state === "READY").length,
+            ready: [...this.contexts.keys()].filter(index => this.isContextReady(index)).length,
+            recovering: Boolean(this._recovering),
+            recoveryAttempts: this._recoveryAttempts || 0,
             staleInitializing: ages.filter(age => age > staleAfter).length,
         };
     }
@@ -845,20 +952,31 @@ class BrowserManager {
                 return;
             }
 
-            const storageState = await this._runInitOperation(attempt, "context.storageState", () =>
-                contextData.context.storageState()
-            );
+            if (contextData.authUpdateRunning) return;
+            contextData.authUpdateRunning = true;
+            const snapshotTask = Promise.resolve().then(() => contextData.context.storageState());
+            snapshotTask
+                .finally(() => {
+                    contextData.authUpdateRunning = false;
+                })
+                .catch(() => {});
+            const storageState = await withHardTimeout(() => snapshotTask, this.contextOperationTimeoutMs || 10000, {
+                operation: "context.storageState",
+                reason: "auth_refresh_timeout",
+            });
+            if (this.contexts.get(authIndex) !== contextData) return;
 
             if (attempt) this._assertCurrentInitAttempt(attempt);
 
             if (this.authSource.accountLoginService?.state) {
-                await this.authSource.accountLoginService.exclusive(() =>
-                    this.authSource.accountLoginService.refreshSession(
+                await this.authSource.accountLoginService.exclusive(() => {
+                    if (this.contexts.get(authIndex) !== contextData) return;
+                    return this.authSource.accountLoginService.refreshSession(
                         authIndex,
                         contextData.page?.accountSessionVersion,
                         storageState
-                    )
-                );
+                    );
+                });
                 return;
             }
 
@@ -975,6 +1093,8 @@ class BrowserManager {
 
         return `
             (function() {
+                window._browserGeneration = ${this.browserGeneration || 0};
+                window._browserAttemptId = ${JSON.stringify(this._contextInitAttempts?.get(authIndex)?.id || null)};
                 if (window._privacyProtectionInjected) return;
                 window._privacyProtectionInjected = true;
 
@@ -1012,6 +1132,8 @@ class BrowserManager {
                                 console.log('[BrowserManager] Received authIndex request, responding with: ${authIndex}');
                                 event.source.postMessage({
                                     type: 'authIndexResponse',
+                                    browserGeneration: window._browserGeneration,
+                                    attemptId: window._browserAttemptId,
                                     authIndex: ${authIndex}
                                 }, '*');
                             }
@@ -1047,8 +1169,8 @@ class BrowserManager {
                 );
             }
         } catch (e) {
-            if (e?.code === "PLAYWRIGHT_RPC_TIMEOUT") throw e;
-            // Ignore movement errors if page is closed
+            e.reason ||= "required_mouse_failed";
+            throw e;
         }
     }
 
@@ -1358,6 +1480,8 @@ class BrowserManager {
 
         // Run every 4 seconds
         contextData.healthMonitorInterval = setInterval(async () => {
+            if (contextData.monitorRunning || this.contexts.get(authIndex) !== contextData || this._recovering) return;
+            contextData.monitorRunning = true;
             try {
                 // Check if this is still the current active account
                 // This prevents background contexts from running healthMonitor unnecessarily
@@ -1388,13 +1512,16 @@ class BrowserManager {
 
                             // Scroll
                             // eslint-disable-next-line no-undef
-                            await page.evaluate(() => window.scrollBy(0, (Math.random() - 0.5) * 20));
+                            await this._runInitOperation(null, "monitor.scroll", () =>
+                                page.evaluate(() => globalThis.window.scrollBy(0, (Math.random() - 0.5) * 20))
+                            );
                             // Human-like mouse jitter
                             const x = Math.floor(Math.random() * (vp.width * 0.8));
                             const y = Math.floor(Math.random() * (vp.height * 0.8));
                             await this._simulateHumanMovement(page, x, y);
                         } catch (e) {
-                            /* empty */
+                            await this._handleRequiredMouseFailure(authIndex, contextData, e);
+                            return;
                         }
                     }
 
@@ -1403,7 +1530,8 @@ class BrowserManager {
                         try {
                             await this._simulateHumanMovement(page, 1, 1);
                         } catch (e) {
-                            /* empty */
+                            await this._handleRequiredMouseFailure(authIndex, contextData, e);
+                            return;
                         }
                     }
 
@@ -1420,49 +1548,53 @@ class BrowserManager {
                     }
 
                     // 4. Popup & Overlay Cleanup
-                    await page.evaluate(() => {
-                        const blockers = [
-                            "div.cdk-overlay-backdrop",
-                            "div.cdk-overlay-container",
-                            "div.cdk-global-overlay-wrapper",
-                        ];
+                    await this._runInitOperation(null, "monitor.overlay", () =>
+                        page.evaluate(() => {
+                            const blockers = [
+                                "div.cdk-overlay-backdrop",
+                                "div.cdk-overlay-container",
+                                "div.cdk-global-overlay-wrapper",
+                            ];
 
-                        const targetTexts = [
-                            "Reload",
-                            "Retry",
-                            "Got it",
-                            "Dismiss",
-                            "Not now",
-                            "Continue to the app",
-                            "Skip",
-                        ];
+                            const targetTexts = [
+                                "Reload",
+                                "Retry",
+                                "Got it",
+                                "Dismiss",
+                                "Not now",
+                                "Continue to the app",
+                                "Skip",
+                            ];
 
-                        // Remove passive blockers
-                        blockers.forEach(selector => {
+                            // Remove passive blockers
+                            blockers.forEach(selector => {
+                                // eslint-disable-next-line no-undef
+                                document.querySelectorAll(selector).forEach(el => el.remove());
+                            });
+
+                            // Click active buttons if visible
                             // eslint-disable-next-line no-undef
-                            document.querySelectorAll(selector).forEach(el => el.remove());
-                        });
+                            document.querySelectorAll("button").forEach(btn => {
+                                // Check if the element occupies space (simple visibility check)
+                                const rect = btn.getBoundingClientRect();
+                                const isVisible = rect.width > 0 && rect.height > 0;
 
-                        // Click active buttons if visible
-                        // eslint-disable-next-line no-undef
-                        document.querySelectorAll("button").forEach(btn => {
-                            // Check if the element occupies space (simple visibility check)
-                            const rect = btn.getBoundingClientRect();
-                            const isVisible = rect.width > 0 && rect.height > 0;
+                                if (isVisible) {
+                                    const text = (btn.innerText || "").trim();
+                                    const ariaLabel = btn.getAttribute("aria-label");
 
-                            if (isVisible) {
-                                const text = (btn.innerText || "").trim();
-                                const ariaLabel = btn.getAttribute("aria-label");
-
-                                // Match text or aria-label
-                                if (targetTexts.includes(text) || ariaLabel === "Close") {
-                                    console.log(`[ProxyClient] HealthMonitor clicking: ${text || "Close Button"}`);
-                                    btn.click();
+                                    // Match text or aria-label
+                                    if (targetTexts.includes(text) || ariaLabel === "Close") {
+                                        console.log(`[ProxyClient] HealthMonitor clicking: ${text || "Close Button"}`);
+                                        btn.click();
+                                    }
                                 }
-                            }
-                        });
-                    });
+                            });
+                        })
+                    );
                 } catch (err) {
+                    if (err.reason === "page_operation_timeout")
+                        await this._handleRequiredMouseFailure(authIndex, contextData, err);
                     // Silent catch to prevent log spamming on navigation
                 }
             } catch (globalError) {
@@ -1478,8 +1610,26 @@ class BrowserManager {
                         );
                     }
                 }
+            } finally {
+                contextData.monitorRunning = false;
             }
         }, 4000);
+    }
+
+    async _handleRequiredMouseFailure(authIndex, data, error) {
+        if (this.contexts.get(authIndex) !== data) return;
+        this.logger.warn(`[Context#${authIndex}] required_mouse_failed reason=${error.reason || "mouse_failed"}`);
+        data.state = "RECONNECTING";
+        data.draining = true;
+        clearInterval(data.healthMonitorInterval);
+        data.healthMonitorInterval = null;
+        // Do not change account eligibility. Existing streams get a bounded grace period.
+        const deadline = Date.now() + (this.contextCleanupTimeoutMs || 5000);
+        while (!this._isContextIdle(authIndex) && Date.now() < deadline)
+            await new Promise(resolve => setTimeout(resolve, 100));
+        if (this.contexts.get(authIndex) !== data) return;
+        await this.closeContext(authIndex, { keepBrowser: true });
+        this.requestContext(authIndex);
     }
 
     /**
@@ -1892,6 +2042,7 @@ class BrowserManager {
     async ensureWorkerContext(authIndex) {
         if (!this.scheduler) return this.launchOrSwitchContext(authIndex);
         if (this.scheduler.closed) throw new Error("Scheduler is shutting down");
+        if (this._recovering) throw new ContextAbortedError(authIndex, "browser recovering");
         if (this.isContextReady(authIndex)) return;
         this.requestContext(authIndex);
         const deadline = Date.now() + this.scheduler.config.queueTimeoutMs;
@@ -1906,7 +2057,14 @@ class BrowserManager {
 
     isContextReady(authIndex) {
         const data = this.contexts.get(authIndex);
-        if (!data?.page || data.page.isClosed() || data.draining || this._poolClosingContexts?.has(authIndex))
+        if (
+            !data?.page ||
+            data.page.isClosed() ||
+            data.draining ||
+            data.mouseReady === false ||
+            (data.browserGeneration !== undefined && data.browserGeneration !== this.browserGeneration) ||
+            this._poolClosingContexts?.has(authIndex)
+        )
             return false;
         const connection = this.connectionRegistry?.getConnectionByAuth(authIndex, false);
         const connected = connection && (connection.readyState === undefined || connection.readyState === 1);
@@ -1992,7 +2150,22 @@ class BrowserManager {
         )
             return;
         this.contextDemand ??= new Map();
-        this.contextDemand.set(authIndex, { at: Date.now(), model });
+        const previous = this.contextDemand.get(authIndex);
+        const models = new Set(previous?.models || (previous?.model ? [previous.model] : []));
+        if (model) models.add(model);
+        this.contextDemand.set(authIndex, { at: Date.now(), model, models, unscoped: previous?.unscoped || !model });
+        if (!this._demandBatch) this._pumpContextPool();
+    }
+
+    requestContexts(requests) {
+        if (!requests.length) return;
+        this._demandBatch = true;
+        try {
+            for (const { authIndex, model } of requests) this.requestContext(authIndex, model);
+        } finally {
+            this._demandBatch = false;
+        }
+        if (this.poolMetrics) this.poolMetrics.demand_batches++;
         this._pumpContextPool();
     }
 
@@ -2001,12 +2174,13 @@ class BrowserManager {
         if (!demand) return false;
         const account = this.scheduler.account(authIndex);
         if (account.disabled || account.healthy === false || this.authSource.isExpired?.(authIndex)) return false;
-        if (!demand.model) return true;
+        if (demand.unscoped || !demand.model) return true;
         const scheduler = this.scheduler;
         if (!scheduler.isResourceEligible) return true;
-        return (
-            scheduler.isResourceEligible(account, demand.model) &&
-            scheduler.pending.some(item => item.model === demand.model && !item.excluded.has(account.key))
+        return [...(demand.models || [demand.model])].some(
+            model =>
+                scheduler.isResourceEligible(account, model) &&
+                scheduler.pending.some(item => item.model === model && !item.excluded.has(account.key))
         );
     }
 
@@ -2070,6 +2244,7 @@ class BrowserManager {
     }
 
     _poolCandidates() {
+        if (this.poolMetrics) this.poolMetrics.scans++;
         const rotation = this.authSource.getRotationIndices();
         const closing = new Set([
             ...(this._poolClosingContexts || []),
@@ -2127,7 +2302,20 @@ class BrowserManager {
     }
 
     _pumpContextPool() {
-        if (!this.scheduler || this.scheduler.closed || this._pumpingContextPool) return;
+        if (
+            !this.scheduler ||
+            this.scheduler.closed ||
+            this.scheduler.paused ||
+            this._recovering ||
+            this._browserRecoveryTask ||
+            this.isClosingIntentionally ||
+            this._pumpingContextPool
+        )
+            return;
+        if (this._contextInitTasks.size >= this.scheduler.config.contextInitConcurrency) {
+            if (this.poolMetrics) this.poolMetrics.capacity_skips++;
+            return;
+        }
         this._pumpingContextPool = true;
         try {
             for (const authIndex of this._poolCandidates()) {
@@ -2156,6 +2344,8 @@ class BrowserManager {
         this.contextCapacityReservations ??= new Map();
         if (
             this.scheduler.closed ||
+            (this._recovering && this._recoveryAuthIndex !== authIndex) ||
+            this.isClosingIntentionally ||
             this._contextInitTasks.size >= this.scheduler.config.contextInitConcurrency ||
             this.contextCapacityReservations.has(authIndex) ||
             this._poolClosingContexts?.has(authIndex) ||
@@ -2224,13 +2414,7 @@ class BrowserManager {
     }
 
     async _ensureBrowserForPool() {
-        if (this.browser) return;
-        if (!this._ensureBrowserTask) {
-            this._ensureBrowserTask = this._ensureBrowser().finally(() => {
-                this._ensureBrowserTask = null;
-            });
-        }
-        await this._ensureBrowserTask;
+        await this._ensureBrowser({ recovery: this._recoveryAuthIndex !== undefined });
     }
 
     markContextRequest(authIndex, now = Date.now()) {
@@ -2331,6 +2515,8 @@ class BrowserManager {
     }
 
     async _createBrowserContext(options, authIndex) {
+        const owner = this.browser;
+        const generation = this.browserGeneration;
         let releaseTurn;
         const previousTurn = this._contextCreationQueue || Promise.resolve();
         const currentTurn = new Promise(resolve => {
@@ -2343,14 +2529,20 @@ class BrowserManager {
         let creationTimedOut = false;
         let timeoutId;
         try {
-            if (!this.browser) throw new Error("Browser disconnected before context creation");
+            if (
+                this.isClosingIntentionally ||
+                !owner ||
+                owner !== this.browser ||
+                generation !== this.browserGeneration
+            )
+                throw new ContextAbortedError(authIndex, "browser generation changed before context creation");
 
-            const creationTask = this.browser.newContext(options);
+            const creationTask = owner.newContext(options);
             // If Playwright eventually completes after the watchdog fired, close
             // the orphan instead of letting an untracked context leak.
             creationTask
                 .then(context => {
-                    if (creationTimedOut) context.close().catch(() => {});
+                    if (creationTimedOut || owner !== this.browser) context.close().catch(() => {});
                 })
                 .catch(() => {});
 
@@ -2381,7 +2573,13 @@ class BrowserManager {
 
     _startPooledContext(authIndex) {
         if (this._contextInitTasks.has(authIndex)) return this._contextInitTasks.get(authIndex);
-        if (!this.scheduler || this.scheduler.closed || this.isContextReady(authIndex)) return Promise.resolve();
+        if (
+            !this.scheduler ||
+            this.scheduler.closed ||
+            this.isContextReady(authIndex) ||
+            (this._recovering && this._recoveryAuthIndex !== authIndex)
+        )
+            return Promise.resolve();
         const reservation = this._reserveContextCapacity(authIndex);
         if (!reservation) return Promise.resolve();
         return this._getOrStartContextInit(authIndex, {
@@ -2389,11 +2587,19 @@ class BrowserManager {
             isBackgroundTask: true,
             onError: error => {
                 if (isContextAbortedError(error)) return;
-                const retryAt = Date.now() + 5000;
-                this.contextUnavailable.set(authIndex, { at: Date.now(), error, reason: error.reason, retryAt });
+                const failures = (this.contextUnavailable.get(authIndex)?.failures || 0) + 1;
+                const delay = Math.min(60000, 5000 * 2 ** Math.min(4, failures - 1));
+                const retryAt = Date.now() + delay;
+                this.contextUnavailable.set(authIndex, {
+                    at: Date.now(),
+                    error,
+                    failures,
+                    reason: error.reason,
+                    retryAt,
+                });
                 this.contextDemand.delete(authIndex);
                 this.logger.error(`[ContextPool] Context #${authIndex} unavailable: ${error.message}`);
-                const retryTimer = setTimeout(() => this._pumpContextPool(), 5000);
+                const retryTimer = setTimeout(() => this._pumpContextPool(), delay);
                 retryTimer.unref?.();
             },
             onSettledAfterRelease: () => {
@@ -2440,8 +2646,31 @@ class BrowserManager {
         });
     }
 
-    async _ensureBrowser() {
+    _withBrowserLifecycle(operation) {
+        const task = (this._lifecycleTail || Promise.resolve()).catch(() => {}).then(operation);
+        this._lifecycleTail = task.catch(() => {});
+        return task;
+    }
+
+    _ensureBrowser(options = {}) {
+        if (this._recovering && !options.recovery)
+            return Promise.reject(new ContextAbortedError(-1, "browser recovering"));
+        if (!this._ensureBrowserTask) {
+            const task = this._withBrowserLifecycle(() => {
+                if (this._recovering && !options.recovery) throw new ContextAbortedError(-1, "browser recovering");
+                return this._launchBrowser();
+            });
+            this._ensureBrowserTask = task;
+            task.finally(() => {
+                if (this._ensureBrowserTask === task) this._ensureBrowserTask = null;
+            }).catch(() => {});
+        }
+        return this._ensureBrowserTask;
+    }
+
+    async _launchBrowser() {
         if (this.browser) return;
+        this.browserState = "STARTING";
 
         const isStickyProxyEnabled = this.stickyProxyManager.isEnabled();
         const proxyConfig = this._proxyResolver || isStickyProxyEnabled ? null : parseProxyFromEnv();
@@ -2456,23 +2685,22 @@ class BrowserManager {
             this._currentAuthIndex = -1;
             throw new Error(`Browser executable not found at path: ${browserExecutablePath}`);
         }
-        this.browser = await firefox.launch({
+        const browser = await firefox.launch({
             args: this.launchArgs,
             executablePath: browserExecutablePath,
             firefoxUserPrefs: this.firefoxUserPrefs,
             headless: true,
             ...(proxyConfig ? { proxy: proxyConfig } : {}),
         });
-        this.browser.on("disconnected", () => {
+        this.browser = browser;
+        this.browserGeneration = (this.browserGeneration || 0) + 1;
+        this.browserState = this._recovering ? "RECOVERING" : "RUNNING";
+        browser.on("disconnected", () => {
+            if (this.browser !== browser) return;
             const unexpected = !this.isClosingIntentionally;
-            if (unexpected) {
-                this.logger.error("❌ [Browser] Main browser unexpectedly disconnected!");
-            } else {
-                this.logger.debug("[Browser] Main browser closed intentionally.");
-            }
             this.browser = null;
             this._cleanupAllContexts();
-            if (unexpected) setImmediate(() => this._pumpContextPool());
+            if (unexpected) this._triggerBrowserRecovery("browser_disconnected");
         });
         this.logger.info("✅ [Browser] Main browser instance launched successfully.");
     }
@@ -3023,6 +3251,8 @@ class BrowserManager {
      * also the only code allowed to release the tracking markers.
      */
     _getOrStartContextInit(authIndex, options = {}) {
+        if (this.isClosingIntentionally || (this._recovering && this._recoveryAuthIndex !== authIndex))
+            return Promise.reject(new ContextAbortedError(authIndex, "browser recovering"));
         const existing = this._contextInitTasks.get(authIndex);
         if (existing) return existing;
 
@@ -3190,6 +3420,7 @@ class BrowserManager {
             // Check abort status before expensive operations
             this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
+            attempt.browserGeneration = this.browserGeneration;
             this._setInitPhase(attempt, "context_creation");
             context = await this._createBrowserContext(
                 {
@@ -3336,6 +3567,11 @@ class BrowserManager {
                 }
             }
 
+            // Required anti-idle movement, including connections established before the wait loop.
+            this._setInitPhase(attempt, "required_mouse");
+            await this._simulateHumanMovement(page, 1, 1, attempt);
+            attempt.mouseReady = true;
+
             // Final check before adding to contexts map
             this._setInitPhase(attempt, "publishing");
             this._assertCurrentInitAttempt(attempt);
@@ -3350,10 +3586,12 @@ class BrowserManager {
             ) {
                 this.contexts.set(authIndex, {
                     attemptId: attempt.id,
+                    browserGeneration: attempt.browserGeneration,
                     context,
                     createdAt: Date.now(),
                     healthMonitorInterval: null,
                     lastRequestAt: 0,
+                    mouseReady: attempt.mouseReady,
                     page,
                     proxyInfo,
                     sessionVersion: page.accountSessionVersion,
@@ -3363,9 +3601,9 @@ class BrowserManager {
                 this._throwIfContextInitAborted(authIndex, isBackgroundTask);
             }
 
-            // Update auth file
+            // Refresh independently of READY publication. Ownership is checked before writing.
             this._assertCurrentInitAttempt(attempt);
-            await this._updateAuthFile(authIndex, attempt);
+            setImmediate(() => this._updateAuthFile(authIndex).catch(error => this.logger.warn(error.message)));
 
             return { context, page };
         } catch (error) {
@@ -3706,6 +3944,7 @@ class BrowserManager {
                 }
             }
 
+            await this._simulateHumanMovement(page, 1, 1);
             this._sendActiveTrigger("[Reconnect]", page);
 
             // [Auth Update] Save the refreshed cookies to the auth file immediately
@@ -3796,6 +4035,8 @@ class BrowserManager {
         }
 
         const contextData = this.contexts.get(authIndex);
+        this._closingContextOwners ??= new Map();
+        this._closingContextOwners.set(authIndex, contextData);
         this.closingContexts.add(authIndex);
         this._poolClosingContexts ??= new Set();
         this._poolClosingContexts.add(authIndex);
@@ -3838,15 +4079,31 @@ class BrowserManager {
         // Close the context AFTER removing from map
         try {
             if (contextData.context) {
-                await contextData.context.close();
+                const closing = contextData.context.close();
+                this._contextCapacityClosures ??= new Map();
+                this._contextCapacityClosures.set(contextData, authIndex);
+                closing
+                    .then(() => {
+                        if (this._contextCapacityClosures.delete(contextData)) {
+                            this.scheduler?.coordinateContextPool?.();
+                            this._pumpContextPool();
+                        }
+                    })
+                    .catch(() => {});
+                await withHardTimeout(() => closing, this.contextCleanupTimeoutMs || 5000);
                 this.logger.info(`[Browser] Context #${authIndex} closed.`);
             }
         } catch (e) {
             this.logger.warn(`[Browser] Error closing context #${authIndex}: ${e.message}`);
+            this._considerCleanupRecovery();
         } finally {
             this._poolClosingContexts.delete(authIndex);
             this.scheduler?.coordinateContextPool?.();
-            const cleanupTimer = setTimeout(() => this.closingContexts.delete(authIndex), 1000);
+            const cleanupTimer = setTimeout(() => {
+                if (this._closingContextOwners.get(authIndex) !== contextData) return;
+                this._closingContextOwners.delete(authIndex);
+                this.closingContexts.delete(authIndex);
+            }, 1000);
             cleanupTimer.unref?.();
         }
 
@@ -3884,7 +4141,9 @@ class BrowserManager {
         this.abortedContexts.clear();
         this.pendingContextClosures.clear();
         this.closingContexts.clear();
+        this._closingContextOwners?.clear();
         this._wsInitState.clear();
+        this._contextCreationQueue = Promise.resolve();
         this.context = null;
         this.page = null;
         this._currentAuthIndex = -1;
@@ -3898,38 +4157,36 @@ class BrowserManager {
      * Handles intervals, timeouts, and resetting all references.
      * In multi-context mode, cleans up all contexts.
      */
-    async closeBrowser() {
-        // Set flag to indicate intentional close - prevents ConnectionRegistry from
-        // attempting lightweight reconnect when WebSocket disconnects
+    closeBrowser() {
+        if (this._closeBrowserTask) return this._closeBrowserTask;
+        // Block admission synchronously, before waiting on an in-flight launch.
         this.isClosingIntentionally = true;
-
-        // Legacy single health monitor cleanup (for backward compatibility)
-        if (this.healthMonitorInterval) {
-            clearInterval(this.healthMonitorInterval);
-            this.healthMonitorInterval = null;
-        }
-
-        if (this.browser) {
-            this.logger.debug("[Browser] Closing main browser instance and all contexts...");
+        const task = this._withBrowserLifecycle(async () => {
+            const browser = this.browser;
+            this.browserState = "CLOSING";
+            for (const attempt of this._contextInitAttempts?.values() || []) attempt.cancel?.("browser closing");
             try {
-                // Give close() 5 seconds, otherwise force proceed
-                const closePromise = this.browser.close();
-                // Attach a catch handler to prevent unhandled rejection if timeout wins
-                closePromise.catch(() => {
-                    // Silently ignore - the timeout will handle this
-                });
-                await Promise.race([closePromise, new Promise(resolve => setTimeout(resolve, 5000))]);
-            } catch (e) {
-                this.logger.warn(`[Browser] Error during close (ignored): ${e.message}`);
+                if (browser) await withHardTimeout(() => browser.close(), this.contextCleanupTimeoutMs || 5000);
+                if (this.browser === browser) {
+                    this.browser = null;
+                    this._cleanupAllContexts();
+                }
+                const tasks = [...(this._contextInitTasks?.values() || [])];
+                if (tasks.length)
+                    await withHardTimeout(() => Promise.allSettled(tasks), this.contextCleanupTimeoutMs || 5000);
+                this.browserState = this._recovering ? "RECOVERING" : "STOPPED";
+            } catch (error) {
+                this._requestApplicationRecovery("browser_close_timeout");
+                throw error;
+            } finally {
+                this.isClosingIntentionally = false;
             }
-
-            this.browser = null;
-            this._cleanupAllContexts();
-            this.logger.debug("[Browser] Main browser instance and all contexts closed, currentAuthIndex reset to -1.");
-        }
-
-        // Reset flag after close is complete
-        this.isClosingIntentionally = false;
+        });
+        this._closeBrowserTask = task;
+        task.finally(() => {
+            if (this._closeBrowserTask === task) this._closeBrowserTask = null;
+        }).catch(() => {});
+        return task;
     }
 
     async switchAccount(newAuthIndex) {

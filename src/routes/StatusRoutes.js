@@ -204,6 +204,8 @@ class StatusRoutes {
         });
 
         // Health check endpoint (public, no authentication required)
+        app.get("/livez", (req, res) => res.json({ status: "alive" }));
+
         app.get("/health", (req, res) => {
             const now = new Date();
             const timezone = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -236,16 +238,28 @@ class StatusRoutes {
             };
             const browserConnected = Boolean(browserManager.browser?.isConnected?.() ?? browserManager.browser);
             const initLimit = this.serverSystem.scheduler?.config?.contextInitConcurrency || 1;
-            const status = !browserConnected
-                ? "unhealthy"
-                : contextPool.staleInitializing >= initLimit
-                  ? "unhealthy"
-                  : contextPool.staleInitializing > 0
-                    ? "degraded"
-                    : "ok";
+            const status =
+                contextPool.recovering || contextPool.ready === 0 || !browserConnected
+                    ? "unhealthy"
+                    : contextPool.staleInitializing >= initLimit
+                      ? "unhealthy"
+                      : contextPool.staleInitializing > 0
+                        ? "degraded"
+                        : "ok";
             const healthStatus = {
                 browserConnected,
                 contextPool,
+                runtime: this.serverSystem.runtimeHealth || null,
+                scheduler: this.serverSystem.scheduler
+                    ? {
+                          drain_rounds: this.serverSystem.scheduler.metrics.drain_rounds || 0,
+                          last_drain_ms: this.serverSystem.scheduler.metrics.last_drain_ms || 0,
+                          oldest_wait_ms: this.serverSystem.scheduler.pending.length
+                              ? Date.now() - this.serverSystem.scheduler.pending[0].createdAt
+                              : 0,
+                          queued: this.serverSystem.scheduler.pending.length,
+                      }
+                    : null,
                 status,
                 timestamp,
                 uptime: process.uptime(),

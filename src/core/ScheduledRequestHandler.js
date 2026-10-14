@@ -205,6 +205,13 @@ class ScheduledRequestHandler extends RequestHandler {
                 }
             }
             this.lease = await this.scheduler.acquire(this.model, excluded, this.controller.signal);
+            this.lease.abort = error => {
+                this.controller.abort(error);
+                if (this.proxyRequest)
+                    this._cancelCurrentAttemptBeforeRetry(this.proxyRequest, this.lease?.account.index);
+                this._sendErrorResponse(this.response, 503, error.message);
+                this._stopEarlyStreamKeepalive();
+            };
             this.excluded.add(this.lease.account.key);
             this.authSwitcher.currentAuthIndex = this.lease.account.index;
             try {

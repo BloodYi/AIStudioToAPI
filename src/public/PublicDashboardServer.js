@@ -40,7 +40,7 @@ class PublicDashboardServer {
             res.set("Access-Control-Allow-Headers", "Accept, Content-Type");
             return res.sendStatus(204);
         });
-        app.get("/healthz", (req, res) => res.json({ status: "ok" }));
+        app.get("/healthz", (req, res) => res.json(this.healthProvider?.() || { status: "ok" }));
         app.get("/api/public/dashboard", async (req, res) => {
             try {
                 const body = await this.service.getSnapshot();

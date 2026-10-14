@@ -786,13 +786,13 @@ test("a runner resolving after its watchdog cannot overwrite a newer attempt", a
     assert.equal(manager.contexts.get(6).value, "new");
 });
 
-test("RPC timeouts require distinct accounts before browser recovery is triggered", () => {
+test("distinct account RPC timeouts request independent evidence before recovery", () => {
     const manager = singleFlightFixture();
     manager.browserRpcFailureThreshold = 2;
     manager.browserRpcFailureWindowMs = 60000;
     manager._browserRpcFailures = [];
     const recoveries = [];
-    manager._triggerBrowserRecovery = reason => recoveries.push(reason);
+    manager._confirmBrowserFault = reason => recoveries.push(reason);
 
     manager._recordBrowserRpcTimeout({ authIndex: 1 }, { operation: "page.evaluate" });
     manager._recordBrowserRpcTimeout({ authIndex: 1 }, { operation: "locator.count" });

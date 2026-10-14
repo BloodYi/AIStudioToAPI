@@ -151,10 +151,15 @@ class FormatConverter {
             return { cleanModelName: modelName, thinkingLevel: null };
         }
 
-        const levels = Object.keys(FormatConverter.THINKING_LEVEL_MAP);
+        const levels = Object.keys(FormatConverter.THINKING_LEVEL_MAP).join("|");
+        if (FormatConverter._thinkingPatternKey !== levels) {
+            FormatConverter._thinkingPatternKey = levels;
+            FormatConverter._thinkingParen = new RegExp(`^(.+)\\((${levels})\\)$`, "i");
+            FormatConverter._thinkingHyphen = new RegExp(`^(.+)-(${levels})$`, "i");
+        }
 
         // Check parenthesis format: model(level)
-        const parenMatch = modelName.match(new RegExp(`^(.+)\\((${levels.join("|")})\\)$`, "i"));
+        const parenMatch = modelName.match(FormatConverter._thinkingParen);
         if (parenMatch) {
             const baseModel = parenMatch[1];
             const levelKey = parenMatch[2].toLowerCase();
@@ -165,7 +170,7 @@ class FormatConverter {
         }
 
         // Check hyphen format: model-level
-        const hyphenMatch = modelName.match(new RegExp(`^(.+)-(${levels.join("|")})$`, "i"));
+        const hyphenMatch = modelName.match(FormatConverter._thinkingHyphen);
         if (hyphenMatch) {
             const baseModel = hyphenMatch[1];
             const levelKey = hyphenMatch[2].toLowerCase();
