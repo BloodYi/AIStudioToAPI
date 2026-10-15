@@ -386,6 +386,44 @@ class ModelScheduler {
         return eligible.filter(account => this.browserManager.isContextReady(account.index));
     }
 
+    needsContextForRequest(item, account = null, ignoreReadyAccount = null) {
+        if (item.signal?.aborted || this.hiddenModels.has(item.model)) return false;
+        if (
+            account &&
+            (item.excluded.has(account.key) ||
+                !this.authSource.getRotationIndices().includes(account.index) ||
+                !this.isResourceEligible(account, item.model))
+        )
+            return false;
+        return !this.readyCandidates(item.model, item.excluded).some(
+            candidate => candidate.index !== ignoreReadyAccount && this.canLease(candidate, item.model)
+        );
+    }
+
+    hasUnmetContextDemand(authIndex, models) {
+        const account = this.account(authIndex);
+        // The initializer must retain its own demand until publication, including
+        // internal file contexts that are not ordinary warm-pool residents.
+        const ignoreReadyAccount = this.browserManager?.initializingContexts?.has(authIndex) ? authIndex : null;
+        return this.pending.some(
+            item =>
+                models.has(item.model) &&
+                this.needsContextForRequest(item, account, ignoreReadyAccount) &&
+                (ignoreReadyAccount !== null || !this.hasInitializingContextForRequest(item))
+        );
+    }
+
+    hasInitializingContextForRequest(item, indices = this.browserManager?.initializingContexts || []) {
+        return [...indices].some(index => {
+            const account = this.account(index);
+            return (
+                !item.excluded.has(account.key) &&
+                this.authSource.getRotationIndices().includes(index) &&
+                this.isResourceEligible(account, item.model)
+            );
+        });
+    }
+
     canLease(account, model) {
         if (account.key === this.drainingAccount) return false;
         if (model !== "__files__" && this.isAccountQuotaExhausted(account)) return false;
@@ -609,6 +647,9 @@ class ModelScheduler {
             this.observe("context_wait_ms", Date.now() - item.createdAt);
             item.resolve(lease);
         }
+        // Dispatch can consume the last ready slot. Reassess the remaining queue
+        // now, rather than waiting for a lease to finish before expanding.
+        if (this.pending.length && performance.now() < deadline) this._signalContextDemand(deadline);
         if (!this._drainQueued) {
             this._validationQueue = null;
             this._validationCursor = 0;
@@ -661,7 +702,16 @@ class ModelScheduler {
             if (performance.now() >= deadline) break;
             const item = this.pending[(offset + n) % this.pending.length];
             this._demandOffset = (offset + n + 1) % this.pending.length;
-            if (this.readyCandidates(item.model, item.excluded).some(account => this.canLease(account, item.model)))
+            if (!this.needsContextForRequest(item)) continue;
+            // An admitted initializer already covers this request's next dispatch
+            // opportunity. Its settlement will re-evaluate any remaining queue.
+            if (this.hasInitializingContextForRequest(item)) continue;
+            if (
+                this.hasInitializingContextForRequest(
+                    item,
+                    requests.map(request => request.authIndex)
+                )
+            )
                 continue;
             const cold = this.eligibleAccounts(item.model, item.excluded).find(
                 account => !demanded.has(account.index) && !this.browserManager.isContextReady(account.index)

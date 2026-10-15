@@ -836,6 +836,288 @@ function exhaust(scheduler, index, model = "pro", deadline = scheduler.now() + 6
     });
 }
 
+test("stale cold demands give a newly ready twelfth context a dispatch opportunity", async t => {
+    const { manager, scheduler } = quotaPoolFixture({
+        contextMaxConcurrency: 10,
+        contextPoolMinReady: 12,
+        maxWorkers: 12,
+    });
+    t.after(() => scheduler.close());
+    manager.authSource.getRotationIndices = () => Array.from({ length: 15 }, (_, index) => index);
+    for (let index = 0; index < 12; index++) {
+        manager.contexts.set(index, { lastRequestAt: 0, page: { isClosed: () => false }, state: "READY" });
+        scheduler.account(index).inflight = index === 11 ? 0 : 10;
+    }
+    scheduler.paused = true;
+    const pending = scheduler.acquire("pro");
+    pending.catch(() => {});
+    for (const index of [12, 13, 14]) manager.contextDemand.set(index, { model: "pro" });
+    scheduler.paused = false;
+    manager._pumpContextPool();
+    assert.equal(manager.contexts.get(11).draining, undefined);
+    scheduler.drain();
+    const lease = await pending;
+    assert.equal(lease.account.index, 11);
+    scheduler.release(lease);
+    for (let round = 0; round < 8; round++) {
+        manager.reconcileContextPool();
+        await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.deepEqual(manager.closedIndices, []);
+    assert.equal(manager.contextDemand.size, 0);
+    assert.equal(manager._contextInitTasks.size, 0);
+});
+
+test("warm deficit caused by draining occupancy never evicts a serviceable idle context", async t => {
+    const { manager, scheduler } = quotaPoolFixture({ contextPoolMinReady: 2, maxWorkers: 2 });
+    t.after(() => scheduler.close());
+    manager.contexts.set(0, { page: { isClosed: () => false }, state: "READY" });
+    manager.contexts.set(1, {
+        draining: true,
+        drainReason: "visible_models_rate_limited",
+        page: { isClosed: () => false },
+        state: "READY",
+    });
+    scheduler.account(1).inflight = 1;
+    manager._pumpContextPool();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(manager.closedIndices, []);
+    assert.equal(manager.isContextReady(0), true);
+    assert.equal(manager._contextInitTasks.size, 0);
+});
+
+test("a pool candidate is revalidated when the request disappears before admission", async t => {
+    const { manager, scheduler } = quotaPoolFixture({ contextPoolMinReady: 0, maxWorkers: 1 });
+    t.after(() => scheduler.close());
+    manager.contexts.set(0, { page: { isClosed: () => false }, state: "READY" });
+    scheduler.slot(scheduler.account(0), "pro").unsupported = true;
+    scheduler.paused = true;
+    const controller = new AbortController();
+    const pending = scheduler.acquire("pro", new Set(), controller.signal);
+    pending.catch(() => {});
+    manager.contextDemand.set(1, { model: "pro" });
+    assert.ok(manager._poolCandidates().includes(1));
+    controller.abort();
+    scheduler.paused = false;
+    await manager._startPooledContext(1);
+    assert.deepEqual(manager.closedIndices, []);
+    assert.equal(manager.isContextReady(0), true);
+    await assert.rejects(pending, /Client disconnected/);
+});
+
+test("multi-model demand checks each pending request's exclusions and cancellation", async t => {
+    const { manager, scheduler } = quotaPoolFixture({ contextPoolMinReady: 0 });
+    t.after(() => scheduler.close());
+    manager.contexts.set(0, { page: { isClosed: () => false }, state: "READY" });
+    scheduler.paused = true;
+    const controller = new AbortController();
+    const pro = scheduler.acquire("pro", new Set([scheduler.account(0).key]), controller.signal);
+    pro.catch(() => {});
+    const flash = scheduler.acquire("flash");
+    flash.catch(() => {});
+    manager.contextDemand.set(1, { model: "flash", models: new Set(["pro", "flash"]) });
+    manager.contextDemand.set(2, { model: "pro" });
+    scheduler.slot(scheduler.account(2), "pro").unsupported = true;
+    assert.equal(manager._hasValidContextDemand(1), true);
+    assert.equal(manager._hasValidContextDemand(2), false);
+    controller.abort();
+    assert.equal(manager._hasValidContextDemand(1), false);
+    scheduler.paused = false;
+    scheduler.drain();
+    const lease = await flash;
+    assert.equal(lease.account.index, 0);
+    scheduler.release(lease);
+    await assert.rejects(pro, /Client disconnected/);
+    assert.deepEqual(manager.closedIndices, []);
+});
+
+test("replacement rechecks newly available ready capacity after candidate selection", async t => {
+    const { manager, scheduler } = quotaPoolFixture({ contextPoolMinReady: 0, maxWorkers: 1 });
+    t.after(() => scheduler.close());
+    manager.contexts.set(0, { page: { isClosed: () => false }, state: "UNAVAILABLE" });
+    scheduler.paused = true;
+    const pending = scheduler.acquire("pro");
+    pending.catch(() => {});
+    manager.contextDemand.set(1, { model: "pro" });
+    assert.ok(manager._poolCandidates().includes(1));
+    manager.contexts.get(0).state = "READY";
+    manager._reserveContextCapacity(1, "demand");
+    assert.equal(manager.contexts.get(0).draining, undefined);
+    scheduler.paused = false;
+    scheduler.drain();
+    const lease = await pending;
+    assert.equal(lease.account.index, 0);
+    scheduler.release(lease);
+    assert.deepEqual(manager.closedIndices, []);
+});
+
+test("dispatching the last ready slot expands for remaining requests without waiting for release", async t => {
+    const { manager, scheduler } = quotaPoolFixture({
+        contextMaxConcurrency: 1,
+        contextPoolMinReady: 0,
+        maxWorkers: 2,
+    });
+    t.after(() => scheduler.close());
+    manager.contexts.set(0, { page: { isClosed: () => false }, state: "READY" });
+    scheduler.paused = true;
+    const pending = [scheduler.acquire("pro"), scheduler.acquire("pro")];
+    for (const promise of pending) promise.catch(() => {});
+    manager.contextDemand.set(1, { model: "pro" });
+    scheduler.paused = false;
+    scheduler.drain();
+    const leases = await Promise.all(pending);
+    assert.deepEqual(
+        leases.map(lease => lease.account.index),
+        [0, 1]
+    );
+    assert.equal(leases[0].released, false);
+    assert.deepEqual(manager.closedIndices, []);
+    for (const lease of leases) scheduler.release(lease);
+});
+
+test("one in-flight initializer covers concurrent stale demands until it can dispatch", async t => {
+    const { manager, scheduler } = quotaPoolFixture({ contextPoolMinReady: 0 });
+    t.after(() => scheduler.close());
+    let finishInit;
+    const gate = new Promise(resolve => {
+        finishInit = resolve;
+    });
+    t.after(() => finishInit());
+    let creations = 0;
+    const initialize = manager._initializeContext;
+    manager._initializeContext = async function (...args) {
+        creations++;
+        await gate;
+        return initialize.apply(this, args);
+    };
+    scheduler.paused = true;
+    const pending = [scheduler.acquire("pro"), scheduler.acquire("pro")];
+    for (const promise of pending) promise.catch(() => {});
+    for (const index of [0, 1, 2]) manager.contextDemand.set(index, { model: "pro" });
+    scheduler.paused = false;
+    manager._pumpContextPool();
+    scheduler.drain();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(creations, 1);
+    assert.equal(manager._contextInitTasks.size, 1);
+    finishInit();
+    const leases = await Promise.all(pending);
+    assert.ok(leases.every(lease => lease.account.index === 0));
+    assert.equal(creations, 1);
+    assert.deepEqual(manager.closedIndices, []);
+    for (const lease of leases) scheduler.release(lease);
+});
+
+test("a genuine model deficit replaces an unrelated idle context and obtains a lease", async t => {
+    const { manager, scheduler } = quotaPoolFixture({ contextPoolMinReady: 0, maxWorkers: 1 });
+    t.after(() => scheduler.close());
+    manager.contexts.set(0, { page: { isClosed: () => false }, state: "READY" });
+    scheduler.slot(scheduler.account(0), "pro").unsupported = true;
+    const lease = await scheduler.acquire("pro");
+    assert.equal(lease.account.index, 1);
+    assert.deepEqual(manager.closedIndices, [0]);
+    assert.equal(manager._contextCapacityIndices().size, 1);
+    scheduler.release(lease);
+});
+
+test("a request canceled during replacement does not initialize the old cold candidate", async t => {
+    const { manager, scheduler } = quotaPoolFixture({ contextPoolMinReady: 0, maxWorkers: 1 });
+    t.after(() => scheduler.close());
+    manager.contexts.set(0, { page: { isClosed: () => false }, state: "READY" });
+    scheduler.slot(scheduler.account(0), "pro").unsupported = true;
+    let finishClose;
+    const closing = new Promise(resolve => {
+        finishClose = resolve;
+    });
+    t.after(() => finishClose());
+    const close = manager.closeContext;
+    manager.closeContext = async function (...args) {
+        await closing;
+        return close.apply(this, args);
+    };
+    let creations = 0;
+    const initialize = manager._initializeContext;
+    manager._initializeContext = async function (...args) {
+        creations++;
+        return initialize.apply(this, args);
+    };
+    const controller = new AbortController();
+    const pending = scheduler.acquire("pro", new Set(), controller.signal);
+    pending.catch(() => {});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager._contextPoolReplacements.size, 1);
+    controller.abort();
+    finishClose();
+    for (let round = 0; round < 4; round++) await new Promise(resolve => setImmediate(resolve));
+    await assert.rejects(pending, /Client disconnected/);
+    assert.equal(creations, 0);
+    assert.equal(manager.contextDemand.size, 0);
+    assert.equal(manager._contextCapacityIndices().size, 0);
+});
+
+test("background recovery demand cannot displace a healthy full pool and expires", async t => {
+    const { manager, scheduler } = quotaPoolFixture({ contextPoolMinReady: 0, maxWorkers: 1 });
+    t.after(() => scheduler.close());
+    manager.contexts.set(0, { page: { isClosed: () => false }, state: "READY" });
+    manager.requestContext(1);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(manager.closedIndices, []);
+    assert.equal(manager.contextDemand.has(1), true);
+    manager.contextDemand.get(1).unscopedUntil = Date.now() - 1;
+    assert.deepEqual(manager._poolCandidates(), []);
+    assert.equal(manager.contextDemand.has(1), false);
+});
+
+test("a foreground waiter can replace idle capacity and leaves no unscoped demand", async t => {
+    const { manager, scheduler } = quotaPoolFixture({ contextPoolMinReady: 0, maxWorkers: 1 });
+    t.after(() => scheduler.close());
+    manager.contexts.set(0, { page: { isClosed: () => false }, state: "READY" });
+    await Promise.all([manager.ensureWorkerContext(1), manager.ensureWorkerContext(1)]);
+    assert.deepEqual(manager.closedIndices, [0]);
+    assert.equal(manager.isContextReady(1), true);
+    assert.equal(manager._foregroundContextWaiters.size, 0);
+    assert.equal(manager.contextDemand.size, 0);
+});
+
+test("a timed-out foreground waiter cannot cause a later idle replacement", async t => {
+    const { manager, scheduler } = quotaPoolFixture({
+        contextPoolMinReady: 0,
+        maxWorkers: 1,
+        queueTimeoutMs: 10,
+    });
+    t.after(() => scheduler.close());
+    manager.contexts.set(0, { page: { isClosed: () => false }, state: "READY" });
+    scheduler.account(0).inflight = 1;
+    await assert.rejects(manager.ensureWorkerContext(1), /Timeout waiting for ready context/);
+    assert.equal(manager._foregroundContextWaiters.size, 0);
+    assert.equal(manager.contextDemand.size, 0);
+    scheduler.account(0).inflight = 0;
+    manager._pumpContextPool();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(manager.closedIndices, []);
+});
+
+test("foreground timeout removes only its unscoped portion of a mixed demand", async t => {
+    const { manager, scheduler } = quotaPoolFixture({
+        contextPoolMinReady: 0,
+        maxWorkers: 1,
+        queueTimeoutMs: 10,
+    });
+    t.after(() => scheduler.close());
+    manager.contexts.set(0, { page: { isClosed: () => false }, state: "READY" });
+    scheduler.account(0).inflight = 10;
+    manager.contextDemand.set(1, { model: "pro", models: new Set(["pro"]) });
+    await assert.rejects(manager.ensureWorkerContext(1), /Timeout waiting for ready context/);
+    const demand = manager.contextDemand.get(1);
+    assert.ok(demand.models.has("pro"));
+    assert.equal(demand.unscopedUntil, 0);
+    assert.equal(manager._hasValidContextDemand(1), false);
+    scheduler.account(0).inflight = 0;
+    manager._pumpContextPool();
+    assert.equal(manager.contextDemand.size, 0);
+    assert.deepEqual(manager.closedIndices, []);
+});
+
 test("quota eviction releases every idle context and never rewarms exhausted accounts", async () => {
     const { manager, scheduler } = quotaPoolFixture();
     manager.startContextPool();

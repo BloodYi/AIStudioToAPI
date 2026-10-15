@@ -2044,14 +2044,31 @@ class BrowserManager {
         if (this.scheduler.closed) throw new Error("Scheduler is shutting down");
         if (this._recovering) throw new ContextAbortedError(authIndex, "browser recovering");
         if (this.isContextReady(authIndex)) return;
-        this.requestContext(authIndex);
-        const deadline = Date.now() + this.scheduler.config.queueTimeoutMs;
-        while (!this.isContextReady(authIndex)) {
-            if (this.scheduler.closed) throw new Error("Scheduler is shutting down");
-            const unavailable = this.contextUnavailable.get(authIndex);
-            if (unavailable?.error && !this._contextInitTasks.has(authIndex)) throw unavailable.error;
-            if (Date.now() >= deadline) throw new Error(`Timeout waiting for ready context #${authIndex}`);
-            await new Promise(resolve => setTimeout(resolve, 25));
+        this._foregroundContextWaiters ??= new Map();
+        this._foregroundContextWaiters.set(authIndex, (this._foregroundContextWaiters.get(authIndex) || 0) + 1);
+        try {
+            this.requestContext(authIndex);
+            const deadline = Date.now() + this.scheduler.config.queueTimeoutMs;
+            while (!this.isContextReady(authIndex)) {
+                if (this.scheduler.closed) throw new Error("Scheduler is shutting down");
+                const unavailable = this.contextUnavailable.get(authIndex);
+                if (unavailable?.error && !this._contextInitTasks.has(authIndex)) throw unavailable.error;
+                if (Date.now() >= deadline) throw new Error(`Timeout waiting for ready context #${authIndex}`);
+                await new Promise(resolve => setTimeout(resolve, 25));
+            }
+        } finally {
+            const remaining = this._foregroundContextWaiters.get(authIndex) - 1;
+            if (remaining) this._foregroundContextWaiters.set(authIndex, remaining);
+            else {
+                this._foregroundContextWaiters.delete(authIndex);
+                const demand = this.contextDemand.get(authIndex);
+                if (demand) {
+                    demand.unscoped = false;
+                    demand.unscopedUntil = 0;
+                    if (!demand.models?.size && !demand.model) this.contextDemand.delete(authIndex);
+                }
+            }
+            this.scheduler.coordinateContextPool?.();
         }
     }
 
@@ -2153,7 +2170,15 @@ class BrowserManager {
         const previous = this.contextDemand.get(authIndex);
         const models = new Set(previous?.models || (previous?.model ? [previous.model] : []));
         if (model) models.add(model);
-        this.contextDemand.set(authIndex, { at: Date.now(), model, models, unscoped: previous?.unscoped || !model });
+        this.contextDemand.set(authIndex, {
+            at: Date.now(),
+            model,
+            models,
+            unscoped: previous?.unscoped || !model,
+            unscopedUntil: !model
+                ? Date.now() + (this.scheduler.config.queueTimeoutMs || 120000)
+                : previous?.unscopedUntil,
+        });
         if (!this._demandBatch) this._pumpContextPool();
     }
 
@@ -2174,14 +2199,31 @@ class BrowserManager {
         if (!demand) return false;
         const account = this.scheduler.account(authIndex);
         if (account.disabled || account.healthy === false || this.authSource.isExpired?.(authIndex)) return false;
-        if (demand.unscoped || !demand.model) return true;
+        if (this._foregroundContextWaiters?.has(authIndex)) return true;
+        if ((demand.unscoped || !demand.model) && demand.unscopedUntil > Date.now()) return true;
+        return this._hasQueuedContextDemand(authIndex);
+    }
+
+    _hasQueuedContextDemand(authIndex) {
+        const demand = this.contextDemand?.get(authIndex);
+        if (!demand) return false;
         const scheduler = this.scheduler;
+        const models = demand.models || new Set(demand.model ? [demand.model] : []);
+        if (scheduler.hasUnmetContextDemand) return scheduler.hasUnmetContextDemand(authIndex, models);
+        // Compatibility with scheduler adapters that do not expose queue inspection.
         if (!scheduler.isResourceEligible) return true;
-        return [...(demand.models || [demand.model])].some(
+        const account = scheduler.account(authIndex);
+        return [...models].some(
             model =>
                 scheduler.isResourceEligible(account, model) &&
                 scheduler.pending.some(item => item.model === model && !item.excluded.has(account.key))
         );
+    }
+
+    _contextPoolPurpose(authIndex) {
+        if (this._foregroundContextWaiters?.has(authIndex)) return "foreground";
+        if (this._hasQueuedContextDemand(authIndex)) return "demand";
+        return this._hasValidContextDemand(authIndex) ? "recovery" : "warm";
     }
 
     _canKeepPooledContext(authIndex) {
@@ -2340,7 +2382,7 @@ class BrowserManager {
         ]);
     }
 
-    _reserveContextCapacity(authIndex) {
+    _reserveContextCapacity(authIndex, purpose = "foreground") {
         this.contextCapacityReservations ??= new Map();
         if (
             this.scheduler.closed ||
@@ -2360,10 +2402,10 @@ class BrowserManager {
             if (this._lastContextCapacityWait !== status) {
                 this._lastContextCapacityWait = status;
                 this.logger.debug(
-                    `[ContextPool] Waiting for capacity: occupied=${occupied.size}, max=${this.scheduler.config.maxWorkers}, reserved=${this.contextCapacityReservations.size}`
+                    `[ContextPool] Waiting for capacity: occupied=${occupied.size}, max=${this.scheduler.config.maxWorkers}, reserved=${this.contextCapacityReservations.size}, purpose=${purpose}`
                 );
             }
-            this._replaceIdlePooledContext(authIndex);
+            this._replaceIdlePooledContext(authIndex, purpose);
             return null;
         }
         // This synchronous claim precedes both init registration and every await.
@@ -2378,7 +2420,10 @@ class BrowserManager {
         this.contextCapacityReservations.delete(authIndex);
     }
 
-    _replaceIdlePooledContext(authIndex) {
+    _replaceIdlePooledContext(authIndex, purpose) {
+        // Warming and background reconnects may use free capacity, but cannot
+        // displace a healthy resident. Re-evaluate model demand at the mutation.
+        if (purpose !== "foreground" && (purpose !== "demand" || !this._hasQueuedContextDemand(authIndex))) return;
         this._contextPoolReplacements ??= new Map();
         // Finish one replacement before selecting another victim for the same demand.
         if (this._contextPoolReplacements.size || this._poolClosingContexts?.size) return;
@@ -2396,7 +2441,7 @@ class BrowserManager {
         this._contextPoolReplacements.set(idle, owner);
         Object.assign(this.contexts.get(idle), { draining: true, drainReason: "context_capacity" });
         this.logger.info(
-            `[ContextPool] Evicting context #${idle} for #${authIndex} (${this.contextEvictionReason(idle)})`
+            `[ContextPool] Evicting context #${idle} for #${authIndex} (${this.contextEvictionReason(idle)}), purpose=${purpose}`
         );
         // Mark synchronously, then close. Closing capacity is retained until settlement.
         Promise.resolve()
@@ -2447,7 +2492,7 @@ class BrowserManager {
         if (rank[0] === 0) return "account_disabled";
         if (rank[1] === 0) return "account_unhealthy";
         if (rank[2] === 0) return "visible_models_rate_limited";
-        if (rank[3] === 0) return "no_queued_demand";
+        if (rank[3] === 0) return "no_account_context_demand";
         return "healthy_idle_lru";
     }
 
@@ -2580,7 +2625,9 @@ class BrowserManager {
             (this._recovering && this._recoveryAuthIndex !== authIndex)
         )
             return Promise.resolve();
-        const reservation = this._reserveContextCapacity(authIndex);
+        const purpose = this._contextPoolPurpose(authIndex);
+        if (purpose === "warm" && !this._poolCandidates().includes(authIndex)) return Promise.resolve();
+        const reservation = this._reserveContextCapacity(authIndex, purpose);
         if (!reservation) return Promise.resolve();
         return this._getOrStartContextInit(authIndex, {
             capacityReservation: reservation,
@@ -2603,8 +2650,8 @@ class BrowserManager {
                 retryTimer.unref?.();
             },
             onSettledAfterRelease: () => {
-                this.scheduler?.coordinateContextPool?.();
                 this.scheduler?.drain();
+                this.scheduler?.coordinateContextPool?.();
                 this._pumpContextPool();
             },
             runner: async attempt => {
