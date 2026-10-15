@@ -26,14 +26,38 @@ const partialUnavailable = computed(
         (!data.value.history.enabled ||
             data.value.realtime.limit === 0 ||
             !supportsRecent.value ||
+            (data.value.cluster && data.value.cluster.status !== "complete") ||
             Object.values(data.value.model_stat_windows || {}).some(window => window.status !== "available"))
 );
 const rangeNotice = computed(() => {
     if (!supportsRecent.value) return "当前服务暂不支持近期统计";
-    if (effectiveRange.value === "all") return data.value?.history.enabled ? "" : "请求统计未启用";
+    if (effectiveRange.value === "all") {
+        if (
+            data.value?.cluster &&
+            data.value.history.status !== "disabled" &&
+            data.value.coverage?.history.status !== "complete"
+        )
+            return "仅包含当前可用统计来源，累计历史可能随节点离线或统计重置而变化。";
+        return data.value?.history.enabled ? "" : "请求统计未启用";
+    }
     const status = data.value.model_stat_windows[effectiveRange.value].status;
-    return status === "disabled" ? "请求统计未启用" : status === "unavailable" ? "近期统计暂时不可用" : "";
+    if (status === "disabled") return "请求统计未启用";
+    if (status === "unavailable") return "近期统计暂时不可用";
+    if (
+        data.value?.cluster &&
+        (data.value.cluster.status !== "complete" ||
+            data.value.models.some(
+                model => model.coverage?.recent_stats?.[effectiveRange.value]?.status !== "complete"
+            ))
+    )
+        return "仅包含当前可用统计来源，部分节点或模型统计不可用。";
+    return "";
 });
+const incomplete = value => value && value.status !== "complete";
+const modelIncomplete = model => ["quota", "today", "realtime"].some(key => incomplete(model.coverage?.[key]));
+const statsCoverage = model =>
+    effectiveRange.value === "all" ? model.coverage?.history : model.coverage?.recent_stats?.[effectiveRange.value];
+const sourceTime = value => (value ? new Date(value).toLocaleString("zh-CN") : "—");
 const error = ref(false);
 const loading = ref(true);
 const currentTime = ref(Date.now());
@@ -240,6 +264,15 @@ function onMockChange() {
                 <p class="eyebrow">PUBLIC STATUS</p>
                 <h1>服务用量公示</h1>
                 <p class="updated">数据更新时间：{{ updatedAt }} (本地) · 配额重置倒计时：{{ resetCountdown }}</p>
+                <p v-if="data?.cluster" class="updated cluster-status" aria-live="polite">
+                    数据有效节点 {{ data.cluster.fresh_nodes }} / {{ data.cluster.expected_nodes }} · 可服务节点
+                    {{ data.cluster.serving_nodes }} / {{ data.cluster.expected_nodes }} ·
+                    {{ data.cluster.status === "complete" ? "数据完整" : "部分节点或统计不可用" }}
+                </p>
+                <p v-if="data?.cluster" class="updated source-times">
+                    源数据时间：{{ sourceTime(data.cluster.oldest_source_at) }} ～
+                    {{ sourceTime(data.cluster.newest_source_at) }}（本地）
+                </p>
             </div>
             <div class="header-actions">
                 <span
@@ -338,7 +371,16 @@ function onMockChange() {
                         <b class="tabular-num">{{ duration(data.history.average_duration_ms) }}</b>
                     </article>
                 </div>
-                <p v-if="!data.history.enabled" class="muted">历史请求统计未启用。</p>
+                <p v-if="data.history.status === 'disabled' || (!data.cluster && !data.history.enabled)" class="muted">
+                    历史请求统计未启用。
+                </p>
+                <p v-else-if="data.cluster && data.history.status === 'unavailable'" class="muted">
+                    历史统计暂不可用。
+                </p>
+                <p v-if="incomplete(data.coverage?.history)" class="muted">
+                    历史请求仅包含当前可用统计来源；合计可能随节点离线、删除或统计重置而下降。
+                </p>
+                <p v-if="incomplete(data.coverage?.realtime)" class="muted">当前负载仅包含可服务且数据有效的节点。</p>
             </section>
 
             <section aria-labelledby="models-title">
@@ -367,11 +409,21 @@ function onMockChange() {
                         >
                             <div class="quota-meta">
                                 <span class="quota-label">预估剩余额度</span>
-                                <em class="quota-badge">{{ model.quota.estimable ? "预估" : "实验" }}</em>
+                                <em class="quota-badge">{{
+                                    model.quota.estimable
+                                        ? "预估"
+                                        : model.quota.known_estimated_remaining != null
+                                          ? "部分可估算"
+                                          : "未知"
+                                }}</em>
                             </div>
                             <b class="quota-value">
                                 {{
-                                    model.quota.estimable ? `${number(getEstimatedRemaining(model))} 次` : "暂无法估算"
+                                    model.quota.estimable
+                                        ? `${number(getEstimatedRemaining(model))} 次`
+                                        : model.quota.known_estimated_remaining != null
+                                          ? `已知部分约 ${number(model.quota.known_estimated_remaining)} 次`
+                                          : "暂无法估算"
                                 }}
                             </b>
                         </div>
@@ -402,6 +454,12 @@ function onMockChange() {
                                     <span v-if="model.realtime.rate_limited_accounts > 0" class="account-warn">
                                         · {{ number(model.realtime.rate_limited_accounts) }} 耗尽
                                     </span>
+                                    <span v-else-if="model.realtime.available_accounts == null" class="account-warn"
+                                        >· 状态未知</span
+                                    >
+                                    <span v-else-if="incomplete(model.coverage?.realtime)" class="account-warn"
+                                        >· 仅已知部分</span
+                                    >
                                     <span v-else class="account-all-ok">· 全部就绪</span>
                                 </div>
                             </div>
@@ -423,6 +481,9 @@ function onMockChange() {
                                 <dd class="tabular-num">{{ number(model.realtime.active) }}</dd>
                             </div>
                         </dl>
+                        <p v-if="modelIncomplete(model)" class="muted">
+                            额度与今日、实时数据可能不完整，未知值显示为 —。
+                        </p>
                     </article>
                 </div>
                 <p v-if="data.models.length" class="helper">
@@ -463,6 +524,9 @@ function onMockChange() {
                             <tr v-for="model in data.models" :key="model.model">
                                 <th class="table-model-th">
                                     <span>{{ model.model }}</span>
+                                    <span v-if="incomplete(statsCoverage(model))" class="muted"
+                                        >（仅可用统计来源）</span
+                                    >
                                     <span class="table-model-tag" :class="'badge-' + getModelTag(model.model).type">
                                         {{ getModelTag(model.model).label }}
                                     </span>
@@ -487,6 +551,9 @@ function onMockChange() {
                     </table>
                 </div>
                 <p class="helper">近期统计按请求完成时间滚动计算；失败数包含用户中止，重试后成功按成功请求计。</p>
+                <p v-if="data.cluster" class="helper">
+                    近期范围来自各节点最近快照，窗口存在秒级偏差。累计历史仅汇总当前有效来源，不保证持续递增。
+                </p>
             </section>
         </template>
     </main>

@@ -91,6 +91,36 @@
                         <p>没有独立控制台密码时，新密钥同时用于控制台登录。现有已登录会话继续有效。</p>
                     </template>
                     <ElInput
+                        v-else-if="d.type === 'secret'"
+                        :id="`config-${d.name}`"
+                        v-model="draft[d.name]"
+                        type="password"
+                        autocomplete="new-password"
+                        placeholder="未修改时保留原凭证；输入新值以替换"
+                        :disabled="busy"
+                    />
+                    <div v-else-if="d.type === 'agents'">
+                        <div v-for="(row, index) in draft[d.name]" :key="index" class="agent-row">
+                            <ElInput v-model="row.name" placeholder="节点名称（仅管理端）" :disabled="busy" />
+                            <ElInput v-model="row.nodeId" placeholder="节点 ID" :disabled="busy" />
+                            <ElInput v-model="row.url" placeholder="https://agent.example.org" :disabled="busy" />
+                            <ElInput
+                                v-model="row.token"
+                                type="password"
+                                autocomplete="new-password"
+                                placeholder="Token；原节点留空保留"
+                                :disabled="busy"
+                            />
+                            <ElButton :disabled="busy" @click="draft[d.name].splice(index, 1)">删除节点</ElButton>
+                        </div>
+                        <ElButton
+                            :disabled="busy"
+                            @click="draft[d.name].push({ name: '', nodeId: '', url: '', token: '' })"
+                            >增加节点</ElButton
+                        >
+                        <p>{{ d.description }}</p>
+                    </div>
+                    <ElInput
                         v-else-if="d.type === 'codes'"
                         :id="`config-${d.name}`"
                         v-model="draft[d.name]"
@@ -216,6 +246,7 @@ watch(
     { deep: true }
 );
 const choiceLabels = {
+    agent: "Agent 端",
     BLOCK_LOW_AND_ABOVE: "拦截低及以上风险",
     BLOCK_MEDIUM_AND_ABOVE: "拦截中及高风险",
     BLOCK_NONE: "不拦截",
@@ -226,15 +257,17 @@ const choiceLabels = {
     least_recently_used: "较久未使用优先",
     least_used: "较少使用优先",
     legacy: "旧版切换",
+    master: "主控端",
     OFF: "关闭安全拦截",
     real: "真实流式",
+    standalone: "独立公示",
 };
 const choiceLabel = value => choiceLabels[value] || value;
 const modeLabel = choiceLabel;
 const label = name => snapshot.value?.definitions.find(d => d.name === name)?.label || name;
 const pending = name => snapshot.value?.pending.some(item => item.name === name);
 function display(name, value) {
-    return name === "API_KEYS"
+    return name === "API_KEYS" || snapshot.value?.definitions.find(d => d.name === name)?.secret
         ? "••••••••"
         : typeof value === "boolean"
           ? value
@@ -258,6 +291,7 @@ async function api(url = "/api/configuration", method = "GET", body) {
     return result;
 }
 function toDraft(d, value) {
+    if (d.type === "agents") return JSON.parse(JSON.stringify(value || []));
     if (d.type === "models")
         return Object.entries(value || {}).map(([model, limit]) => ({
             min_workers: limit?.min_workers ?? 0,
@@ -325,6 +359,7 @@ function resetField(d) {
 }
 function encode(d) {
     const value = draft[d.name];
+    if (d.type === "agents") return value.map(row => ({ ...row, token: row.token || null }));
     if (d.type === "keys")
         return String(value || "")
             .split("\n")
@@ -497,6 +532,11 @@ onBeforeUnmount(() => {
 }
 .model-row {
     margin: 8px 0;
+}
+.agent-row {
+    display: grid;
+    gap: 8px;
+    margin: 12px 0;
 }
 .model-row input {
     min-width: 180px;

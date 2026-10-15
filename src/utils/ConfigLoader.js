@@ -97,6 +97,7 @@ class ConfigLoader {
                 return origin;
             });
         }
+        require("../public/DashboardConfig").load(config.publicDashboard, env);
         if (env.ANTI_TRUNCATION_ENABLED !== undefined) {
             if (!["true", "false"].includes(String(env.ANTI_TRUNCATION_ENABLED).toLowerCase()))
                 throw new Error("Invalid ANTI_TRUNCATION_ENABLED: expected true or false");

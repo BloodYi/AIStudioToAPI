@@ -1,6 +1,6 @@
 # 公示模式多节点汇总改造方案
 
-状态：待实现。本文用于指导后续项目改造，不代表功能已经完成。
+状态：已实现。本文记录接口、配置、统计口径及验收要求；部署方法见第 12 节。
 
 ## 1. 目标与已确认前提
 
@@ -330,3 +330,53 @@ models[]:
 12. 节点重启、主控重启及配置切换后无残留任务；节点恢复后自动重新纳入汇总，历史请求不通过差值重复累计。
 
 实施时增加有意义的快照生产/读取隔离测试、汇总单元测试和角色路由集成测试，并执行项目已有公示面板、隔离进程及统一配置相关测试。
+
+## 12. 部署示例
+
+### 12.1 Agent 服务器
+
+各服务器独立部署本项目并分配互不重复的账号池。在 agent 的 `.env` 中配置：
+
+```dotenv
+PUBLIC_DASHBOARD_ENABLED=true
+PUBLIC_DASHBOARD_ROLE=agent
+PUBLIC_DASHBOARD_PORT=7861
+PUBLIC_DASHBOARD_AGENT_TOKEN=替换为独立生成的随机凭证
+```
+
+Token 使用可打印 ASCII 字符，例如通过 `openssl rand -hex 32` 生成；不要直接使用以上中文占位值。首次启动后读取 `data/public-dashboard-node-id`，将其作为主控的预期节点 ID。保留此文件以保证重启后的身份不变，复制部署时不要复制此文件。
+
+将该端口经 HTTPS 反向代理提供给主控，或者只在可信私网开放。代理需要转发 `Authorization` 请求头，不能缓存 `/api/agent/dashboard`。容器部署还需为公示端口添加端口映射，并持久化 `data` 目录。
+
+Agent 不提供公示首页和匿名公示 API。可在本机验证：
+
+```bash
+curl -H "Authorization: Bearer YOUR_AGENT_TOKEN" http://127.0.0.1:7861/api/agent/dashboard
+```
+
+尚未生成首份快照时返回 `503`，认证失败返回 `401`，健康接口 `GET /healthz` 不需要 Token。
+
+### 12.2 主控服务器
+
+主控仍独立处理 API 请求，并纳入本机统计；本机不要再次写进 agent 列表。
+
+```dotenv
+PUBLIC_DASHBOARD_ENABLED=true
+PUBLIC_DASHBOARD_ROLE=master
+PUBLIC_DASHBOARD_PORT=7861
+PUBLIC_DASHBOARD_AGENTS='[{"nodeId":"替换为节点A的实际ID","name":"节点 A","url":"https://agent-a.example.org","token":"REPLACE_WITH_AGENT_A_TOKEN"},{"nodeId":"替换为节点B的实际ID","name":"节点 B","url":"https://agent-b.example.org","token":"REPLACE_WITH_AGENT_B_TOKEN"}]'
+```
+
+节点 ID 必须替换为实际文件中的 UUID。访问主控公示端口的 `/` 查看汇总，`/api/public/dashboard` 提供公开 JSON。节点 URL 支持路径前缀，例如 `https://example.org/node-a` 会读取 `https://example.org/node-a/api/agent/dashboard`。
+
+默认本机生成和主控采集均为 5 秒，查询超时 2 秒，快照 20 秒后过期；状态有效期每秒检查。修改周期时需同步调整有效期，端到端数据延迟包括生成、传输与采集等待。
+
+也可在管理控制台的“多节点公示”分组配置角色、节点与凭证，保存后重启生效。已有节点不填写新 Token 时保留原凭证；新节点必须填写 Token。管理配置优先于环境配置，已在控制台保存的字段需通过控制台修改或恢复环境值。
+
+### 12.3 已实现的接口补充
+
+- 主控 `history.status` 区分 `available`、`disabled`、`unavailable`，用于区分统计关闭与数据缺失。
+- 近期窗口提供 `alignment: approximate`、`source_to_min`、`source_to_max`，不提供虚构的统一窗口边界。
+- 未知节点尚无模型清单时，已知模型的覆盖状态同样降级，不把已知额度表示成完整全站额度。
+- 原始耗时总和在投影边界统一四舍五入为整数毫秒，再按请求量加权；不通过已取整的平均耗时反推。
+- 单节点 agent 协议和主控公开 JSON 各设 1 MiB 上限；原有单机 IPC 快照保持 256 KiB 上限。

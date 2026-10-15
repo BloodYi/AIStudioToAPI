@@ -1,4 +1,67 @@
 module.exports = [
+    ...[
+        {
+            choices: ["standalone", "master", "agent"],
+            description: "独立展示本机；主控汇总独立账号池节点；agent 仅提供受保护的本机快照接口",
+            label: "公示角色",
+            name: "PUBLIC_DASHBOARD_ROLE",
+            path: "role",
+            type: "enum",
+        },
+        {
+            description: "agent 角色必填；独立于管理密码和 API Key，不向公众浏览器发送",
+            label: "Agent 查询凭证",
+            name: "PUBLIC_DASHBOARD_AGENT_TOKEN",
+            path: "agentToken",
+            secret: true,
+            type: "secret",
+        },
+        {
+            description:
+                "主控使用；账号池必须互不重复，填写节点 data/public-dashboard-node-id 中的 ID；已有 Token 留空保留",
+            label: "Agent 节点列表",
+            name: "PUBLIC_DASHBOARD_AGENTS",
+            path: "agents",
+            type: "agents",
+        },
+        {
+            description: "主控和 agent 定时生成本机快照，查询不触发统计",
+            label: "本机快照生成周期",
+            name: "PUBLIC_DASHBOARD_SNAPSHOT_INTERVAL_MS",
+            path: "snapshotIntervalMs",
+            type: "integer",
+        },
+        {
+            description: "后台读取 agent 已生成的快照，与公示页访问人数无关",
+            label: "主控采集周期",
+            name: "PUBLIC_DASHBOARD_POLL_INTERVAL_MS",
+            path: "pollIntervalMs",
+            type: "integer",
+        },
+        {
+            description: "单节点超时独立处理，不阻塞其他节点",
+            label: "节点查询超时",
+            name: "PUBLIC_DASHBOARD_FETCH_TIMEOUT_MS",
+            path: "fetchTimeoutMs",
+            type: "integer",
+        },
+        {
+            description: "必须大于生成周期、采集周期与查询超时之和；过期数据不参与当前汇总",
+            label: "快照有效期",
+            name: "PUBLIC_DASHBOARD_STALE_AFTER_MS",
+            path: "staleAfterMs",
+            type: "integer",
+        },
+    ].map(field => ({
+        application: "restart",
+        group: "多节点公示",
+        maximum: 3600000,
+        minimum: 100,
+        mode: "all",
+        unit: field.type === "integer" ? "毫秒" : "",
+        ...field,
+        path: `publicDashboard.${field.path}`,
+    })),
     {
         application: "restart",
         description: "调度单轮时间预算，默认 8；修改后重启生效",

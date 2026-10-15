@@ -1,17 +1,27 @@
 const { fork } = require("child_process");
 const path = require("path");
 const PublicDashboardService = require("./PublicDashboardService");
+const { defaults, nodeId } = require("./DashboardConfig");
+const { MAX_AGENT_BYTES } = require("./DashboardProtocol");
 
 // Only the public DTO crosses IPC. Account pools, authentication and mutations
 // remain owned by the application process.
 class IsolatedPublicDashboard {
     constructor({ config, logger, scheduler, usageStatsService, browserManager }) {
-        this.config = config;
+        this.config = { ...defaults, ...config };
         this.logger = logger;
         this.browserManager = browserManager;
-        this.service = new PublicDashboardService(scheduler, usageStatsService);
+        this.service = new PublicDashboardService(scheduler, usageStatsService, {
+            cacheTtlMs: this.config.role === "standalone" ? 1000 : 0,
+            includeAggregation: this.config.role !== "standalone",
+        });
     }
     async start() {
+        if (this.config.role !== "standalone") {
+            this.config.nodeId = nodeId();
+            if (this.config.agents.some(agent => agent.nodeId === this.config.nodeId))
+                throw new Error("Public dashboard cannot collect itself");
+        }
         this.child = fork(path.join(__dirname, "dashboard-process.js"), [], {
             stdio: ["ignore", "inherit", "inherit", "ipc"],
         });
@@ -44,7 +54,10 @@ class IsolatedPublicDashboard {
         this.child.on("exit", () => {
             if (!this.stopping) this.browserManager?._requestApplicationRecovery("public_dashboard_process_exited");
         });
-        this.timer = setInterval(() => this.publish(), 1000);
+        this.timer = setInterval(
+            () => this.publish(),
+            this.config.role === "standalone" ? 1000 : this.config.snapshotIntervalMs
+        );
         this.timer.unref();
         await this.publish();
     }
@@ -55,15 +68,27 @@ class IsolatedPublicDashboard {
             const body = await this.service.getSnapshot();
             if (this.stopping || !this.child.connected) return;
             const health = this.browserManager?.getContextInitHealth();
-            const snapshot = {
-                ...body,
-                service_status: health?.recovering || !health?.ready ? "unavailable" : "ready",
-            };
-            if (Buffer.byteLength(JSON.stringify(snapshot)) > 256 * 1024)
+            const status = health?.recovering || !health?.ready ? "unavailable" : "ready";
+            const snapshot =
+                this.config.role === "standalone"
+                    ? { ...body, service_status: status }
+                    : {
+                          agent_schema_version: 1,
+                          aggregation: body.aggregation,
+                          generated_at: body.snapshot.generated_at,
+                          node_id: this.config.nodeId,
+                          service_status: status,
+                          snapshot: body.snapshot,
+                          snapshot_sequence: (this.sequence = (this.sequence || 0) + 1),
+                      };
+            if (
+                Buffer.byteLength(JSON.stringify(snapshot)) >
+                (this.config.role === "standalone" ? 256 * 1024 : MAX_AGENT_BYTES)
+            )
                 throw new Error("Public dashboard response too large");
             await new Promise(resolve => this.child.send({ body: snapshot, type: "snapshot" }, () => resolve()));
         } catch (error) {
-            this.logger.warn(`[PublicDashboard] Snapshot failed: ${error.message}`);
+            this.logger.warn("[PublicDashboard] Snapshot generation failed");
         } finally {
             this.publishing = false;
         }

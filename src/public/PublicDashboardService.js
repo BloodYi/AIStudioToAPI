@@ -5,6 +5,7 @@ class PublicDashboardService {
         this.cacheTtlMs = options.cacheTtlMs ?? 1000;
         this.cachedAt = 0;
         this.cachedSnapshot = null;
+        this.includeAggregation = options.includeAggregation === true;
     }
 
     _realtimeSnapshot() {
@@ -57,7 +58,7 @@ class PublicDashboardService {
         const visibleModels = realtime.models.map(item => item.model);
         let recent;
         try {
-            recent = await this.usageStatsService.getPublicModelWindows(visibleModels, now);
+            recent = await this.usageStatsService.getPublicModelWindows(visibleModels, now, this.includeAggregation);
         } catch {
             recent = { models: [], windows: {} };
         }
@@ -81,7 +82,7 @@ class PublicDashboardService {
         const nullableCount = value => (value === null ? null : count(value));
         const rate = value => (Number.isFinite(value) && value >= 0 && value <= 100 ? Number(value.toFixed(1)) : null);
 
-        return {
+        const snapshot = {
             disclaimer: "estimated_quota_may_differ_from_actual",
             generated_at: new Date(now).toISOString(),
             history: {
@@ -139,6 +140,27 @@ class PublicDashboardService {
             schema_version: 1,
             usage_window: { date: realtime.usageWindow.date, timezone: realtime.usageWindow.timezone },
         };
+        if (!this.includeAggregation) return snapshot;
+        const { counters } = require("./DashboardProtocol");
+        const aggregation = this.usageStatsService.getPublicAggregationSnapshot(visibleModels);
+        for (const model of aggregation.models) {
+            model.recent_stats = Object.fromEntries(
+                ["24h", "1h"].map(range => {
+                    const stats = recentByModel.get(model.model)?.[range];
+                    return [
+                        range,
+                        counters(
+                            windows[range].status,
+                            stats?.totalRequests,
+                            stats?.successfulRequests,
+                            stats?.failedRequests,
+                            stats?.totalDurationMs
+                        ),
+                    ];
+                })
+            );
+        }
+        return { aggregation, snapshot };
     }
 }
 

@@ -440,7 +440,24 @@ class UsageStatsService {
         };
     }
 
-    async getPublicModelWindows(visibleModels = [], asOfMs = Date.now()) {
+    getPublicAggregationSnapshot(visibleModels = []) {
+        const { counters } = require("../public/DashboardProtocol");
+        const status = this.enabled ? "available" : "disabled";
+        const project = stats =>
+            counters(
+                status,
+                stats?.totalRequests ?? 0,
+                stats?.successCount ?? 0,
+                (stats?.errorCount ?? 0) + (stats?.abortedCount ?? 0),
+                Math.round(stats?.totalDurationMs ?? 0)
+            );
+        return {
+            history: project(this.summary),
+            models: [...new Set(visibleModels)].map(model => ({ history: project(this.modelStats.get(model)), model })),
+        };
+    }
+
+    async getPublicModelWindows(visibleModels = [], asOfMs = Date.now(), includeAggregation = false) {
         const modelKeys = [...new Set(visibleModels.filter(value => typeof value === "string" && value.trim()))];
         let rows = [];
         let status = this.enabled ? "available" : "disabled";
@@ -479,6 +496,13 @@ class UsageStatsService {
                             ? Number(((row[`success_${range}`] / total) * 100).toFixed(1))
                             : null,
                     totalRequests: status === "available" ? total : null,
+                    ...(includeAggregation
+                        ? {
+                              successfulRequests: status === "available" ? (row?.[`success_${range}`] ?? 0) : null,
+                              totalDurationMs:
+                                  status === "available" ? Math.round(row?.[`duration_${range}`] ?? 0) : null,
+                          }
+                        : {}),
                 };
             }
             return { modelKey, stats };

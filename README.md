@@ -182,6 +182,8 @@ PUBLIC_DASHBOARD_PORT=7861
 
 执行 `docker compose up -d` 重新创建容器，通过 `http://localhost:7861` 访问。此端口提供匿名聚合数据；管理端仍使用 `7860`。部署说明和指标定义见 [公开用量看板说明](docs/zh/public-dashboard-design.md)。
 
+多服务器部署可将公示角色设为 `master`（主控）和 `agent`。Agent 定时生成本机快照，主控定时读取并缓存汇总；公众访问不会触发节点统计或远程采集。各节点必须使用独立账号池，agent 查询接口使用独立 Token。配置方法见 [多节点公示部署与实现说明](docs/zh/public-dashboard-multi-node-design.md#12-部署示例)。默认 `standalone` 保留原有独立公示功能。
+
 ## 更新与维护
 
 ### Docker Compose

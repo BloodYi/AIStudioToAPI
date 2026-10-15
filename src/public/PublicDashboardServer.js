@@ -27,22 +27,49 @@ class PublicDashboardServer {
                 "X-Content-Type-Options": "nosniff",
             });
             const origin = req.get("origin");
-            if (origin && this.config.corsOrigins.includes(origin) && req.path === "/api/public/dashboard") {
+            if (
+                this.config.role !== "agent" &&
+                origin &&
+                this.config.corsOrigins.includes(origin) &&
+                req.path === "/api/public/dashboard"
+            ) {
                 res.set("Access-Control-Allow-Origin", origin);
                 res.set("Vary", "Origin");
             }
             next();
         });
-        app.options("/api/public/dashboard", (req, res) => {
-            const origin = req.get("origin");
-            if (!origin || !this.config.corsOrigins.includes(origin)) return res.sendStatus(404);
-            res.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-            res.set("Access-Control-Allow-Headers", "Accept, Content-Type");
-            return res.sendStatus(204);
-        });
+        if (this.config.role !== "agent")
+            app.options("/api/public/dashboard", (req, res) => {
+                const origin = req.get("origin");
+                if (!origin || !this.config.corsOrigins.includes(origin)) return res.sendStatus(404);
+                res.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+                res.set("Access-Control-Allow-Headers", "Accept, Content-Type");
+                return res.sendStatus(204);
+            });
         app.get("/healthz", (req, res) => res.json(this.healthProvider?.() || { status: "ok" }));
-        app.get("/api/public/dashboard", async (req, res) => {
+        app.get(this.config.role === "agent" ? "/api/agent/dashboard" : "/api/public/dashboard", async (req, res) => {
+            const agent = this.config.role === "agent";
+            if (agent) {
+                res.set("Cache-Control", "private, no-store");
+                const digest = value => crypto.createHash("sha256").update(value).digest();
+                if (
+                    !this.config.agentToken ||
+                    !crypto.timingSafeEqual(
+                        digest(req.get("authorization") || ""),
+                        digest(`Bearer ${this.config.agentToken}`)
+                    )
+                )
+                    return res.status(401).json({ error: "unauthorized" });
+            }
             try {
+                if (this.cachedResponseProvider || ["master", "agent"].includes(this.config.role)) {
+                    const cached = this.cachedResponseProvider?.();
+                    if (!cached) throw new Error("Snapshot not yet available");
+                    res.set("Cache-Control", agent ? "private, no-store" : "public, max-age=2, must-revalidate");
+                    res.set("ETag", cached.etag);
+                    if (req.get("if-none-match") === cached.etag) return res.status(304).end();
+                    return res.type("application/json").send(cached.serialized);
+                }
                 const body = await this.service.getSnapshot();
                 const serialized = JSON.stringify(body);
                 if (Buffer.byteLength(serialized) > 256 * 1024) throw new Error("Public dashboard response too large");
@@ -52,14 +79,17 @@ class PublicDashboardServer {
                 if (req.get("if-none-match") === etag) return res.status(304).end();
                 return res.type("application/json").send(serialized);
             } catch (error) {
-                this.logger.error(`[PublicDashboard] Failed to build snapshot: ${error.message}`);
+                this.logger.error("[PublicDashboard] Snapshot unavailable");
+                res.set("Cache-Control", "no-store");
                 return res.status(503).json({ error: "dashboard_temporarily_unavailable" });
             }
         });
 
         const dist = path.join(__dirname, "..", "..", "ui-public", "dist");
-        app.use("/assets", express.static(path.join(dist, "assets"), { fallthrough: false, index: false }));
-        app.get("/", (req, res) => res.sendFile(path.join(dist, "index.html")));
+        if (this.config.role !== "agent") {
+            app.use("/assets", express.static(path.join(dist, "assets"), { fallthrough: false, index: false }));
+            app.get("/", (req, res) => res.sendFile(path.join(dist, "index.html")));
+        }
         app.use((error, req, res, next) => {
             if (res.headersSent) return next(error);
             return res

@@ -251,3 +251,27 @@ for (const range of ["24h", "1h"]) {
 }
 delete mockPresets.legacy.data.model_stat_windows;
 for (const model of mockPresets.legacy.data.models) delete model.recent_stats;
+
+mockPresets.clusterPartial = { data: clone(mockPresets.standard.data), label: "多节点部分可用" };
+const clusterMock = mockPresets.clusterPartial.data;
+clusterMock.cluster = {
+    expected_nodes: 3,
+    fresh_nodes: 2,
+    newest_source_at: new Date().toISOString(),
+    oldest_source_at: new Date(Date.now() - 5000).toISOString(),
+    serving_nodes: 1,
+    status: "partial",
+};
+const partialCoverage = { expected_nodes: 3, included_nodes: 1, status: "partial" };
+clusterMock.coverage = { history: partialCoverage, realtime: partialCoverage };
+clusterMock.history.status = "available";
+for (const model of clusterMock.models) {
+    model.coverage = {
+        history: partialCoverage,
+        quota: partialCoverage,
+        realtime: partialCoverage,
+        recent_stats: { "1h": partialCoverage, "24h": partialCoverage },
+        today: partialCoverage,
+    };
+    model.quota = { estimable: false, estimated_remaining: null, known_estimated_remaining: 150 };
+}

@@ -118,6 +118,18 @@ class ConfigurationService {
     validateField(name, value) {
         const d = definitions.find(item => item.name === name);
         if (!d) throw fail(`不允许修改配置：${name}`);
+        if (
+            d.type === "secret" &&
+            (typeof value !== "string" || (value && !require("../public/DashboardConfig").validToken(value)))
+        )
+            throw fail(`${name}: 无效凭证`);
+        if (d.type === "agents") {
+            try {
+                require("../public/DashboardConfig").normalizeAgents(value);
+            } catch {
+                throw fail(`${name}: 无效节点列表，请检查 ID、URL 和 Token`);
+            }
+        }
         if (d.type === "boolean" && typeof value !== "boolean") throw fail(`${name}: 必须为布尔值`);
         if (
             d.type === "integer" &&
@@ -172,10 +184,12 @@ class ConfigurationService {
     snapshot(reveal = false) {
         const errorPath = path.join(path.dirname(this.file), "restart-status.json");
         if (fs.existsSync(errorPath)) this.restartError = JSON.parse(fs.readFileSync(errorPath, "utf8")).error;
-        const values = config =>
-            Object.fromEntries(
-                definitions.map(d => [d.name, d.name === "API_KEYS" && !reveal ? null : this.value(config, d)])
-            );
+        const publicValue = (config, d) => {
+            if (d.secret || (d.name === "API_KEYS" && !reveal)) return null;
+            const value = this.value(config, d);
+            return d.type === "agents" ? value.map(row => ({ ...row, token: null })) : value;
+        };
+        const values = config => Object.fromEntries(definitions.map(d => [d.name, publicValue(config, d)]));
         const pending = definitions
             .filter(d => !equal(this.value(this.running, d), this.value(this.saved, d)))
             .map(d => ({
@@ -186,7 +200,7 @@ class ConfigurationService {
             defaults: values(this.baseline),
             definitions: definitions.map(d => ({
                 ...d,
-                default: d.name === "API_KEYS" ? null : this.value(this.defaults, d),
+                default: d.name === "API_KEYS" ? null : publicValue(this.defaults, d),
             })),
             environmentError: this.baselineError || null,
             instanceId: this.instanceId,
@@ -259,7 +273,18 @@ class ConfigurationService {
         if (!changes || typeof changes !== "object" || Array.isArray(changes) || !Array.isArray(reset))
             throw fail("无效配置提交");
         const overrides = { ...this.document.overrides };
-        for (const [name, value] of Object.entries(changes)) {
+        for (const [name, submitted] of Object.entries(changes)) {
+            let value = submitted;
+            if (name === "PUBLIC_DASHBOARD_AGENT_TOKEN" && value === null) continue;
+            if (name === "PUBLIC_DASHBOARD_AGENTS" && Array.isArray(value)) {
+                value = value.map(row => ({
+                    ...row,
+                    token:
+                        row?.token == null
+                            ? this.saved.publicDashboard.agents.find(agent => agent.nodeId === row?.nodeId)?.token
+                            : row.token,
+                }));
+            }
             this.validateField(name, value);
             overrides[name] = clone(value);
         }

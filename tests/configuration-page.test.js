@@ -146,6 +146,31 @@ test(
         await page.waitForFunction(() => !document.querySelector(".configuration-panel details"));
         assert.equal(service.snapshot().pending.length, 0);
         assert.equal(await panel.getByText("MODEL_QUEUE_TIMEOUT_MS", { exact: true }).count(), 0);
+        await panel
+            .locator(".configuration-field")
+            .filter({ has: page.locator('label[for="config-PUBLIC_DASHBOARD_ROLE"]') })
+            .locator(".el-select")
+            .click();
+        await page.getByRole("option", { exact: true, name: "主控端" }).click();
+        await panel.getByRole("button", { exact: true, name: "增加节点" }).click();
+        const agentRow = panel.locator(".agent-row");
+        await agentRow.getByPlaceholder("节点名称（仅管理端）").fill("节点 A");
+        await agentRow.getByPlaceholder("节点 ID", { exact: true }).fill("agent-a");
+        await agentRow.getByPlaceholder("https://agent.example.org").fill("https://agent.example.org");
+        await agentRow.getByPlaceholder("Token；原节点留空保留").fill("AGENT_TEST_SECRET");
+        await panel.getByRole("button", { exact: true, name: "保存" }).click();
+        await panel.getByText("查看待重启变更").waitFor();
+        assert.equal(service.saved.publicDashboard.agents[0].token, "AGENT_TEST_SECRET");
+        assert.equal(await agentRow.getByPlaceholder("Token；原节点留空保留").inputValue(), "");
+        assert.doesNotMatch(JSON.stringify(service.snapshot()), /AGENT_TEST_SECRET/);
+        await agentRow.getByPlaceholder("节点名称（仅管理端）").fill("节点 A 改名");
+        await panel.getByRole("button", { exact: true, name: "保存" }).click();
+        await page.waitForFunction(
+            () =>
+                document.querySelector(".agent-row input")?.value === "节点 A 改名" &&
+                document.querySelector('.configuration-panel [role="status"]')?.textContent.includes("0 项修改")
+        );
+        assert.equal(service.saved.publicDashboard.agents[0].token, "AGENT_TEST_SECRET");
         assert.deepEqual(errors, []);
     }
 );

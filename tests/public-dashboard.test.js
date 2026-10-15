@@ -31,6 +31,7 @@ test("public dashboard configuration is off by default and validates ports and o
         process.env.HOST = "127.0.0.1";
         let config = new ConfigLoader(logger).loadConfiguration();
         assert.deepEqual(config.publicDashboard, {
+            ...require("../src/public/DashboardConfig").defaults,
             corsOrigins: [],
             enabled: false,
             host: "127.0.0.1",

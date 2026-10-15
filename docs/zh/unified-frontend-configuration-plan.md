@@ -66,6 +66,13 @@
 | 配置项                     | 中文名称与含义                                                            | 展示条件 | 保存后   |
 | -------------------------- | ------------------------------------------------------------------------- | -------- | -------- |
 | `PUBLIC_DASHBOARD_ENABLED` | 启用公开用量看板：启动无需登录的独立只读用量看板                          | 通用     | 重启生效 |
+| `PUBLIC_DASHBOARD_ROLE` | 公示角色：独立 / 主控 / agent | 通用 | 重启生效 |
+| `PUBLIC_DASHBOARD_AGENT_TOKEN` | Agent 查询凭证，读取时脱敏 | 通用 | 重启生效 |
+| `PUBLIC_DASHBOARD_AGENTS` | 主控节点列表，已有节点留空 Token 保留凭证 | 通用 | 重启生效 |
+| `PUBLIC_DASHBOARD_SNAPSHOT_INTERVAL_MS` | 本机快照生成周期 | 通用 | 重启生效 |
+| `PUBLIC_DASHBOARD_POLL_INTERVAL_MS` | 主控后台采集周期 | 通用 | 重启生效 |
+| `PUBLIC_DASHBOARD_FETCH_TIMEOUT_MS` | 单节点查询超时 | 通用 | 重启生效 |
+| `PUBLIC_DASHBOARD_STALE_AFTER_MS` | 快照有效期 | 通用 | 重启生效 |
 | `API_KEYS`                 | API 访问密钥：调用 API 使用的密钥；未设置独立控制台密码时也用于控制台登录 | 通用     | 热生效   |
 
 API Key 修改要处理现有控制台认证的关联，不能因请求重复提交而重复执行切换操作。接口必须设置明确目标值。

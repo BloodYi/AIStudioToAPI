@@ -123,6 +123,37 @@ test(
         await page.setViewportSize({ height: 800, width: 375 });
         assert.ok(await page.locator(".range-buttons").isVisible());
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+        fail = false;
+        snapshot.cluster = {
+            expected_nodes: 3,
+            fresh_nodes: 2,
+            newest_source_at: snapshot.generated_at,
+            oldest_source_at: snapshot.generated_at,
+            serving_nodes: 1,
+            status: "partial",
+        };
+        const coverage = { expected_nodes: 3, included_nodes: 1, status: "partial" };
+        snapshot.coverage = { history: coverage, realtime: coverage };
+        snapshot.history.status = "available";
+        snapshot.model_stat_windows = {
+            "1h": { alignment: "approximate", status: "available" },
+            "24h": { alignment: "approximate", status: "available" },
+        };
+        snapshot.models[0].coverage = {
+            history: coverage,
+            quota: coverage,
+            realtime: coverage,
+            recent_stats: { "1h": coverage, "24h": coverage },
+            today: coverage,
+        };
+        snapshot.models[0].quota = { estimable: false, estimated_remaining: null, known_estimated_remaining: 150 };
+        snapshot.models[0].realtime.available_accounts = null;
+        await page.getByRole("button", { name: "立即刷新数据" }).click();
+        await page.getByText("已知部分约 150 次", { exact: true }).waitFor();
+        assert.match(await page.locator(".cluster-status").textContent(), /数据有效节点 2 \/ 3/);
+        assert.match(await page.locator(".account-ring-detail").textContent(), /状态未知/);
+        assert.match(await page.locator(".source-times").textContent(), /源数据时间/);
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
         assert.deepEqual(errors, []);
     }
 );
