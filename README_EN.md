@@ -1,5 +1,10 @@
 # AIStudioToAPI — Independently Maintained Version
 
+> **Required first step: build your own AI Studio app.** This checkout cannot start as an API service until you create an app under your own Google account, install the bridge client, share it with your accounts, and set `AI_STUDIO_APP_URL`. No usable default app is included.
+>
+> Start with the [Build App setup guide](docs/BUILD-APP.md), adapted from [yunx738's tutorial](https://github.com/yunx738/ais2api/blob/main/docs/BUILD-APP.md). Complete it **before** installing or starting the gateway.
+
+
 [中文文档](README_ZH.md) | English
 
 A browser automation service that exposes Google AI Studio Build App through OpenAI, Gemini and Anthropic compatible APIs, with account management, model scheduling, proxy nodes and usage dashboards.

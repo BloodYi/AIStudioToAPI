@@ -4,7 +4,9 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
 const Service = require("../../src/accounts/AccountLoginService");
+const { requireBuildAppUrl } = require("../../src/config/BuildAppSetup");
 async function main() {
+    const targetUrl = requireBuildAppUrl();
     const readline = require("node:readline").createInterface({ input: process.stdin });
     const input = await new Promise(resolve => readline.once("line", resolve));
     readline.close();
@@ -19,7 +21,7 @@ async function main() {
             closeContext: async () => {},
             contextUnavailable: new Map(),
             rebalanceContextPool: async () => {},
-            targetUrl: "https://ai.studio/apps/cab9ab6c-44f9-4e7a-8972-037f8ae177ab",
+            targetUrl,
         },
         logger: {
             debug() {},

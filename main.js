@@ -13,6 +13,7 @@ const envFile = process.env.NODE_ENV === "production" ? ".env" : ".env.developme
 if (require.main !== module || (process.env.AISTUDIO_SERVICE_CHILD === "1" && process.send))
     require("dotenv").config({ path: path.resolve(__dirname, envFile) });
 
+const { requireBuildAppUrl } = require("./src/config/BuildAppSetup");
 const ProxyServerSystem = require("./src/core/ProxyServerSystem");
 
 /**
@@ -25,6 +26,7 @@ const initializeServer = async () => {
 
     let serverSystem;
     try {
+        requireBuildAppUrl();
         serverSystem = new ProxyServerSystem();
         const { monitorEventLoopDelay } = require("node:perf_hooks");
         const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
@@ -108,6 +110,15 @@ const initializeServer = async () => {
 
 // If this file is run directly, start the server
 if (require.main === module) {
+    try {
+        const fs = require("node:fs");
+        const filePath = path.resolve(__dirname, envFile);
+        const fileEnv = fs.existsSync(filePath) ? require("dotenv").parse(fs.readFileSync(filePath)) : {};
+        requireBuildAppUrl({ ...fileEnv, ...process.env });
+    } catch (error) {
+        console.error(error.message);
+        process.exit(1);
+    }
     if (process.env.AISTUDIO_SERVICE_CHILD === "1" && process.send) initializeServer();
     else require("./src/config/ServiceSupervisor").supervise(__filename);
 }

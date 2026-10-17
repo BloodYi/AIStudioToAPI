@@ -1,5 +1,10 @@
 # AIStudioToAPI
 
+> **Required first step: build your own AI Studio app.** This checkout cannot start as an API service until you create an app under your own Google account, install the bridge client, share it with your accounts, and set `AI_STUDIO_APP_URL`. No usable default app is included.
+>
+> Start with the [Build App setup guide](docs/BUILD-APP.md), adapted from [yunx738's tutorial](https://github.com/yunx738/ais2api/blob/main/docs/BUILD-APP.md). Complete it **before** installing or starting the gateway.
+
+
 A self-hosted API gateway for Google AI Studio Build Apps, with multi-account scheduling, automatic Pro/Ultra detection, and a usage dashboard.
 
 [English setup guide](README_EN.md) | [中文文档](README_ZH.md) | [License](LICENSE)
@@ -15,7 +20,11 @@ A self-hosted API gateway for Google AI Studio Build Apps, with multi-account sc
 
 The inherited service includes OpenAI-, Gemini-, and Anthropic-compatible endpoints, account imports, queues, per-model cooldowns, proxy management, and usage statistics. Model availability depends on Google and account permissions.
 
-## Quick start
+## Step 1: create your Build App
+
+Complete the [required Build App setup](docs/BUILD-APP.md) first. Then continue with the gateway installation below.
+
+## Step 2: install the gateway
 
 Requirements: Docker Engine or Docker Desktop, Docker Compose v2, and an account that can access your configured AI Studio Build App.
 
@@ -49,7 +58,7 @@ OpenAI-compatible base URL: `http://localhost:7860/v1`. Use your `API_KEYS` valu
 
 The 50-request Pro allowance is a **dashboard estimate**, not an allowance granted or guaranteed by Google. Actual upstream limits remain authoritative. Accounting follows the scheduler's Pacific-time day boundary. Ultra quota is not assumed to equal Pro quota.
 
-These changes passed 156 local regression checks, quota-card rendering checks, frontend builds, and 11 isolated server browser checks. An existing live Pro account was automatically detected and completed an Argon request after removal of the manual allowlist. Multiple-Pro aggregation and Ultra behavior were tested with fixtures; a second live Pro account and a live Ultra account have not been validated.
+These changes passed 156 local regression checks, quota-card rendering checks, frontend builds, and 11 isolated server browser checks. An existing live Pro account was automatically detected and completed an Argon request after removal of the manual allowlist. Two live Pro accounts subsequently connected and were recognized as Pro, producing a combined 100-request daily estimate. Per-account generation on the second account and live Ultra behavior have not been individually validated.
 
 ```bash
 node --test tests/auto-benefit.test.js tests/model-scheduler.test.js tests/browser-workers.test.js tests/browser-recovery.test.js

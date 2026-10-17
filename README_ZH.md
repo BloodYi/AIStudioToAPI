@@ -1,5 +1,10 @@
 # AIStudioToAPI（二次开发版）
 
+> **第一次使用必须先自行构建 AI Studio Build App。** 本仓库不提供可直接使用的默认应用。请先用自己的 Google 账号创建应用、放入本仓库客户端脚本、设置账号池访问权限，再配置 `AI_STUDIO_APP_URL`；未配置时服务会停止启动。
+>
+> 先阅读[本仓库对应的构建说明](docs/BUILD-APP.md)，流程参考[你提供的原教程](https://github.com/yunx738/ais2api/blob/main/docs/BUILD-APP.md)。原教程的脚本名和后台配置入口与本项目不同，请以本仓库说明为准。
+
+
 中文文档 | [English](README_EN.md)
 
 将 Google AI Studio Build App 网页端封装为兼容 OpenAI、Gemini 和 Anthropic 格式的 API，通过浏览器自动化转发请求，并提供账号、模型调度、代理节点及用量管理界面。

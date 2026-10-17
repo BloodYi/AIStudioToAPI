@@ -5,6 +5,7 @@
  * Author: Ellinav, iBenzene, bbbugg, 挈挈
  */
 
+const { requireBuildAppUrl } = require("../config/BuildAppSetup");
 const { BuildBenefitContext } = require("./BuildBenefitContext");
 const { MakerSuiteBridge } = require("./MakerSuiteBridge");
 const fs = require("fs");
@@ -115,7 +116,7 @@ class BrowserManager {
         this._wsInitState = new Map();
 
         // Target URL for AI Studio app
-        this.targetUrl = process.env.AI_STUDIO_APP_URL || "https://ai.studio/apps/cab9ab6c-44f9-4e7a-8972-037f8ae177ab";
+        this.targetUrl = (process.env.AI_STUDIO_APP_URL || "").trim();
 
         // Firefox/Camoufox does not use Chromium-style command line args.
         // We keep this empty; Camoufox has its own anti-fingerprinting optimizations built-in.
@@ -1342,13 +1343,14 @@ class BrowserManager {
      * @param {string} logPrefix - Log prefix for messages (e.g., "[Browser]" or "[Reconnect]")
      */
     async _navigateAndWakeUpPage(page, logPrefix = "[Browser]", attempt = null) {
+        const targetUrl = requireBuildAppUrl({ AI_STUDIO_APP_URL: this.targetUrl });
         this.logger.debug(`${logPrefix} Navigating to target page...`);
 
         await this._runInitOperation(
             attempt,
             "page.goto",
             () =>
-                page.goto(this.targetUrl, {
+                page.goto(targetUrl, {
                     timeout: 180000,
                     waitUntil: "domcontentloaded",
                 }),
