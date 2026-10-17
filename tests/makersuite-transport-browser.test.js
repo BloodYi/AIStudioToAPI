@@ -153,8 +153,8 @@ async function fixture(t) {
                 value: `account-${index}`,
             },
         ]);
-        await page.goto("https://aistudio.google.com/");
-        await page.waitForFunction(() => window.pageReady);
+        await page.goto("https://aistudio.google.com/", { waitUntil: "domcontentloaded" });
+        await waitPageReady(page);
         await benefit.assertReady();
         return { benefit, bridge, context, page };
     };
@@ -177,12 +177,18 @@ async function fixture(t) {
 
 function prepare(bridge, model = "gemini-4-argon", budget = 300000) {
     const attempt = "req_fixture_attempt_" + require("node:crypto").randomUUID();
-    const proxy = { request_attempt_id: attempt, transport_policy: TransportPolicy.resolve(model, "real") };
-    bridge.prepare(proxy, performance.now() + budget);
+    const proxy = {
+        body: JSON.stringify({ contents: [{ parts: [{ text: "hi" }], role: "user" }] }),
+        request_attempt_id: attempt,
+        transport_policy: TransportPolicy.resolve(model, "real"),
+    };
+    const wire = bridge.prepare(proxy, performance.now() + budget);
     return JSON.stringify([
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?__aistudio_attempt=${attempt}`,
-        JSON.stringify({ contents: [{ parts: [{ text: "hi" }], role: "user" }] }),
+        // Studio removes arbitrary query parameters; preserve the actual wire form.
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        wire.body,
         "old-proof",
+        "POST",
     ]);
 }
 async function generation(page, body) {
@@ -252,13 +258,13 @@ test(
         await until(
             () => f.requests.filter(request => request.url === RPC + "GenerateContent").length === beforeCancel + 1
         );
-        bridge.cancelAttempt("req_fixture", new URL(JSON.parse(body)[0]).searchParams.get("__aistudio_attempt"));
+        bridge.cancelAttempt("req_fixture", JSON.parse(JSON.parse(body)[1]).__aistudio_attempt);
         await running;
         await until(() => f.cancelled === 2);
         await bridge.settle();
         assert.equal(bridge.cleanup.size, 0);
         await f.reload(page);
-        await page.waitForFunction(() => window.pageReady);
+        await waitPageReady(page);
         f.hold = false;
         assert.equal((await generation(page, prepare(bridge))).status, 200);
     }
@@ -280,3 +286,13 @@ test(
         assert.equal(bridge.active.size, 0);
     }
 );
+
+async function waitPageReady(page) {
+    if (!process.env.BUILD_BENEFIT_BROWSER_EXECUTABLE_PATH) return page.waitForFunction(() => window.pageReady);
+    // Camoufox's page state lives in wrappedJSObject, matching production evaluation.
+    const deadline = performance.now() + 5000;
+    while (!(await page._fixtureBenefit._evaluate(() => Boolean(window.pageReady)))) {
+        assert.ok(performance.now() < deadline, "Camoufox main-world pageReady deadline");
+        await new Promise(resolve => setTimeout(resolve, 20));
+    }
+}

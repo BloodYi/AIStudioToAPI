@@ -4930,10 +4930,13 @@ class RequestHandler {
             );
         const connection = this.connectionRegistry.getConnectionByAuth(authIndex);
         if (connection) {
-            if (policy?.transport === "makersuite")
-                this.browserManager.contexts
-                    .get(authIndex)
-                    .page.makerSuiteBridge.prepare(proxyRequest, proxyRequest.__generationDeadline);
+            const wireRequest =
+                policy?.transport === "makersuite"
+                    ? this.browserManager.contexts
+                          .get(authIndex)
+                          .page.makerSuiteBridge.prepare(proxyRequest, proxyRequest.__generationDeadline) ||
+                      proxyRequest
+                    : proxyRequest;
             this.logger.debug(
                 `[Request] Forwarding request #${proxyRequest.request_id} via connection for authIndex=${authIndex}` +
                     ` (attempt=${proxyRequest.request_attempt_id})`
@@ -4941,7 +4944,7 @@ class RequestHandler {
             connection.send(
                 JSON.stringify({
                     event_type: "proxy_request",
-                    ...proxyRequest,
+                    ...wireRequest,
                 })
             );
         } else {

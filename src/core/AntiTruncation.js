@@ -20,6 +20,7 @@ const TEXT_MODELS = Object.freeze([
     "gemini-3.6-flash",
     "gemini-3.7-flash",
     "gemini-3.8-flash",
+    "gemini-4-argon",
 ]);
 const error = (code, message, status = 400) => Object.assign(new Error(message), { code, status });
 

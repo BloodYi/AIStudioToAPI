@@ -1,6 +1,6 @@
 # 抗截断传输集成
 
-状态：代码和隔离测试已完成；未部署，真实 Gemini、NewAPI/SillyTavern 及公网链路未验收。默认策略为 off。
+状态：代码和隔离测试已完成；2026-10-17 在 bero 实测 Argon 的 AUTO 合成函数传输，非流式与缓冲 SSE 两次均通过。项目全局默认策略仍为 off；bero 使用 prefer。其他模型及客户端组合不能据此视为已完成生产验收。
 
 ## 使用
 
@@ -38,12 +38,15 @@
 
 此矩阵表示本地转换与模拟上游验证结果，不能代替真实账号的模型/工具能力测试。
 
+模型采用静态准入名单 `src/core/AntiTruncation.js` 的 `TEXT_MODELS`，不根据名称自动放行未来型号。此前 Argon 未加入是因为尚未验证，并非已确认上游不支持。新模型需要验证文本与函数传输后加入名单；只加入 `/v1/models` 不会自动启用抗截断。
+
 | 模型/入口/组合                                                                   | 行为                                                                    |
 | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | gemini-2.5-flash / pro / flash-lite                                              | 文本、函数工具隔离验证通过                                              |
 | gemini-3-flash-preview、gemini-3.1-pro-preview                                   | 文本注入、转换及修饰符隔离验证通过                                      |
 | gemini-3.1-flash-lite-preview / gemini-3.1-flash-lite                            | 同上                                                                    |
 | gemini-3.5-flash / flash-lite、gemini-3.6/3.7/3.8-flash                          | 同上；依赖部署模型目录与账号实际可用性                                  |
+| gemini-4-argon                                                               | 已加入默认名单；真实 AUTO 合成函数、非流式及缓冲 SSE 正文还原通过。MakerSuite 当前只支持 AUTO 工具选择，none / required 等强制模式仍受桥接限制 |
 | 普通回答、函数 auto / required、并行真实函数                                     | 保留真实工具、参数和已有调用 ID；synthetic 只还原成正文                 |
 | tool_choice none（含旧 function_call none）                                      | 本次声明只包含 synthetic，Gemini ANY 仅允许该内部函数，真实工具不可调用 |
 | 强制指定真实函数                                                                 | 跳过 anti，原指定工具语义保留，记录 forced_real_tool                    |

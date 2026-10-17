@@ -13,6 +13,7 @@ const RPC = url =>
     );
 const TransportPolicy = require("./ModelTransportPolicy");
 const MARKER = "__aistudio_bridge_id";
+const ATTEMPT_FIELD = "__aistudio_attempt";
 
 // Serialized into the MAIN page realm, including Firefox's wrapped page window.
 // No Node closures may be referenced here.
@@ -456,6 +457,9 @@ class MakerSuiteBridge {
         if (this.closed || this.benefit?.disposed || this.benefit?.isCurrent() === false)
             throw Object.assign(new Error("MakerSuite document unavailable"), { status: 503 });
         const remaining = deadline - performance.now();
+        const body = JSON.parse(proxyRequest.body || "{}");
+        if (!body || typeof body !== "object" || Array.isArray(body) || Object.hasOwn(body, ATTEMPT_FIELD))
+            throw Object.assign(new Error("Invalid or reserved MakerSuite request metadata"), { status: 400 });
         this.attempts.set(id, {
             deadline,
             epoch: this.epoch,
@@ -468,7 +472,12 @@ class MakerSuiteBridge {
             policy: proxyRequest.transport_policy,
             reserveMs: Math.min(5000, remaining * 0.05),
         });
-        proxyRequest.query_params = { ...proxyRequest.query_params, __aistudio_attempt: id };
+        proxyRequest.query_params = { ...proxyRequest.query_params, [ATTEMPT_FIELD]: id };
+        // Studio may remove arbitrary URL query parameters from ProxyUnaryCall.
+        // The JSON payload survives that boundary; strip this local field before
+        // encoding GenerateContent and generating its new proof. Never mutate the
+        // original body used by retries and anti-truncation continuation rounds.
+        return { ...proxyRequest, body: JSON.stringify({ ...body, [ATTEMPT_FIELD]: id }) };
     }
     cancelAttempt(requestId, attemptId) {
         for (const [id] of this.attempts)
@@ -513,7 +522,16 @@ class MakerSuiteBridge {
         const match = upstream.pathname.match(
             /^\/v1(?:beta|alpha)?\/models\/([^:/]+):(streamGenerateContent|generateContent)$/
         );
-        const attemptId = upstream.searchParams.get("__aistudio_attempt");
+        let wireBody;
+        try {
+            wireBody = JSON.parse(a?.[1] || "{}");
+        } catch {
+            /* The generation handler returns the existing controlled JSON error. */
+        }
+        const hasBodyAttempt = wireBody && typeof wireBody === "object" && Object.hasOwn(wireBody, ATTEMPT_FIELD);
+        const bodyAttempt = hasBodyAttempt ? wireBody[ATTEMPT_FIELD] : null;
+        const queryAttempt = upstream.searchParams.get(ATTEMPT_FIELD);
+        const attemptId = typeof bodyAttempt === "string" ? bodyAttempt : queryAttempt;
         const registration = this.attempts.get(attemptId);
         const selected = registration?.policy || TransportPolicy.resolve(match?.[1] || "", "fake", this.policy);
         if (
@@ -546,7 +564,12 @@ class MakerSuiteBridge {
         const fulfill = result => route.fulfill({ ...result, contentType: "application/json+protobuf; charset=UTF-8" });
         try {
             if (
-                this.requireRegistration &&
+                hasBodyAttempt &&
+                (typeof bodyAttempt !== "string" || !bodyAttempt || (queryAttempt && bodyAttempt !== queryAttempt))
+            )
+                throw Object.assign(new Error("Invalid MakerSuite request metadata"), { status: 400 });
+            if (
+                (this.requireRegistration || hasBodyAttempt) &&
                 (!registration || registration.epoch !== epoch || registration.policy.model !== match[1])
             )
                 throw Object.assign(new Error("Retired MakerSuite request"), { status: 503 });
@@ -559,6 +582,7 @@ class MakerSuiteBridge {
             } catch {
                 throw Object.assign(new Error("Invalid Gemini JSON in MakerSuite generation request"), { status: 400 });
             }
+            if (hasBodyAttempt) delete g[ATTEMPT_FIELD];
             const { body, ht } = buildBody(match[1], g);
             const expectedDocumentId = this.benefit
                 ? await this.benefit._evaluate(() => window.__buildBenefit?.documentId)

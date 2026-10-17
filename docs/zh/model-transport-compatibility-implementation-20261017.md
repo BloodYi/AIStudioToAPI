@@ -1,6 +1,6 @@
 # 双通道兼容修复实施记录
 
-日期：2026-10-17（Asia/Shanghai）。运行代码与离线测试已实施；生产 Camoufox 和真实账号验收尚未完成，不作为发布通过记录。
+日期：2026-10-17（Asia/Shanghai）。运行代码已部署至 bero，完成实际 Camoufox、Google Argon 与 NewAPI 内网验收；生产中发现并修复 RPC 请求关联问题，详见文末生产补充。
 
 ## 基线与范围
 
@@ -16,7 +16,7 @@
 
 浏览器宿主页只安装一个生成 RPC 分派 route。legacy 沿用原始 URL、正文、认证与 WAA，并继续支持已授权的权益补头。makerSuite 分派只接受精确 Google origin、RPC pathname、POST、主 frame 及生成路径；模型目录、文件、embedding 和 countTokens 不进入桥接。桥接为转换后的载荷生成新 WAA，GenerateContent 使用当前页面真实认证与 tier/ext，且不从自产请求学习认证。客户端 Key 的排除属于当前调用，不能污染其他请求。
 
-每个桥接请求在发送前登记 request/attempt、策略、页面 epoch 和单调 deadline。关联标记经过旧 Build 客户端已有的 query 传递能力到宿主页，并在转换时丢弃，不进入 GenerateContent。legacy RPC 上的本地取消标记在出站前移除。此兼容方式不要求编辑用户已保存的 App；新版脚本另通过内部 WebSocket 握手报告 `transportVersion=1`，识别策略和剩余预算。
+每个桥接请求在发送前登记 request/attempt、策略、页面 epoch 和单调 deadline。请求关联标记放入本地桥接专用的 JSON 字段 `__aistudio_attempt`，在转换 GenerateContent 前校验并移除；仍兼容 query 中保留该标记的客户端。生产证明 Google 宿主页会丢弃自定义 URL query，不能仅依赖 query 关联。转发只修改 wire 副本，重试与抗截断的原始请求体不变。legacy RPC 上的本地取消标记在出站前移除。此兼容方式不要求编辑用户已保存的 App；新版脚本另通过内部 WebSocket 握手报告 `transportVersion=1`，识别策略和剩余预算。
 
 Argon 保留 verified account + 当前页面 paid 的双重资格检查。unknown 只做预检，认证和权益失败受控返回。未确认的桥接认证错误不轮换或禁用账号；确认登录过期仍受 sessionVersion 保护。桥接 403/RPC 7 按模型资格处理；429 保留原错误与既有冷却，不清额度，不改 3.7 历史统计，也不推定 Argon 日额度。
 
@@ -37,7 +37,7 @@ Argon 保留 verified account + 当前页面 paid 的双重资格检查。unknow
 - `npm run build:ui`：管理界面与公示页构建通过。
 - 改动 JS/Vue ESLint、Prettier（忽略无 parser 的 `.env.example`）与 `git diff --check`：最终结果见验收统计。
 
-## 尚未完成的发布门槛
+## 本地实施阶段记录的发布门槛（本次生产验收已补充）
 
 当前环境未找到 Camoufox 可执行文件，因此没有声称生产 Camoufox 已通过。TLS fixture 支持 `BUILD_BENEFIT_BROWSER_EXECUTABLE_PATH=/path/to/camoufox`；使用与 BrowserManager 一致的 `goto(..., { waitUntil: "domcontentloaded" })` 重建文档。生产版本的 realm、取消和长等待仍须用实际可执行文件验证，不能用标准 Firefox 结果替代。
 
@@ -49,7 +49,7 @@ Argon 保留 verified account + 当前页面 paid 的双重资格检查。unknow
 
 | 检查                                                                                                                      | 实际结果                                                                                                                                          |
 | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `npm test`                                                                                                                | 退出码 0；TAP 汇总 462 项，430 通过、0 失败、0 取消、32 条件跳过；跳过来自未设置 `ACCOUNT_LOGIN_BROWSER_TEST_EXECUTABLE` 的既有可选登录浏览器测试 |
+| `npm test`                                                                                                                | 退出码 0；TAP 汇总 465 项，433 通过、0 失败、0 取消、32 条件跳过；跳过来自未设置 `ACCOUNT_LOGIN_BROWSER_TEST_EXECUTABLE` 的既有可选登录浏览器测试 |
 | `node --test tests/makersuite-browser.test.js tests/makersuite-transport-browser.test.js tests/makersuite-bridge.test.js` | 24 通过、0 失败、1 条件跳过（61 秒用例另行执行）                                                                                                  |
 | `npm run test:transport:long`                                                                                             | 2 通过、0 失败、0 跳过；真实 TLS GenerateContent 等待 **61027 ms**，包含新 proof、权益、原始 legacy query 编码与取消回归                          |
 | `npm run build:ui`                                                                                                        | 管理界面和公示页构建通过；仅有已有的 Vite CJS / bundle 大小提示                                                                                   |
@@ -60,3 +60,23 @@ Argon 保留 verified account + 当前页面 paid 的双重资格检查。unknow
 | commit / push                                                                                                             | 未执行；修改保留在开发分支工作树                                                                                                                  |
 
 补充修复：本地取消标记通过原始 query 字符串追加与移除，避免 URLSearchParams 将 legacy URL 中的 `%20`、`%2f`、`~` 重编码。TLS peer 对带这些字符的真实出站 query 做了逐字检查。
+
+## bero 生产补充：892fba7 与 RPC 关联修复
+
+用户授权升级并验证后，先备份原项目及 ais2api 对照实例，停止对照容器并关闭自动重启，再启动本项目。现有账号、密钥、Build App URL、2 contexts、legacy 调度、共享 NewAPI 网络与无内存上限设置保留。Argon 使用 makersuite，3.7 使用 legacy；启用已由同账号 ais2api 实际验证过的 authIndex #0。
+
+初版真实请求报 `Retired MakerSuite request`：实际 Google RPC 形态为 `[path, JSON-string body, proof, method]`，path 不带自定义 query，Node 侧仍有对应 registration。修复将本地 attempt ID 放在 JSON 载荷专用字段，校验 registration、账号页面 epoch、精确模型及 query/body 一致性后剥离。没有按“仅剩一个请求”猜测归属，也没有跳过注册校验。重试原始 body 不变；用户预先设置保留字段、冲突标记、未知注册或旧文档标记均受控拒绝。
+
+新增三组回归覆盖 query 被 Google 丢弃、标记不进入真实 GenerateContent、重试基线保持不变、冲突/未知/旧文档拒绝及保留字段拒绝。实际 Camoufox fixture 的首次导航改用 domcontentloaded；就绪变量通过其 main realm 读取。TLS fixture 使用生产实测的无 query RPC 形态，保留所有原协议/proof/认证/取消断言。
+
+- 完整 `npm test` 退出码 0，TAP 465 项、433 通过、32 既有可选登录浏览器条件跳过，0 失败。
+- 实际生产 Camoufox 的 TLS 测试 2/2，通过取消、文档重建与真实 61 秒等待；修复后 GenerateContent 等待 61048 ms，无跳过，不使用 Google 或生产 Cookie。
+- Argon 新 context 第一次生成 HTTP 200、严格 OK、stop、usage，9.028 秒。
+- Argon Anthropic/Gemini/OpenAI 均通过；Anthropic 110.298 秒仍在总预算内正常完成。
+- Argon `-real` 请求按 makersuite 策略输出缓冲 SSE，1 个正文事件、1 个 DONE、0 错误；不声称上游真实增量输出。
+- 3.7 legacy real SSE 有 6 个非空正文事件；3.8 普通调用正常。
+- Argon AUTO 工具调用两轮通过，包括数字工具结果 `7`；强制命名工具仍因 `allowedFunctionNames` 没有已验证编码而返回 400，不擅自补猜测的协议字段。
+- Argon 不在当前抗截断白名单，默认 prefer 请求正常退回普通文本，不能将其计作 Argon 抗截断通过。
+- NewAPI 容器内真实 Argon 调用成功。仅在真实生成通过后，部署模型列表追加精确 Argon ID；未填写未知上下文或输出 token 上限。
+
+本次生产补充的本地源码和测试修改未 commit/push；运行镜像在 892fba7 上包含该请求关联补丁。完整配置、数据保护、验收边界与脱敏证据见基础设施仓库 `runbooks/bero-aistudio-892fba7-upgrade-20261017.md`。

@@ -618,3 +618,69 @@ test("client key exclusions belong to one call and cannot poison another request
     await f.bridge.handle(route);
     assert.equal(route.outcomes[0].status, 200);
 });
+
+test("registered body metadata survives Studio dropping URL queries and stays out of upstream generation", async t => {
+    const f = fixture(t, 0, { bridge: { requireRegistration: true } });
+    await f.init();
+    const originalBody = JSON.stringify({ contents: [{ parts: [{ text: "hi" }], role: "user" }] });
+    const proxy = {
+        body: originalBody,
+        request_attempt_id: "registered-body-one",
+        transport_policy: require("../src/core/ModelTransportPolicy").resolve("gemini-2.5-flash", "fake", {
+            "gemini-2.5-flash": "makersuite",
+        }),
+    };
+    for (const id of ["registered-body-one", "registered-body-two"]) {
+        proxy.request_attempt_id = id;
+        const wire = f.bridge.prepare(proxy, performance.now() + 1000);
+        assert.equal(proxy.body, originalBody, "retry baseline must remain unchanged");
+        assert.equal(JSON.parse(wire.body).__aistudio_attempt, id);
+        // Actual Studio RPC carries a plain path, JSON body, proof and method;
+        // custom query parameters are absent from that path.
+        const route = f.route({ body: JSON.parse(wire.body) });
+        await f.bridge.handle(route);
+        assert.equal(route.outcomes[0].status, 200);
+        assert.equal(f.calls.at(-1).init.body.includes("__aistudio_attempt"), false);
+        assert.equal(f.calls.at(-1).init.body.includes(id), false);
+        assert.equal(f.bridge.attempts.size, 0);
+    }
+    assert.equal(f.calls.length, 2);
+});
+
+test("body correlation rejects conflicting, unregistered and retired attempts before upstream dispatch", async t => {
+    const f = fixture(t, 0, { bridge: { requireRegistration: true } });
+    await f.init();
+    const proxy = {
+        body: JSON.stringify({ contents: [] }),
+        request_attempt_id: "known-body-id",
+        transport_policy: require("../src/core/ModelTransportPolicy").resolve("gemini-2.5-flash", "fake", {
+            "gemini-2.5-flash": "makersuite",
+        }),
+    };
+    const wire = f.bridge.prepare(proxy, performance.now() + 1000);
+    const conflict = f.route({
+        body: JSON.parse(wire.body),
+        path: "/v1beta/models/gemini-2.5-flash:generateContent?__aistudio_attempt=another-id",
+    });
+    await f.bridge.handle(conflict);
+    assert.equal(conflict.outcomes[0].status, 400);
+    const unregistered = f.route({ body: { __aistudio_attempt: "unknown-body-id", contents: [] } });
+    await f.bridge.handle(unregistered);
+    assert.equal(unregistered.outcomes[0].status, 503);
+    f.page.emit("framenavigated", f.frame);
+    const retired = f.route({ body: JSON.parse(wire.body) });
+    await f.bridge.handle(retired);
+    assert.equal(retired.outcomes[0].status, 503);
+    assert.equal(f.calls.length, 0);
+});
+
+test("preparation rejects user-supplied reserved correlation fields", async t => {
+    const f = fixture(t);
+    await f.init();
+    assert.throws(
+        () => f.bridge.prepare({ body: '{"contents":[],"__aistudio_attempt":"user-value"}' }, performance.now() + 1000),
+        error => error.status === 400
+    );
+    assert.equal(f.bridge.attempts.size, 0);
+    assert.equal(f.calls.length, 0);
+});
