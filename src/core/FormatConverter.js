@@ -690,6 +690,12 @@ class FormatConverter {
                     responseContent = { result: message.content };
                 }
 
+                // Gemini functionResponse requires an object, including when a
+                // valid JSON tool result parses to a scalar or null.
+                if (responseContent === null || typeof responseContent !== "object") {
+                    responseContent = { result: responseContent === undefined ? "" : responseContent };
+                }
+
                 // Use function name from tool message (OpenAI format always includes name)
                 const functionName = message.name || "unknown_function";
 

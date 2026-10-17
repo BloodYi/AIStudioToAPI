@@ -1557,3 +1557,80 @@ test("Argon upstream 429 retains quota cooldown without expiring the account", a
     assert.equal(account.models["gemini-4-argon"].unsupported || false, false);
     assert.equal(res.statusCode, 429);
 });
+
+test("legacy benefit preflight failures return controlled responses in every generation adapter", async t => {
+    for (const method of [
+        "processOpenAIRequest",
+        "processOpenAIResponseRequest",
+        "processClaudeRequest",
+        "processRequest",
+    ]) {
+        for (const stream of [false, true]) {
+            await t.test(`${method} stream=${stream}`, async t => {
+                const fixture = setup(() => success);
+                t.after(() => fixture.scheduler.close());
+                fixture.handler.serverSystem.scheduler = null;
+                fixture.handler.authSwitcher.currentAuthIndex = 0;
+                fixture.handler._ensureBrowserBackedRequestReady = async () => true;
+                fixture.browser.contexts = new Map([
+                    [
+                        0,
+                        {
+                            page: {
+                                buildBenefit: {
+                                    async assertReady() {
+                                        throw Object.assign(
+                                            new Error("Build benefit failed for gemini-4-argon (auth_unavailable)"),
+                                            { code: "BUILD_BENEFIT_NOT_READY", status: 503 }
+                                        );
+                                    },
+                                },
+                            },
+                        },
+                    ],
+                ]);
+                const req = request("gemini-4-argon", stream);
+                if (method === "processOpenAIResponseRequest") req.body.input = "hi";
+                if (method === "processRequest") {
+                    req.path = `/v1beta/models/gemini-4-argon:${stream ? "streamGenerateContent" : "generateContent"}`;
+                    req.body = { contents: [{ parts: [{ text: "hi" }], role: "user" }] };
+                }
+                const res = new Response();
+                await assert.doesNotReject(fixture.handler[method](req, res));
+                assert.equal(res.statusCode, 503);
+                assert.match(res.body, /auth_unavailable/);
+                assert.equal(res.writableEnded, true);
+                assert.equal(fixture.sent.length, 0);
+                assert.equal(fixture.registry.messageQueues.size, 0);
+            });
+        }
+    }
+});
+
+test("OpenAI tool results normalize parsed JSON scalars without changing object results", async t => {
+    const fixture = setup(() => success);
+    t.after(() => fixture.scheduler.close());
+    for (const [content, expected] of [
+        ["7", { result: 7 }],
+        ['"7"', { result: "7" }],
+        ["true", { result: true }],
+        ["null", { result: null }],
+        ["plain text", { result: "plain text" }],
+        ['{"number":7}', { number: 7 }],
+    ]) {
+        const translated = await fixture.handler.formatConverter.translateOpenAIToGoogle({
+            messages: [
+                { content: "get number", role: "user" },
+                {
+                    content: null,
+                    role: "assistant",
+                    tool_calls: [{ function: { arguments: "{}", name: "get_number" }, id: "call1", type: "function" }],
+                },
+                { content, name: "get_number", role: "tool", tool_call_id: "call1" },
+            ],
+            model: "gemini-3.8-flash",
+        });
+        const part = translated.googleRequest.contents.flatMap(item => item.parts).find(part => part.functionResponse);
+        assert.deepEqual(part.functionResponse.response, expected);
+    }
+});

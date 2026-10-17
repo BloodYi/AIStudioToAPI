@@ -1,6 +1,6 @@
 # Gemini 4 Argon 适配方案：保留旧版 Build 请求模式
 
-日期：2026-10-17（Asia/Shanghai）。状态：运行代码及离线验证已实施；真实账号资格与 Google 上游验收尚未执行，未部署服务。
+日期：2026-10-17（Asia/Shanghai）。状态：已完成首次实施、离线验证与生产问题定位；目标模型生成尚未验收通过，后续修复尚未部署，详见第 11 节。
 
 ## 1. 目标与基线
 
@@ -203,7 +203,7 @@ await route.continue({ headers });
 
 未通过时保留脱敏错误证据，区分权限、通道、参数、认证和限流。不能用重复轮换、批量重新登录、写死 tier 或清除额度作为成功标准。
 
-## 10. 实施记录（2026-10-17）
+## 10. 首次实施记录（2026-10-17）
 
 - 运行代码：新增 `BuildBenefitContext`，首次导航前安装 fetch/XHR 原生请求观察和精确 unary RPC route。权益、认证与 ext 绑定账号页面及文档；原生请求正文需匹配当前文档记录，旧文档事件不能更新缓存或补新权益。
 - 权益查询：同页面并发共享 Promise，5 秒 deadline；独立记录 unknown/loading/ready-paid/ready-free/failed、脱敏失败原因及 HTTP 状态。失败允许 30 秒后重新预检，重载立即失效；查询的 401/403/429 不进入生成错误或账号过期流程。API Key 仅从该宿主页原生 MakerSuite 请求获取，排除本模块查询及其他服务。
@@ -220,3 +220,7 @@ await route.continue({ headers });
 - commit / push / 生产部署：未执行。
 
 验证结果：新增权益/Firefox 测试 8 项通过；scheduled request 回归 65 项通过（含四入口 stream/non-stream、403、429 和断线不重放）；完整 `npm test` 通过（共 393 项：361 通过、32 按现有环境条件跳过、0 失败）；改动 JS lint、Prettier 与 `git diff --check` 通过。现有需要额外环境开关的真实登录浏览器用例保持其原有 skip 条件。
+
+## 11. 生产验收问题与后续修复
+
+首次生产验收发现 Camoufox realm 导致权益认证捕获失败，以及 legacy 预检异常未受控返回。已通过 SSH 定位并在本地修复；真实权益查询达到 ready-paid，生产镜像的 Camoufox fixture 通过，但目标模型生成仍未验收成功，修复尚未部署。完整证据、限制、诊断影响与后续验收方案见 [生产问题定位与修复](gemini-4-argon-production-diagnosis-20261017.md)。第 10 节保留首次实施时的历史记录。

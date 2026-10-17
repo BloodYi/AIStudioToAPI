@@ -7,7 +7,7 @@ const benefitError = message => Object.assign(new Error(message), { code: "BUILD
 
 // Runs in each new document. Credentials and opaque entitlement values never leave
 // the owning page except for the final, native RPC's headers.
-function installObserver({ origin, rpc, binding, owner }) {
+function installObserver({ origin, rpc, binding, owner, messageBridge = false }) {
     if (window !== window.top) return;
     const documentId = crypto.randomUUID();
     const state = {
@@ -21,6 +21,10 @@ function installObserver({ origin, rpc, binding, owner }) {
         tier: null,
     };
     window.__buildBenefit = state;
+    const notify = () => {
+        if (messageBridge) console.debug(`BuildBenefitChange:${owner}:${documentId}`);
+        else if (binding) window[binding](documentId).catch(() => {});
+    };
     const observe = (url, headers) => {
         try {
             const parsed = new URL(url, location.href);
@@ -39,10 +43,10 @@ function installObserver({ origin, rpc, binding, owner }) {
             if (tier === "TIER1" || tier === "TIER2") {
                 state.tier = tier;
                 state.source = "native";
-                if (binding) window[binding](documentId).catch(() => {});
+                notify();
             }
             if (h.has("x-goog-ext-519733851-bin")) state.ext = h.get("x-goog-ext-519733851-bin");
-            if (binding && state.auth && !tier) window[binding](documentId).catch(() => {});
+            if (state.auth && !tier) notify();
         } catch {
             // Ignore unrelated requests and malformed header input.
         }
@@ -181,26 +185,60 @@ class BuildBenefitContext {
         this.page.on("framenavigated", this.onNavigation);
         this.page.on("close", this.onClose);
         const binding = "__buildBenefitChanged";
-        await this.page.exposeBinding(binding, async ({ frame }, documentId) => {
-            if (this.disposed || frame !== this.page.mainFrame()) return;
-            const epoch = this.epoch;
-            const current = await this.page
-                .evaluate(() => ({ id: window.__buildBenefit?.documentId, tier: window.__buildBenefit?.tier }))
-                .catch(() => null);
-            if (this.disposed || !this.isCurrent() || epoch !== this.epoch || current?.id !== documentId) return;
-            if (!current?.tier) {
-                if (this.verified && this.state === "failed" && Date.now() >= this.retryAt)
-                    this.ensure({ refresh: true });
-                return;
-            }
-            this.state = "ready-paid";
-            this.source = "native";
-            this.failureReason = null;
-            this.queryStatus = null;
-            this.onChange();
-        });
-        await this.page.addInitScript(installObserver, { binding, origin: ORIGIN, owner: this.owner, rpc: RPC });
+        this.usesMainWorldBridge = await this.page.evaluate(() => Boolean(window.wrappedJSObject));
+        const options = { binding, origin: ORIGIN, owner: this.owner, rpc: RPC };
+        if (this.usesMainWorldBridge) {
+            // Camoufox's isolated world also cannot call Playwright bindings.
+            // Forward only owner/document IDs through a private console marker;
+            // the current page's state is read again before accepting the event.
+            const prefix = `BuildBenefitChange:${this.owner}:`;
+            this.onConsole = message => {
+                const text = message.text();
+                if (text.startsWith(prefix)) this._observeDocument(text.slice(prefix.length)).catch(() => {});
+            };
+            this.page.on("console", this.onConsole);
+            await this.page.addInitScript(
+                ({ source, options }) => {
+                    if (window !== window.top) return;
+                    window.wrappedJSObject.eval(`(${source})(${JSON.stringify({ ...options, messageBridge: true })})`);
+                },
+                { options, source: installObserver.toString() }
+            );
+        } else {
+            await this.page.exposeBinding(binding, ({ frame }, documentId) => {
+                if (frame === this.page.mainFrame()) return this._observeDocument(documentId);
+            });
+            await this.page.addInitScript(installObserver, options);
+        }
         await this.page.route(this.matcher, this.route);
+    }
+
+    async _observeDocument(documentId) {
+        if (this.disposed) return;
+        const epoch = this.epoch;
+        const current = await this._evaluate(() => ({
+            id: window.__buildBenefit?.documentId,
+            tier: window.__buildBenefit?.tier,
+        })).catch(() => null);
+        if (this.disposed || !this.isCurrent() || epoch !== this.epoch || current?.id !== documentId) return;
+        if (!current?.tier) {
+            if (this.verified && this.state === "failed" && Date.now() >= this.retryAt) this.ensure({ refresh: true });
+            return;
+        }
+        this.state = "ready-paid";
+        this.source = "native";
+        this.failureReason = null;
+        this.queryStatus = null;
+        this.onChange();
+    }
+
+    async _evaluate(fn, arg) {
+        if (!this.usesMainWorldBridge) return this.page.evaluate(fn, arg);
+        // Resolve promises and serialize in the page world, so no credential
+        // objects or cross-realm Promise wrappers enter Playwright's sandbox.
+        const expression = `(async () => JSON.stringify(await (${fn.toString()})(${JSON.stringify(arg) ?? "undefined"})))()`;
+        const result = await this.page.evaluate(expression => window.wrappedJSObject.eval(expression), expression);
+        return result === undefined ? undefined : JSON.parse(result);
     }
 
     ensure({ refresh = false } = {}) {
@@ -218,7 +256,7 @@ class BuildBenefitContext {
             let timer;
             try {
                 const result = await Promise.race([
-                    this.page.evaluate(async timeout => {
+                    this._evaluate(async timeout => {
                         try {
                             return await window.__buildBenefit.read(timeout);
                         } catch (error) {
@@ -292,13 +330,13 @@ class BuildBenefitContext {
                 );
             if (!target || request.frame() !== this.page.mainFrame()) return await route.continue();
             const epoch = this.epoch;
-            const documentId = await this.page.evaluate(body => {
+            const documentId = await this._evaluate(body => {
                 const state = window.__buildBenefit;
                 return state?.outgoing.delete(body) ? state.documentId : null;
             }, request.postData());
             if (!documentId || epoch !== this.epoch) throw benefitError("Retired Build request");
             await this.assertReady();
-            const native = await this.page.evaluate(() => {
+            const native = await this._evaluate(() => {
                 const state = window.__buildBenefit;
                 return { documentId: state?.documentId, ext: state?.ext, tier: state?.tier };
             });
@@ -326,12 +364,11 @@ class BuildBenefitContext {
         this.state = "unknown";
         this.page.off("framenavigated", this.onNavigation);
         this.page.off("close", this.onClose);
+        if (this.onConsole) this.page.off("console", this.onConsole);
         this.page.unroute(this.matcher, this.route).catch(() => {});
-        this.page
-            .evaluate(owner => {
-                if (window.__buildBenefit?.owner === owner) window.__buildBenefit.controller?.abort();
-            }, this.owner)
-            .catch(() => {});
+        this._evaluate(owner => {
+            if (window.__buildBenefit?.owner === owner) window.__buildBenefit.controller?.abort();
+        }, this.owner).catch(() => {});
         this.onChange();
     }
 }

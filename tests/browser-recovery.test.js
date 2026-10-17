@@ -216,6 +216,7 @@ test("an already open WebSocket still requires mouse completion before publishin
     let closed = false;
     const page = {
         addInitScript: async () => {},
+        evaluate: async () => false,
         exposeBinding: async () => {},
         isClosed: () => false,
         mouse: {

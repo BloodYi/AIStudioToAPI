@@ -99,6 +99,7 @@ async function fixture(t) {
         fs.rmSync(directory, { force: true, recursive: true });
     });
     const browser = await firefox.launch({
+        executablePath: process.env.BUILD_BENEFIT_BROWSER_EXECUTABLE_PATH || undefined,
         headless: true,
         proxy: { server: `http://127.0.0.1:${proxy.address().port}` },
     });
@@ -108,6 +109,7 @@ async function fixture(t) {
         const page = await context.newPage();
         const benefit = new BuildBenefitContext(page, { authIndex: index, timeoutMs, verified: true });
         await benefit.install();
+        page._fixtureBenefit = benefit;
         await context.addCookies([
             {
                 domain: "alkalimakersuite-pa.clients6.google.com",
@@ -121,8 +123,16 @@ async function fixture(t) {
         await page.goto("https://aistudio.google.com/");
         return { benefit, context, page };
     };
+    // Camoufox 135's Juggler does not complete Page.reload with this
+    // Playwright version. Recreate its document through the production goto path.
+    state.reload = page =>
+        process.env.BUILD_BENEFIT_BROWSER_EXECUTABLE_PATH
+            ? page.goto(`https://aistudio.google.com/?fixture_document=${Date.now()}`, {
+                  waitUntil: "domcontentloaded",
+              })
+            : page.reload({ waitUntil: "domcontentloaded" });
     state.native = (page, headers = auth, method = "ListModels", body = "[]") =>
-        page.evaluate(
+        page._fixtureBenefit._evaluate(
             async ({ body, headers, url }) =>
                 (await fetch(url, { body, credentials: "include", headers, method: "POST" })).status,
             { body, headers, url: ORIGIN + RPC + method }
@@ -177,9 +187,15 @@ test("real Firefox preserves legacy wire and isolates entitlement documents/acco
     await f.native(page, headers, "ProxyStreamedCall", body);
     assert.equal(f.requests.at(-1).headers["x-aistudio-g1-tier"], undefined);
     assert.ok(f.requests.every(request => !request.url.startsWith(RPC + "GenerateContent")));
-    const retiredId = await page.evaluate(() => window.__buildBenefit.documentId);
-    await page.reload();
-    await page.evaluate(id => window.__buildBenefitChanged(id), retiredId);
+    const retiredId = await benefit._evaluate(() => window.__buildBenefit.documentId);
+    await f.reload(page);
+    if (benefit.usesMainWorldBridge) {
+        await benefit._evaluate(({ owner, id }) => console.debug(`BuildBenefitChange:${owner}:${id}`), {
+            id: retiredId,
+            owner: benefit.owner,
+        });
+        await page.waitForTimeout(20);
+    } else await page.evaluate(id => window.__buildBenefitChanged(id), retiredId);
     assert.equal(benefit.state, "unknown");
     await f.native(page);
     f.body = "[0]";
@@ -192,7 +208,8 @@ test("real Firefox preserves legacy wire and isolates entitlement documents/acco
     assert.equal(f.requests.at(-1).headers["x-aistudio-g1-tier"], "TIER2");
     assert.equal(f.requests.at(-1).headers["x-goog-ext-519733851-bin"], undefined);
     await f.native(page, { ...auth, "x-aistudio-g1-tier": "TIER1", "x-goog-ext-519733851-bin": "account-zero-ext" });
-    await benefit.ensure({ refresh: true });
+    for (let attempt = 0; attempt < 100 && benefit.state !== "ready-paid"; attempt++) await page.waitForTimeout(10);
+    assert.equal(benefit.state, "ready-paid", "native tier notification must wake the owning Node context");
     const beforeConcurrent = f.requests.length;
     await Promise.all([
         f.native(page, headers, "ProxyUnaryCall", body),
@@ -246,11 +263,11 @@ test(
         f.delay = 0;
         benefit.timeoutMs = 1000;
         assert.equal(await benefit.ensure({ refresh: true }), "ready-paid");
-        await page.reload();
+        await f.reload(page);
         await f.native(page);
         f.delay = 100;
         const pending = benefit.ensure();
-        await page.reload();
+        await f.reload(page);
         await pending;
         assert.equal(benefit.state, "unknown");
         await context.close();

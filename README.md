@@ -248,3 +248,5 @@ Docker 中包含的 Node.js、Camoufox、Mihomo 等第三方组件遵循各自�
 Chat Completions、Responses、Anthropic 和 Gemini native 均支持原有 JSON/SSE 响应格式。此模型的流式请求（包括全局 `real`、`-real` 后缀和原生 `alt=sse`）实际使用 unary 并缓冲输出；不是实时增量流。其他模型沿用原有流模式。权益补头只作用于最终宿主页 RPC，不改写正文、WAA 或原生认证，不回退到直接 GenerateContent。Argon 的本地日额度仍显示未知，实际 429 保留现有限流处理。
 
 离线测试包含真实 Firefox 与本地 TLS/CONNECT fixture，运行 `node --test tests/build-benefit.test.js`（需安装 Playwright Firefox 和 OpenSSL）；测试不访问 Google。代码及 fixture 通过不等同于真实账号已通过上游验收，具体记录见 [适配方案](docs/zh/gemini-4-argon-legacy-build-adaptation-plan-20261017.md)。
+
+Camoufox 生产差异及后续修复见 [生产问题定位](docs/zh/gemini-4-argon-production-diagnosis-20261017.md)。可通过 `BUILD_BENEFIT_BROWSER_EXECUTABLE_PATH=/path/to/camoufox node --test tests/build-benefit.test.js` 运行同一套本地 fixture；Camoufox 使用 BrowserManager 的导航方式验证文档失效，标准 Firefox 保留原生 reload 测试。

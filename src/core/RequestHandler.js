@@ -1028,6 +1028,8 @@ class RequestHandler {
                 }
                 if (!res.writableEnded) res.end();
             }
+        } catch (error) {
+            this._handleRequestError(error, res, requestId);
         } finally {
             this._finalizeTrackedRequest(requestId, res);
         }
@@ -1100,6 +1102,8 @@ class RequestHandler {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
                 if (!res.writableEnded) res.end();
             }
+        } catch (error) {
+            this._handleRequestError(error, res, requestId);
         } finally {
             this._finalizeTrackedRequest(requestId, res);
         }
@@ -1164,6 +1168,8 @@ class RequestHandler {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
                 if (!res.writableEnded) res.end();
             }
+        } catch (error) {
+            this._handleRequestError(error, res, requestId);
         } finally {
             this._finalizeTrackedRequest(requestId, res);
         }
@@ -1792,6 +1798,8 @@ class RequestHandler {
                 }
                 if (!res.writableEnded) res.end();
             }
+        } catch (error) {
+            this._handleRequestError(error, res, requestId);
         } finally {
             res.__stopEarlyOpenAIStream?.();
             if (res.__streamStartSent)
@@ -2255,6 +2263,8 @@ class RequestHandler {
                 }
                 if (!res.writableEnded) res.end();
             }
+        } catch (error) {
+            this._handleRequestError(error, res, requestId);
         } finally {
             this._finalizeTrackedRequest(requestId, res);
         }
@@ -2615,6 +2625,8 @@ class RequestHandler {
                 }
                 if (!res.writableEnded) res.end();
             }
+        } catch (error) {
+            this._handleRequestError(error, res, requestId);
         } finally {
             this._finalizeTrackedRequest(requestId, res);
         }
@@ -2770,6 +2782,8 @@ class RequestHandler {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
                 if (!res.writableEnded) res.end();
             }
+        } catch (error) {
+            this._handleRequestError(error, res, requestId);
         } finally {
             this._finalizeTrackedRequest(requestId, res);
         }
@@ -2946,6 +2960,8 @@ class RequestHandler {
                 this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
                 if (!res.writableEnded) res.end();
             }
+        } catch (error) {
+            this._handleRequestError(error, res, requestId);
         } finally {
             this._finalizeTrackedRequest(requestId, res);
         }
