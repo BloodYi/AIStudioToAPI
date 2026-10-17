@@ -1463,7 +1463,15 @@ test("Argon uses unary across all adapters while preserving client JSON and SSE"
                 const fixture = setup(() => success, { scheduler: { argonVerifiedAccounts: [0] } });
                 t.after(() => fixture.scheduler.close());
                 const benefit = { state: "ready-paid", verified: true };
-                fixture.browser.contexts = new Map([[0, { page: { buildBenefit: benefit }, state: "READY" }]]);
+                fixture.browser.contexts = new Map([
+                    [
+                        0,
+                        {
+                            page: { buildBenefit: benefit, makerSuiteBridge: { cancelAttempt() {}, prepare() {} } },
+                            state: "READY",
+                        },
+                    ],
+                ]);
                 fixture.browser.isContextReady = index => index === 0;
                 fixture.scheduler.browserManager = fixture.browser;
                 const req = request("gemini-4-argon-real", stream);
@@ -1499,7 +1507,13 @@ test("Argon permission errors affect only the model and do not replay generation
     fixture.browser.contexts = new Map(
         [0, 1].map(index => [
             index,
-            { page: { buildBenefit: { state: "ready-paid", verified: true } }, state: "READY" },
+            {
+                page: {
+                    buildBenefit: { state: "ready-paid", verified: true },
+                    makerSuiteBridge: { cancelAttempt() {}, prepare() {} },
+                },
+                state: "READY",
+            },
         ])
     );
     fixture.browser.isContextReady = index => index < 2;
@@ -1520,7 +1534,13 @@ test("Argon does not replay a unary generation after its connection is lost", as
     fixture.browser.contexts = new Map(
         [0, 1].map(index => [
             index,
-            { page: { buildBenefit: { state: "ready-paid", verified: true } }, state: "READY" },
+            {
+                page: {
+                    buildBenefit: { state: "ready-paid", verified: true },
+                    makerSuiteBridge: { cancelAttempt() {}, prepare() {} },
+                },
+                state: "READY",
+            },
         ])
     );
     fixture.browser.isContextReady = index => index < 2;
@@ -1543,7 +1563,16 @@ test("Argon upstream 429 retains quota cooldown without expiring the account", a
     });
     t.after(() => fixture.scheduler.close());
     fixture.browser.contexts = new Map([
-        [0, { page: { buildBenefit: { state: "ready-paid", verified: true } }, state: "READY" }],
+        [
+            0,
+            {
+                page: {
+                    buildBenefit: { state: "ready-paid", verified: true },
+                    makerSuiteBridge: { cancelAttempt() {}, prepare() {} },
+                },
+                state: "READY",
+            },
+        ],
     ]);
     fixture.browser.isContextReady = index => index === 0;
     fixture.scheduler.browserManager = fixture.browser;
@@ -1632,5 +1661,68 @@ test("OpenAI tool results normalize parsed JSON scalars without changing object 
         });
         const part = translated.googleRequest.contents.flatMap(item => item.parts).find(part => part.functionResponse);
         assert.deepEqual(part.functionResponse.response, expected);
+    }
+});
+
+test("all adapters keep buffered generation through 59/61/90 seconds within one deadline", async t => {
+    for (const method of [
+        "processOpenAIRequest",
+        "processOpenAIResponseRequest",
+        "processClaudeRequest",
+        "processRequest",
+    ]) {
+        for (const stream of [false, true]) {
+            await t.test(`${method} stream=${stream}`, async t => {
+                let elapsed = 0;
+                t.mock.method(performance, "now", () => elapsed);
+                t.mock.timers.enable({ apis: ["setTimeout"] });
+                const fixture = setup(() => [], {
+                    fakeStreamTimeoutMs: 120000,
+                    scheduler: { argonVerifiedAccounts: [0] },
+                    streamTimeoutMs: 60000,
+                });
+                t.after(() => fixture.scheduler.close());
+                const benefit = { state: "ready-paid", verified: true };
+                fixture.browser.contexts = new Map([
+                    [
+                        0,
+                        {
+                            page: { buildBenefit: benefit, makerSuiteBridge: { cancelAttempt() {}, prepare() {} } },
+                            state: "READY",
+                        },
+                    ],
+                ]);
+                fixture.browser.isContextReady = index => index === 0;
+                fixture.scheduler.browserManager = fixture.browser;
+                const req = request("gemini-4-argon-real", stream);
+                if (method === "processOpenAIResponseRequest") req.body.input = "hi";
+                if (method === "processRequest") {
+                    req.path = `/v1beta/models/gemini-4-argon-real:${stream ? "streamGenerateContent" : "generateContent"}`;
+                    req.query = stream ? { alt: "sse" } : {};
+                    req.body = { contents: [{ parts: [{ text: "hi" }], role: "user" }] };
+                }
+                const res = new Response();
+                const running = fixture.handler[method](req, res);
+                for (let n = 0; n < 15; n++) await new Promise(resolve => setImmediate(resolve));
+                assert.equal(fixture.sent.length, 1);
+                const entry = fixture.sent[0];
+                assert.equal(entry.request.transport_policy.transport, "makersuite");
+                assert.equal(entry.request.transport_policy.requestedMode, "real");
+                assert.equal(entry.request.transport_policy.effectiveMode, "fake");
+                for (const time of [59000, 61000, 90000]) {
+                    t.mock.timers.tick(time - elapsed);
+                    elapsed = time;
+                    for (let n = 0; n < 3; n++) await new Promise(resolve => setImmediate(resolve));
+                    assert.equal(res.writableEnded, false);
+                }
+                deliver(fixture, entry, success);
+                await running;
+                assert.equal(res.statusCode, 200, res.body);
+                assert.match(res.body, /hello/);
+                assert.equal(fixture.sent.length, 1);
+                assert.equal(fixture.registry.messageQueues.size, 0);
+                assert.equal(fixture.scheduler.snapshot().active_workers, 0);
+            });
+        }
     }
 });

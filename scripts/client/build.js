@@ -143,7 +143,10 @@ class ConnectionManager extends EventTarget {
             window.chrome?._browserGeneration === undefined
                 ? ""
                 : `&generation=${window.chrome._browserGeneration}&attemptId=${encodeURIComponent(window.chrome._browserAttemptId || "")}`;
-        const wsUrl = this.authIndex >= 0 ? `${this.endpoint}?authIndex=${this.authIndex}${ownership}` : this.endpoint;
+        const wsUrl =
+            this.authIndex >= 0
+                ? `${this.endpoint}?authIndex=${this.authIndex}${ownership}&transportVersion=1`
+                : this.endpoint;
         Logger.output("Connecting to server:", wsUrl);
         return new Promise((resolve, reject) => {
             try {
@@ -235,9 +238,19 @@ class RequestProcessor {
         }
 
         // Browser-side safety cap. Server-side timeouts can be configured with env vars.
-        const IDLE_TIMEOUT_DURATION = 300000; // 300 seconds (5 minutes)
+        const bufferedBridge = requestSpec.transport_policy?.transport === "makersuite";
+        const budget = requestSpec.remaining_budget_ms;
+        if (bufferedBridge && (!Number.isFinite(budget) || budget <= 0 || budget > 300000))
+            throw new Error("Invalid buffered generation budget");
+        const IDLE_TIMEOUT_DURATION = bufferedBridge ? budget : 300000;
         const abortController = new AbortController();
-        const activeOperation = { abortController, requestAttemptId, startedAt: performance.now(), ttfbMs: null };
+        const activeOperation = {
+            abortController,
+            deadline: bufferedBridge ? performance.now() + budget : null,
+            requestAttemptId,
+            startedAt: performance.now(),
+            ttfbMs: null,
+        };
         this.activeOperations.set(operationId, activeOperation);
 
         let timeoutId = null;
@@ -248,6 +261,10 @@ class RequestProcessor {
                     const error = new Error(
                         `Timeout: ${IDLE_TIMEOUT_DURATION / 1000} seconds without receiving any data`
                     );
+                    if (bufferedBridge) {
+                        error.status = 504;
+                        activeOperation.deadlineExceeded = true;
+                    }
                     abortController.abort();
                     reject(error);
                 }, IDLE_TIMEOUT_DURATION);
@@ -300,8 +317,8 @@ class RequestProcessor {
                     };
                     throw error;
                 }
-                // Clear timeout when fetch succeeds to prevent timer leak
-                cancelTimeout();
+                // Buffered generation keeps its hard deadline through body reading.
+                if (!bufferedBridge) cancelTimeout();
                 return response;
             } catch (error) {
                 cancelTimeout();
@@ -784,9 +801,13 @@ class ProxySystem extends EventTarget {
 
             // --- Core modification: Correctly dispatch streaming and non-streaming data inside the loop ---
             // Browser-side safety cap for each chunk read.
-            const CHUNK_READ_TIMEOUT = 300000; // 300 seconds (5 minutes)
+            const operation = this.requestProcessor.activeOperations.get(operationId);
+            const readTimeout = () =>
+                operation?.deadline ? Math.max(1, operation.deadline - performance.now()) : 300000;
             let processing = true;
             while (processing) {
+                if (operation?.deadline && performance.now() >= operation.deadline)
+                    throw Object.assign(new Error("Buffered generation deadline exceeded"), { status: 504 });
                 // Check if WebSocket is still connected
                 if (!this.connectionManager.isConnected) {
                     Logger.debug(`WebSocket disconnected, stopping stream read for operation #${operationId}`);
@@ -808,10 +829,8 @@ class ProxySystem extends EventTarget {
                 const timeoutPromise = new Promise((_, reject) => {
                     chunkTimeoutId = setTimeout(() => {
                         timeoutOccurred = true;
-                        reject(
-                            new Error(`Chunk read timeout: no data received for ${CHUNK_READ_TIMEOUT / 1000} seconds`)
-                        );
-                    }, CHUNK_READ_TIMEOUT);
+                        reject(new Error(`Chunk read timeout: no data received for ${readTimeout() / 1000} seconds`));
+                    }, readTimeout());
                 });
 
                 try {
@@ -831,7 +850,7 @@ class ProxySystem extends EventTarget {
                         break;
                     }
 
-                    cancelTimeout();
+                    if (!operation?.deadline) cancelTimeout();
 
                     const chunk = textDecoder.decode(value, { stream: true });
                     if (mode === "real") {
@@ -872,6 +891,8 @@ class ProxySystem extends EventTarget {
                 }
             }
 
+            if (operation?.deadline && performance.now() >= operation.deadline)
+                throw Object.assign(new Error("Buffered generation deadline exceeded"), { status: 504 });
             Logger.output("Data stream read complete.");
 
             // Check if operation was cancelled during streaming
@@ -900,6 +921,10 @@ class ProxySystem extends EventTarget {
             }
             // Only send error if we still own this operationId (prevent stale errors from reaching server during retries)
             const currentOperation = this.requestProcessor.activeOperations.get(operationId);
+            if (currentOperation?.deadlineExceeded) {
+                error.status = 504;
+                error.message = "Buffered generation deadline exceeded";
+            }
             if (
                 currentOperation?.abortController === abortController &&
                 currentOperation?.requestAttemptId === requestAttemptId
@@ -913,6 +938,7 @@ class ProxySystem extends EventTarget {
             if (cancelTimeout && typeof cancelTimeout === "function") {
                 cancelTimeout();
             }
+            abortController?.abort();
             // Always cancel reader to stop background stream processing
             if (reader && typeof reader.cancel === "function") {
                 try {

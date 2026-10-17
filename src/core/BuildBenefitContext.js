@@ -30,7 +30,7 @@ function installObserver({ origin, rpc, binding, owner, messageBridge = false })
             const parsed = new URL(url, location.href);
             if (parsed.origin !== origin || !parsed.pathname.startsWith(rpc)) return;
             if (!/^[A-Za-z]+$/.test(parsed.pathname.slice(rpc.length))) return;
-            if (parsed.pathname === rpc + "GetAiStudioBenefitTier") return;
+            if (["GetAiStudioBenefitTier", "GenerateContent"].some(method => parsed.pathname === rpc + method)) return;
             const h = new Headers(headers);
             if (h.has("authorization") && (h.has("x-goog-api-key") || parsed.searchParams.has("key"))) {
                 state.auth = {
@@ -70,6 +70,7 @@ function installObserver({ origin, rpc, binding, owner, messageBridge = false })
         }
     };
     const originalFetch = window.fetch;
+    state.nativeFetch = originalFetch.bind(window);
     window.fetch = function (input, init) {
         const url = input instanceof Request ? input.url : input;
         observe(url, init?.headers || input?.headers);
@@ -210,7 +211,7 @@ class BuildBenefitContext {
             });
             await this.page.addInitScript(installObserver, options);
         }
-        await this.page.route(this.matcher, this.route);
+        if (!this.dispatcher) await this.page.route(this.matcher, this.route);
     }
 
     async _observeDocument(documentId) {
@@ -311,13 +312,14 @@ class BuildBenefitContext {
             );
     }
 
-    async route(route) {
+    async route(route, cleanUrl) {
+        if (typeof cleanUrl !== "string") cleanUrl = undefined;
         const request = route.request();
         let body;
         try {
             body = JSON.parse(request.postData() || "null");
         } catch {
-            return route.continue();
+            return route.continue(cleanUrl ? { url: cleanUrl } : {});
         }
         try {
             // Legacy Build's first protobuf-JSON field is the upstream path.
@@ -328,7 +330,8 @@ class BuildBenefitContext {
                 /^(?:https:\/\/generativelanguage\.googleapis\.com)?\/v1beta\/models\/gemini-4-argon:generateContent(?:\?|$)/.test(
                     body[0]
                 );
-            if (!target || request.frame() !== this.page.mainFrame()) return await route.continue();
+            if (!target || request.frame() !== this.page.mainFrame())
+                return await route.continue(cleanUrl ? { url: cleanUrl } : {});
             const epoch = this.epoch;
             const documentId = await this._evaluate(body => {
                 const state = window.__buildBenefit;
@@ -350,7 +353,7 @@ class BuildBenefitContext {
                 headers["x-aistudio-g1-tier"] = native.tier;
             }
             if (!headers["x-goog-ext-519733851-bin"] && native.ext) headers["x-goog-ext-519733851-bin"] = native.ext;
-            await route.continue({ headers });
+            await route.continue({ headers, ...(cleanUrl ? { url: cleanUrl } : {}) });
         } catch {
             await route.abort("blockedbyclient").catch(() => {});
         }

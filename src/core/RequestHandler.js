@@ -1,3 +1,4 @@
+const TransportPolicy = require("./ModelTransportPolicy");
 const { isArgon, benefitError } = require("./BuildBenefitContext");
 /**
  * File: src/core/RequestHandler.js
@@ -668,7 +669,9 @@ class RequestHandler {
         return this._readInitialMessage(queue);
     }
 
-    _shouldRetryError(error) {
+    _shouldRetryError(error, proxyRequest) {
+        if (proxyRequest?.transport_policy?.transport === "makersuite") return false;
+        if (require("../utils/MakerSuiteAuth").isBridgeAuthFailure(error)) return false;
         return this.config.immediateSwitchStatusCodes.includes(Number(error?.status));
     }
 
@@ -1432,6 +1435,11 @@ class RequestHandler {
                 query_params: useRealStream ? { alt: "sse" } : {},
                 request_id: requestId,
                 streaming_mode: useRealStream ? "real" : "fake",
+                transport_policy: TransportPolicy.resolve(
+                    model,
+                    modelStreamingMode || systemStreamMode,
+                    this.config.modelTransportPolicy
+                ),
             };
             if (policy.enabled) {
                 const context = {
@@ -1496,7 +1504,7 @@ class RequestHandler {
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this._shouldRetryError(initialMessage)
+                            this._shouldRetryError(initialMessage, proxyRequest)
                         ) {
                             this.logger.warn(
                                 `[Request] OpenAI real stream received ${initialStatus}, preparing retry...`
@@ -1931,6 +1939,11 @@ class RequestHandler {
                 query_params: useRealStream ? { alt: "sse" } : {},
                 request_id: requestId,
                 streaming_mode: useRealStream ? "real" : "fake",
+                transport_policy: TransportPolicy.resolve(
+                    model,
+                    modelStreamingMode || systemStreamMode,
+                    this.config.modelTransportPolicy
+                ),
             };
             this._initializeProxyRequestAttempt(proxyRequest);
             await this._ensureLegacyBenefit(proxyRequest);
@@ -1984,7 +1997,7 @@ class RequestHandler {
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this._shouldRetryError(initialMessage)
+                            this._shouldRetryError(initialMessage, proxyRequest)
                         ) {
                             this.logger.warn(
                                 `[Request] OpenAI Response API real stream received ${initialStatus}, preparing retry...`
@@ -2339,6 +2352,11 @@ class RequestHandler {
                 query_params: useRealStream ? { alt: "sse" } : {},
                 request_id: requestId,
                 streaming_mode: useRealStream ? "real" : "fake",
+                transport_policy: TransportPolicy.resolve(
+                    model,
+                    modelStreamingMode || systemStreamMode,
+                    this.config.modelTransportPolicy
+                ),
             };
             this._initializeProxyRequestAttempt(proxyRequest);
             await this._ensureLegacyBenefit(proxyRequest);
@@ -2392,7 +2410,7 @@ class RequestHandler {
                             initialMessage.event_type === "error" &&
                             !isUserAbortedError(initialMessage) &&
                             Number.isFinite(initialStatus) &&
-                            this._shouldRetryError(initialMessage)
+                            this._shouldRetryError(initialMessage, proxyRequest)
                         ) {
                             this.logger.warn(
                                 `[Request] Claude real stream received ${initialStatus}, preparing retry...`
@@ -3384,7 +3402,7 @@ class RequestHandler {
                 proxyRequest.is_generative &&
                 !isUserAbortedError(headerMessage) &&
                 Number.isFinite(headerStatus) &&
-                this._shouldRetryError(headerMessage)
+                this._shouldRetryError(headerMessage, proxyRequest)
             ) {
                 this.logger.warn(`[Request] Gemini real stream received ${headerStatus}, preparing retry...`);
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
@@ -3722,7 +3740,8 @@ class RequestHandler {
 
                 // A lost unary response may already have generated output upstream.
                 if (
-                    isArgon(this._extractModelFromPath(proxyRequest.path)) &&
+                    (isArgon(this._extractModelFromPath(proxyRequest.path)) ||
+                        proxyRequest.transport_policy?.transport === "makersuite") &&
                     (this._isConnectionResetError(error) ||
                         error.code === "BUILD_BENEFIT_NOT_READY" ||
                         error.code === "QUEUE_TIMEOUT" ||
@@ -3808,9 +3827,14 @@ class RequestHandler {
                 lastError = errorPayload;
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
+                if (proxyRequest.transport_policy?.transport === "makersuite") {
+                    lastError = { ...errorPayload, skipAccountSwitch: true };
+                    break;
+                }
                 const errorStatus = Number(errorPayload?.status);
                 if (
-                    isArgon(this._extractModelFromPath(proxyRequest.path)) &&
+                    (isArgon(this._extractModelFromPath(proxyRequest.path)) ||
+                        proxyRequest.transport_policy?.transport === "makersuite") &&
                     ([400, 401, 403].includes(errorStatus) ||
                         errorPayload.code === "BUILD_BENEFIT_NOT_READY" ||
                         /PERMISSION_DENIED/.test(errorPayload.message || ""))
@@ -4477,6 +4501,9 @@ class RequestHandler {
 
     _cancelBrowserRequest(requestId, authIndex, requestAttemptId = null) {
         const targetAuthIndex = authIndex !== undefined ? authIndex : this.currentAuthIndex;
+        this.browserManager.contexts
+            ?.get(targetAuthIndex)
+            ?.page?.makerSuiteBridge?.cancelAttempt(requestId, requestAttemptId);
         const connection = this.connectionRegistry.getConnectionByAuth(targetAuthIndex);
         if (connection) {
             this.logger.info(
@@ -4572,8 +4599,6 @@ class RequestHandler {
         const bodyObj = req.body;
         let requestBodyObj = bodyObj;
         let responseTransform = null;
-
-        this.logger.debug(`[Proxy] Debug: incoming Gemini Body (Google Native) = ${JSON.stringify(bodyObj, null, 2)}`);
 
         // Parse model suffixes from model name in native Gemini generation requests
         // Only handle generation requests: /v1beta/models/{modelName}:generateContent or :streamGenerateContent
@@ -4754,13 +4779,16 @@ class RequestHandler {
             bodyObj.safetySettings = this.formatConverter.getDefaultSafetySettings();
         }
 
-        this.logger.debug(
-            `[Proxy] Debug: Final Gemini Request (Google Native) = ${JSON.stringify(requestBodyObj, null, 2)}`
-        );
-
-        const argonGeneration = /\/models\/gemini-4-argon:(?:generateContent|streamGenerateContent)$/.test(cleanPath);
+        const bufferedGeneration =
+            req.method === "POST" &&
+            TransportPolicy.resolve(
+                this._extractModelFromPath(cleanPath),
+                modelStreamingMode || this.config.streamingMode,
+                this.config.modelTransportPolicy
+            ).transport === "makersuite" &&
+            /:(?:generateContent|streamGenerateContent)$/.test(cleanPath);
         const query = { ...(req.query || {}) };
-        if (argonGeneration) {
+        if (bufferedGeneration) {
             cleanPath = cleanPath.replace(":streamGenerateContent", ":generateContent");
             delete query.alt;
         }
@@ -4775,11 +4803,16 @@ class RequestHandler {
             query_params: query,
             request_id: requestId,
             response_transform: responseTransform,
-            streaming_mode: argonGeneration
+            streaming_mode: bufferedGeneration
                 ? "fake"
                 : (modelStreamingMode || this.config.streamingMode) === "early"
                   ? "fake"
                   : modelStreamingMode || this.config.streamingMode,
+            transport_policy: TransportPolicy.resolve(
+                this._extractModelFromPath(cleanPath),
+                modelStreamingMode || this.config.streamingMode,
+                this.config.modelTransportPolicy
+            ),
         };
     }
 
@@ -4807,11 +4840,7 @@ class RequestHandler {
     }
 
     _effectiveStreamMode(model, mode) {
-        if (isArgon(model) && mode === "real") {
-            this.logger.info(`[Build] model=gemini-4-argon rpc=ProxyUnaryCall stream_mode=fake (buffered)`);
-            return "fake";
-        }
-        return mode;
+        return TransportPolicy.resolve(model, mode, this.config.modelTransportPolicy).effectiveMode;
     }
 
     async _ensureLegacyBenefit(proxyRequest) {
@@ -4823,6 +4852,14 @@ class RequestHandler {
     }
 
     _initializeProxyRequestAttempt(proxyRequest) {
+        if (proxyRequest.is_generative && !proxyRequest.transport_policy) {
+            proxyRequest.transport_policy = TransportPolicy.resolve(
+                this._extractModelFromPath(proxyRequest.path),
+                proxyRequest.streaming_mode || "fake",
+                this.config.modelTransportPolicy
+            );
+            proxyRequest.streaming_mode = proxyRequest.transport_policy.effectiveMode;
+        }
         if (proxyRequest.is_generative && isArgon(this._extractModelFromPath(proxyRequest.path))) {
             // Client headers cannot attest to the host account's membership.
             proxyRequest.headers = Object.fromEntries(
@@ -4856,6 +4893,24 @@ class RequestHandler {
     }
 
     _forwardRequest(proxyRequest, authIndex = this.currentAuthIndex) {
+        const policy = proxyRequest.is_generative ? proxyRequest.transport_policy : null;
+        if (policy?.transport === "makersuite") {
+            const bridge = this.browserManager.contexts?.get(authIndex)?.page?.makerSuiteBridge;
+            if (!bridge) throw benefitError("MakerSuite bridge unavailable");
+            // One monotonic generation budget survives retries and continuation rounds.
+            if (!proxyRequest.__generationDeadline)
+                Object.defineProperty(proxyRequest, "__generationDeadline", {
+                    value: performance.now() + this.timeouts.FAKE_STREAM,
+                });
+            const remaining = Math.floor(proxyRequest.__generationDeadline - performance.now());
+            if (remaining <= 0) throw Object.assign(new Error("Generation deadline exceeded"), { status: 504 });
+            proxyRequest.remaining_budget_ms = remaining;
+            const entry = this.connectionRegistry.messageQueues?.get(proxyRequest.request_id);
+            if (entry?.queue) {
+                entry.queue.generationDeadline = proxyRequest.__generationDeadline;
+                entry.transportPolicy = policy;
+            }
+        }
         if (proxyRequest.is_generative && isArgon(this._extractModelFromPath(proxyRequest.path))) {
             const benefit = this.browserManager.contexts?.get(authIndex)?.page?.buildBenefit;
             if (
@@ -4866,11 +4921,19 @@ class RequestHandler {
             )
                 throw benefitError("No qualified Build account for gemini-4-argon");
             this.logger.info(
-                `[Build] account=${authIndex} request=${proxyRequest.request_id} attempt=${proxyRequest.request_attempt_id} model=gemini-4-argon rpc=ProxyUnaryCall benefit_source=${benefit.source || "unknown"} benefit_state=${benefit.state} stream_mode=${proxyRequest.streaming_mode} buffered=true`
+                `[Build] account=${authIndex} request=${proxyRequest.request_id} attempt=${proxyRequest.request_attempt_id} model=gemini-4-argon transport=${policy?.transport || "legacy"} rpc=${policy?.transport === "makersuite" ? "GenerateContent" : "ProxyUnaryCall"} policy=${policy?.version || "unknown"} benefit_source=${benefit.source || "unknown"} benefit_state=${benefit.state} stream_mode=${proxyRequest.streaming_mode} buffered=true`
             );
         }
+        if (policy)
+            this.logger.info(
+                `[Transport] account=${authIndex} request=${proxyRequest.request_id} attempt=${proxyRequest.request_attempt_id} model=${policy.model} transport=${policy.transport} rpc=${policy.transport === "makersuite" ? "GenerateContent" : proxyRequest.streaming_mode === "real" ? "ProxyStreamedCall" : "ProxyUnaryCall"} policy=${policy.version} requested_mode=${policy.requestedMode} effective_mode=${policy.effectiveMode} budget=${policy.timeoutCategory} remaining_ms=${proxyRequest.remaining_budget_ms ?? "incremental"}`
+            );
         const connection = this.connectionRegistry.getConnectionByAuth(authIndex);
         if (connection) {
+            if (policy?.transport === "makersuite")
+                this.browserManager.contexts
+                    .get(authIndex)
+                    .page.makerSuiteBridge.prepare(proxyRequest, proxyRequest.__generationDeadline);
             this.logger.debug(
                 `[Request] Forwarding request #${proxyRequest.request_id} via connection for authIndex=${authIndex}` +
                     ` (attempt=${proxyRequest.request_attempt_id})`

@@ -151,6 +151,13 @@ class ConfigurationService {
             (!Array.isArray(value) || value.some(code => !Number.isInteger(code) || code < 400 || code > 599))
         )
             throw fail(`${name}: 使用 400–599 错误码`);
+        if (d.type === "transport") {
+            try {
+                require("../core/ModelTransportPolicy").parsePolicy(value);
+            } catch (error) {
+                throw fail(error.message);
+            }
+        }
         if (d.type === "models") {
             if (!value || typeof value !== "object" || Array.isArray(value)) throw fail(`${name}: 必须为模型映射`);
             for (const [model, limit] of Object.entries(value)) {

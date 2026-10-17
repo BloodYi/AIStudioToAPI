@@ -59,6 +59,8 @@ class ConfigLoader {
             wsPort: 9998,
         };
 
+        config.modelTransportPolicy = require("../core/ModelTransportPolicy").parsePolicy(env.MODEL_TRANSPORT_POLICY);
+
         config.scheduler = require("../core/SchedulerConfig")(env);
 
         // Environment variable overrides
@@ -131,6 +133,8 @@ class ConfigLoader {
                 ? Math.min(300000, Math.max(1, parsed))
                 : config.streamTimeoutMs;
         }
+        if (Number(env.FAKE_STREAM_TIMEOUT_MS) > 300000)
+            throw new Error("FAKE_STREAM_TIMEOUT_MS above 300000 is not supported by the Build client");
         if (env.FAKE_STREAM_TIMEOUT_MS) {
             const parsed = parseInt(env.FAKE_STREAM_TIMEOUT_MS, 10);
             config.fakeStreamTimeoutMs = Number.isFinite(parsed)

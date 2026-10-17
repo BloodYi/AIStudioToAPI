@@ -6,6 +6,7 @@
  */
 
 const { BuildBenefitContext } = require("./BuildBenefitContext");
+const { MakerSuiteBridge } = require("./MakerSuiteBridge");
 const fs = require("fs");
 const path = require("path");
 const { firefox } = require("playwright");
@@ -462,6 +463,7 @@ class BrowserManager {
     }
 
     async _closeAttemptContext(attempt) {
+        attempt?.page?.makerSuiteBridge?.dispose();
         attempt?.page?.buildBenefit?.dispose();
         if (!attempt?.context) return { closed: false, skipped: true };
         if (attempt.cleanupTask) return attempt.cleanupTask;
@@ -1403,6 +1405,17 @@ class BrowserManager {
     //     }
     // }
 
+    async _diagnoseMakerSuiteSession(page) {
+        const title = await withHardTimeout(() => page.title(), 1500);
+        const url = new URL(page.url());
+        return url.hostname === "accounts.google.com" ||
+            /ServiceLogin/.test(url.pathname) ||
+            title.includes("Sign in") ||
+            title.includes("登录")
+            ? "expired"
+            : "unverified";
+    }
+
     /**
      * Helper: Check page status and detect various error conditions
      * Detects: cookie expiration, region restrictions, 403 errors, page load failures
@@ -2133,6 +2146,7 @@ class BrowserManager {
                 inflight,
                 last_disconnect_reason: data.lastDisconnectReason || null,
                 last_request_at: data.lastRequestAt || null,
+                makersuite_active: data.page?.makerSuiteBridge?.active.size || 0,
                 state,
             };
         });
@@ -3527,7 +3541,21 @@ class BrowserManager {
                 verified: (this.config?.scheduler?.argonVerifiedAccounts || []).includes(authIndex),
             });
             page.buildBenefit = benefit;
+            benefit.dispatcher = true;
+            const bridge = new MakerSuiteBridge({
+                authIndex,
+                benefit,
+                context,
+                logger: this.logger,
+                page,
+                policy: this.config?.modelTransportPolicy,
+                requireRegistration: true,
+                timeoutMs: 295000,
+                validateSession: () => this._diagnoseMakerSuiteSession(page),
+            });
+            page.makerSuiteBridge = bridge;
             await this._runInitOperation(attempt, "benefit.install", () => benefit.install());
+            await this._runInitOperation(attempt, "makersuite.install", () => bridge.install());
 
             // Pure JS Wakeup (Focus & Mouse Movement)
             // Skip focus operations for background tasks to avoid window focus conflicts
@@ -4122,6 +4150,7 @@ class BrowserManager {
         }
 
         const contextData = this.contexts.get(authIndex);
+        contextData.page?.makerSuiteBridge?.dispose();
         contextData.page?.buildBenefit?.dispose();
         this._closingContextOwners ??= new Map();
         this._closingContextOwners.set(authIndex, contextData);
@@ -4211,6 +4240,7 @@ class BrowserManager {
     _cleanupAllContexts() {
         // Clean up all context health monitors
         for (const [authIndex, contextData] of this.contexts.entries()) {
+            contextData.page?.makerSuiteBridge?.dispose();
             contextData.page?.buildBenefit?.dispose();
             if (contextData.healthMonitorInterval) {
                 clearInterval(contextData.healthMonitorInterval);
@@ -4221,6 +4251,7 @@ class BrowserManager {
 
         // Reset all references
         for (const attempt of this._contextInitAttempts?.values() || []) {
+            attempt.page?.makerSuiteBridge?.dispose();
             attempt.page?.buildBenefit?.dispose();
             attempt.cancel?.("browser reset");
         }

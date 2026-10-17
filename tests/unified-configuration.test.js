@@ -21,7 +21,10 @@ test("allowlist matches plan and excludes file-only queue timeout and usage enab
     const plan = fs.readFileSync(path.join(__dirname, "../docs/zh/unified-frontend-configuration-plan.md"), "utf8");
     const section = plan.split("\n## 4.")[1].split("\n## 5.")[0];
     const keys = [...section.matchAll(/^\| `([A-Z_]+)`\s+\|/gm)].map(match => match[1]);
-    assert.deepEqual(new Set(definitions.map(d => d.name)), new Set([...keys, "LOG_DISPLAY_LIMIT", "DEBUG_MODE"]));
+    assert.deepEqual(
+        new Set(definitions.map(d => d.name)),
+        new Set([...keys, "LOG_DISPLAY_LIMIT", "DEBUG_MODE", "MODEL_TRANSPORT_POLICY"])
+    );
     assert.equal(new Set(definitions.map(d => d.name)).size, definitions.length);
 });
 test("save persists hot values, masks secrets and preserves restart differences on another instance", t => {
@@ -284,4 +287,21 @@ test("anti settings persist, validate, reset and retain accepted request snapsho
     service.save({ reset: ["ANTI_TRUNCATION_ENABLED", "ANTI_TRUNCATION_DEFAULT"], version: service.document.version });
     assert.equal(service.running.antiTruncationEnabled, true);
     assert.equal(service.running.antiTruncationDefault, "off");
+});
+
+test("transport mappings persist but only a restarted configuration uses the new route", t => {
+    const { service, save, system } = setup(t);
+    const { resolve } = require("../src/core/ModelTransportPolicy");
+    const rules = { "gemini-3.7-flash": "makersuite", "gemini-4-argon": "legacy" };
+    const result = save({ MODEL_TRANSPORT_POLICY: rules });
+    assert.equal(resolve("gemini-4-argon", "real", system.config.modelTransportPolicy).transport, "makersuite");
+    assert.ok(result.pending.some(item => item.name === "MODEL_TRANSPORT_POLICY"));
+    const loaded = new ConfigurationService({ logger }, { env: {}, file: service.file });
+    assert.deepEqual(loaded.running.modelTransportPolicy, rules);
+    assert.equal(resolve("gemini-4-argon", "real", loaded.running.modelTransportPolicy).transport, "legacy");
+    assert.throws(() => save({ MODEL_TRANSPORT_POLICY: { "gemini-4-argon-real": "makersuite" } }), { status: 400 });
+    assert.throws(() => save({ MODEL_TRANSPORT_POLICY: { "gemini-4-argon": "auto" } }), { status: 400 });
+    service.save({ reset: ["MODEL_TRANSPORT_POLICY"], version: service.document.version });
+    const reset = new ConfigurationService({ logger }, { env: {}, file: service.file });
+    assert.deepEqual(reset.running.modelTransportPolicy, {});
 });

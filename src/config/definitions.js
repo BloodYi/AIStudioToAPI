@@ -1,4 +1,14 @@
 module.exports = [
+    {
+        application: "restart",
+        description: "精确模型 ID 到 legacy 或 makersuite 的映射；重启生效",
+        group: "请求处理与模型功能",
+        label: "模型传输策略",
+        mode: "all",
+        name: "MODEL_TRANSPORT_POLICY",
+        path: "modelTransportPolicy",
+        type: "transport",
+    },
     ...[
         {
             choices: ["standalone", "master", "agent"],

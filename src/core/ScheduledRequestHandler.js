@@ -240,6 +240,12 @@ class ScheduledRequestHandler extends RequestHandler {
     }
 
     _shouldRetryError(error) {
+        if (require("../utils/MakerSuiteAuth").isBridgeAuthFailure(error)) return false;
+        if (
+            require("./ModelTransportPolicy").resolve(this.model || "", "fake", this.config?.modelTransportPolicy)
+                .transport === "makersuite"
+        )
+            return false;
         if (
             isArgon(this.model) &&
             (error.code === "BUILD_BENEFIT_NOT_READY" ||
@@ -374,7 +380,8 @@ class ScheduledRequestHandler extends RequestHandler {
     }
 
     async _retryTransportQueue(error, registry) {
-        if (isArgon(this.model)) throw benefitError("Argon transport interrupted; generation was not replayed");
+        if (isArgon(this.model) || this.proxyRequest?.transport_policy?.transport === "makersuite")
+            throw benefitError("Argon transport interrupted; generation was not replayed");
         if (
             this.controller.signal.aborted ||
             this.response.__modelOutputStarted ||
@@ -447,7 +454,7 @@ class ScheduledRequestHandler extends RequestHandler {
         this._earlyStreamKeepalive = null;
     }
 
-    finish() {
+    async finish() {
         if (this.response.__streamStartSent)
             this.scheduler.observe("request_complete_ms", Date.now() - this._acceptedAt);
         this._stopEarlyStreamKeepalive();
@@ -455,6 +462,7 @@ class ScheduledRequestHandler extends RequestHandler {
         this.response.removeListener("close", this.onClose);
         const success =
             !this.controller.signal.aborted && !this.response.__usageTrackingOutcome && this.response.statusCode < 400;
+        await this.browserManager.contexts?.get(this.currentAuthIndex)?.page?.makerSuiteBridge?.settle?.();
         this.scheduler.release(this.lease, success);
     }
 }
@@ -469,7 +477,7 @@ async function dispatch(parent, method, req, res) {
             else handler._sendErrorResponse(res, error.status || 503, error.message, null, error);
         }
     } finally {
-        handler.finish();
+        await handler.finish();
     }
 }
 module.exports = { dispatch, ScheduledRequestHandler };

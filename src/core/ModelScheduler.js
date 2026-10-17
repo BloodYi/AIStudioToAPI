@@ -106,6 +106,7 @@ function isValidDateKey(value) {
 }
 
 function classifyError(error = {}) {
+    if (require("../utils/MakerSuiteAuth").isBridgeAuthFailure(error)) return "bridge_auth";
     if (isUserAbortedError(error) || error.reason === "client_disconnect") return "aborted";
     if (
         error.kind === "transport" ||
@@ -824,13 +825,13 @@ class ModelScheduler {
         if (!lease || lease.recorded) return lease?.expirationPromise;
         let kind = classifyError(error);
         if (
-            isArgon(lease.model) &&
+            (isArgon(lease.model) || error.transport === "makersuite") &&
             (Number(error.status) === 403 ||
                 /PERMISSION_DENIED|RPC.*(?:Code|code)\s*7/.test(String(error.message || "")))
         )
             kind = "unsupported";
         if (error.code === "BUILD_BENEFIT_NOT_READY") return;
-        if (kind === "aborted") return;
+        if (kind === "aborted" || kind === "bridge_auth") return;
         if (kind === "transport") {
             lease.recorded = true;
             lease.account.local_transport_failures = (lease.account.local_transport_failures || 0) + 1;
@@ -861,6 +862,7 @@ class ModelScheduler {
         else slot.consecutive_failures++;
         slot.last_error = String(error.message || "Request failed").slice(0, 2000);
         slot.last_error_kind = kind;
+        if (error.transport) slot.last_transport = error.transport;
         const httpStatus = Number(error.status ?? error.code);
         slot.last_http_status = Number.isFinite(httpStatus)
             ? httpStatus

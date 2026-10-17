@@ -188,3 +188,19 @@ Chat Completions, Responses, Anthropic and native Gemini retain JSON/SSE compati
 `node --test tests/build-benefit.test.js` runs real Firefox against a local TLS/CONNECT fixture without contacting Google (requires Playwright Firefox and OpenSSL). Offline success does not establish live account or Build model availability; live acceptance remains separate.
 
 See the [production diagnosis and fix report](docs/zh/gemini-4-argon-production-diagnosis-20261017.md) for Camoufox differences and remaining live acceptance limits. Use `BUILD_BENEFIT_BROWSER_EXECUTABLE_PATH=/path/to/camoufox node --test tests/build-benefit.test.js` to exercise the fixture with that browser. The Camoufox fixture recreates documents through the production BrowserManager navigation path; standard Firefox continues to test native reload.
+
+### Model transport compatibility
+
+`gemini-3.7-flash` keeps its original ID, legacy Proxy RPC and real streaming. `gemini-4-argon` defaults to the MakerSuite GenerateContent bridge. All other models remain on legacy. Exact model overrides are available in the configuration UI or environment and require a restart:
+
+```dotenv
+MODEL_TRANSPORT_POLICY={"gemini-3.7-flash":"legacy","gemini-4-argon":"makersuite"}
+```
+
+Only canonical model IDs and `legacy` / `makersuite` are accepted. Requests keep their transport snapshot through retries and continuation rounds. There is no automatic channel fallback or model renaming. Argon still requires a verified account and that account's live paid benefit context; neither configuration nor membership grants quota.
+
+The bridge buffers the upstream result. JSON and SSE formats remain available; requested real streaming becomes buffered output. Chat supports early headers and keepalives; other adapters retain buffered SSE. `FAKE_STREAM_TIMEOUT_MS` is a fixed generation budget (default and maximum 300000 ms). Authentication, WAA, fetch and full body reading share that budget; the bridge reserves settlement time and uses at most 295000 ms. Keepalives do not renew it. `STREAM_TIMEOUT_MS` remains the legacy real-stream idle timeout. Queue deadlines are separate; configure gateways and callers to cover queueing plus generation.
+
+The bridge is installed on the owning host page and does not modify saved Build Apps. Existing clients retain their known five-minute cap; the bundled client additionally supports remaining budgets and a capability handshake. Ten-minute budgets are not supported. Internal correlation markers are removed before outbound Google calls. Credentials, opaque benefit data, proof and payloads are not logged by the transport.
+
+Run `npm test`, `npm run test:transport:browser`, and `npm run test:transport:long` for regressions, browser checks, and a real local TLS response taking over 60 seconds. Set `BUILD_BENEFIT_BROWSER_EXECUTABLE_PATH` to test production Camoufox with the TLS fixture. CONNECT destinations are restricted; the fixture cannot connect to Google or production port 9998. Offline results do not establish real-account availability. Deployment and account switching require separate authorization. See the [implementation record](docs/zh/model-transport-compatibility-implementation-20261017.md).

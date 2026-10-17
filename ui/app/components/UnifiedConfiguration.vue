@@ -127,6 +127,14 @@
                         placeholder="如 429,503；空值关闭"
                         :disabled="busy"
                     />
+                    <ElInput
+                        v-else-if="d.type === 'transport'"
+                        :id="`config-${d.name}`"
+                        v-model="draft[d.name]"
+                        type="textarea"
+                        :disabled="busy"
+                        placeholder='{"gemini-4-argon":"makersuite"}'
+                    />
                     <div v-else-if="d.type === 'models'">
                         <div class="model-columns">
                             <span>真实上游模型 ID</span
@@ -292,6 +300,7 @@ async function api(url = "/api/configuration", method = "GET", body) {
 }
 function toDraft(d, value) {
     if (d.type === "agents") return JSON.parse(JSON.stringify(value || []));
+    if (d.type === "transport") return JSON.stringify(value || {}, null, 2);
     if (d.type === "models")
         return Object.entries(value || {}).map(([model, limit]) => ({
             min_workers: limit?.min_workers ?? 0,
@@ -366,6 +375,7 @@ function encode(d) {
             .map(key => key.trim())
             .filter(Boolean);
     if (d.type === "codes") return value.trim() ? value.split(",").map(code => Number(code.trim())) : [];
+    if (d.type === "transport") return JSON.parse(value);
     if (d.type !== "models") return value;
     const entries = [],
         seen = new Set();

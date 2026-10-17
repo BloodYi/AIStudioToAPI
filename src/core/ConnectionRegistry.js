@@ -64,6 +64,7 @@ class ConnectionRegistry extends EventEmitter {
             return;
         }
         websocket._browserGeneration = clientInfo.browserGeneration;
+        websocket._transportVersion = clientInfo.transportVersion || 0;
 
         // Check if there's already a connection for this authIndex
         const existingConnection = this.connectionsByAuth.get(authIndex);
@@ -309,6 +310,7 @@ class ConnectionRegistry extends EventEmitter {
                     );
                     return;
                 }
+                if (entry.transportPolicy) parsedMessage.transport = entry.transportPolicy.transport;
                 this._routeMessage(parsedMessage, entry.queue);
             } else {
                 this.logger.warn(`[Server] Received message for unknown or outdated request ID: ${requestId}`);
@@ -525,6 +527,9 @@ class ConnectionRegistry extends EventEmitter {
         const entry = this.messageQueues.get(requestId);
         if (entry) {
             const authIndex = entry.authIndex;
+            this.browserManager?.contexts
+                ?.get(authIndex)
+                ?.page?.makerSuiteBridge?.cancelAttempt(requestId, entry.requestAttemptId);
             entry.queue.close(reason);
             this.messageQueues.delete(requestId);
             this._emitAuthQueuesDrainedIfNeeded(authIndex);

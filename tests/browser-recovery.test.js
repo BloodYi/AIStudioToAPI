@@ -226,7 +226,10 @@ test("an already open WebSocket still requires mouse completion before publishin
                 }),
         },
         on() {},
+        once() {},
+        removeListener() {},
         route: async () => {},
+        unroute: async () => {},
     };
     pool._createBrowserContext = async () => ({
         addInitScript: async () => {},
@@ -234,6 +237,9 @@ test("an already open WebSocket still requires mouse completion before publishin
             closed = true;
         },
         newPage: async () => page,
+        on() {},
+        once() {},
+        removeListener() {},
     });
     const initialization = pool._getOrStartContextInit(0, { isBackgroundTask: true });
     await tick();

@@ -1,5 +1,7 @@
 # 新旧 MakerSuite 双通道兼容性修复方案
 
+实施更新：运行代码与离线验证记录见 [双通道兼容修复实施记录](model-transport-compatibility-implementation-20261017.md)。以下“待实施”及末尾状态保留为方案编写时的历史快照；生产 Camoufox 与真实账号验收尚未完成。
+
 日期：2026-10-17（Asia/Shanghai）。状态：待实施。本次只编写实施方案，不修改运行代码、创建分支、启动生产实例或部署服务。
 
 本方案以当前 `main` 为开发基线，选择性复用 `archive/makersuite-protocol-1dc1e30` 的桥接代码。对于目标模型的上游路径选择，本方案取代此前“Gemini 4 Argon 必须继续走旧 ProxyUnaryCall”的约束；此前方案中的账号隔离、权益真实性、取消、错误分类和数据保护要求继续有效。

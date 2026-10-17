@@ -591,10 +591,15 @@ test("a failed old attempt closes only its local context and preserves a newer m
             isClosed: () => true,
             off() {},
             on: () => {},
+            once() {},
+            removeListener() {},
             route: async () => {},
             unroute: async () => {},
             viewportSize: () => ({ height: 10, width: 10 }),
         }),
+        on() {},
+        once() {},
+        removeListener() {},
     };
     Object.assign(manager, {
         _backgroundPreloadAbort: false,

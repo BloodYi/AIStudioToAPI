@@ -30,6 +30,7 @@ class QueueTimeoutError extends Error {
         super(message);
         this.name = "QueueTimeoutError";
         this.code = "QUEUE_TIMEOUT";
+        this.status = 504;
     }
 }
 
@@ -65,6 +66,10 @@ class MessageQueue extends EventEmitter {
     }
 
     async dequeue(timeoutMs = this.defaultTimeout) {
+        if (this.generationDeadline !== undefined) {
+            timeoutMs = Math.floor(this.generationDeadline - performance.now());
+            if (timeoutMs <= 0) throw new QueueTimeoutError("Generation deadline exceeded");
+        }
         if (this.closed) {
             throw this._closedError();
         }

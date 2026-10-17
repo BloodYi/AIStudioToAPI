@@ -663,6 +663,7 @@ class ProxyServerSystem extends EventEmitter {
                     browserGeneration: url.searchParams.has("generation")
                         ? Number(url.searchParams.get("generation"))
                         : undefined,
+                    transportVersion: Number(url.searchParams.get("transportVersion")) || 0,
                 });
             });
         });
