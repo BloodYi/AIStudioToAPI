@@ -302,7 +302,7 @@ class ModelScheduler {
     isResourceEligible(account, model, now = this.now()) {
         const slot = account.models[model];
         if (isArgon(model)) {
-            if (!(this.config.argonVerifiedAccounts || []).includes(account.index)) return false;
+            if (this.accountBenefit(account)?.state === "ready-free") return false;
             const benefit = this.browserManager?.contexts?.get(account.index)?.page?.buildBenefit;
             if (benefit?.isCurrent?.() === false) return false;
             if (benefit?.state === "failed" && Date.now() >= benefit.retryAt) benefit.ensure();
@@ -332,6 +332,7 @@ class ModelScheduler {
             if (this.closed || this.recovering || this.paused) return;
             this._scheduleCooldownWake();
             this.browserManager?.reconcileContextPool?.();
+            this.browserManager?.discoverAccountBenefits?.();
         });
     }
 
@@ -373,13 +374,81 @@ class ModelScheduler {
         this.cooldownWakeTimer?.unref?.();
     }
 
-    noteBenefitState(authIndex, state) {
+    sessionVersion(authIndex) {
+        return (
+            this.authSource.accountLoginService?.state?.accounts.find(a => a.authIndex === authIndex)?.sessionVersion ||
+            0
+        );
+    }
+
+    accountBenefit(account) {
+        if (this.authSource.accountLoginService?.invalidated?.has(account.index)) return null;
+        const live = this.browserManager?.contexts?.get(account.index)?.page?.buildBenefit;
+        if (live && live.isCurrent?.() !== false) {
+            return ["ready-paid", "ready-free"].includes(live.state) ? live : null;
+        }
+        const cached = account.build_benefit;
+        return cached?.session_version === this.sessionVersion(account.index) &&
+            this.now() - cached.checked_at < 3600000
+            ? cached
+            : null;
+    }
+
+    needsBenefitDiscovery(index) {
+        const account = this.account(index);
+        const probe = account.build_benefit_probe;
+        return (
+            !account.disabled &&
+            account.healthy &&
+            !this.authSource.isExpired?.(index) &&
+            !this.authSource.accountLoginService?.invalidated?.has(index) &&
+            !this.accountBenefit(account) &&
+            !(probe?.session_version === this.sessionVersion(index) && this.now() - probe.at < 300000)
+        );
+    }
+
+    noteBenefitState(authIndex, state, tier = null, sessionVersion = this.sessionVersion(authIndex)) {
+        if (sessionVersion !== this.sessionVersion(authIndex)) return;
+        if (["ready-paid", "ready-free"].includes(state)) {
+            this.account(authIndex).build_benefit = {
+                checked_at: this.now(),
+                session_version: sessionVersion,
+                state,
+                tier: ["TIER1", "TIER2"].includes(tier) ? tier : null,
+            };
+            if (state === "ready-paid") this.slot(this.account(authIndex), "gemini-4-argon");
+            this.saveSoon();
+        }
         // A failed/free preflight excludes this account only from currently waiting
         // Argon requests. Eviction cannot cause the same queue item to reload it.
         if (["ready-free", "failed"].includes(state)) {
             const key = this.account(authIndex).key;
             for (const item of this.pending) if (isArgon(item.model)) item.excluded.add(key);
         }
+    }
+
+    argonBenefitsSnapshot(now = this.now()) {
+        const result = {
+            pro_accounts: 0,
+            pro_daily_limit: 50,
+            pro_daily_requests: 0,
+            pro_estimated_remaining: 0,
+            ultra_accounts: 0,
+        };
+        for (const index of this.authSource.getRotationIndices()) {
+            const account = this.account(index);
+            if (account.disabled || !account.healthy || this.authSource.isExpired?.(index)) continue;
+            const benefit = this.accountBenefit(account);
+            if (benefit?.state !== "ready-paid") continue;
+            if (benefit.tier === "TIER2") result.ultra_accounts++;
+            if (benefit.tier !== "TIER1") continue;
+            const slot = account.models["gemini-4-argon"];
+            const used = slot?.daily_request_date === this.getPacificDateKey(now) ? slot.daily_request_count : 0;
+            result.pro_accounts++;
+            result.pro_daily_requests += used;
+            result.pro_estimated_remaining += Math.max(0, result.pro_daily_limit - used);
+        }
+        return result;
     }
 
     eligibleAccounts(model, excluded = new Set()) {
@@ -454,8 +523,7 @@ class ModelScheduler {
     canLease(account, model) {
         if (
             isArgon(model) &&
-            (!(this.config.argonVerifiedAccounts || []).includes(account.index) ||
-                this.browserManager?.contexts?.get(account.index)?.page?.buildBenefit?.state !== "ready-paid" ||
+            (this.browserManager?.contexts?.get(account.index)?.page?.buildBenefit?.state !== "ready-paid" ||
                 this.browserManager?.contexts?.get(account.index)?.page?.buildBenefit?.isCurrent?.() === false)
         )
             return false;
@@ -1317,6 +1385,7 @@ class ModelScheduler {
             accounts_summary: this.accountsOverviewSnapshot().summary,
             active_browser_workers: contexts.filter(context => context.inflight > 0).length,
             active_workers: this.workers.filter(worker => worker.lease).length,
+            argon_benefits: this.argonBenefitsSnapshot(now),
             busy_browser_workers: busyContexts,
             contexts_summary: {
                 all_visible_models_rate_limited:

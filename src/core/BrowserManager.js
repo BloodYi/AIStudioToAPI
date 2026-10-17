@@ -115,7 +115,7 @@ class BrowserManager {
         this._wsInitState = new Map();
 
         // Target URL for AI Studio app
-        this.targetUrl = "https://ai.studio/apps/cab9ab6c-44f9-4e7a-8972-037f8ae177ab";
+        this.targetUrl = process.env.AI_STUDIO_APP_URL || "https://ai.studio/apps/cab9ab6c-44f9-4e7a-8972-037f8ae177ab";
 
         // Firefox/Camoufox does not use Chromium-style command line args.
         // We keep this empty; Camoufox has its own anti-fingerprinting optimizations built-in.
@@ -2135,6 +2135,7 @@ class BrowserManager {
                           reason: data.page.buildBenefit.failureReason || null,
                           source: data.page.buildBenefit.source || null,
                           state: data.page.buildBenefit.state,
+                          tier: data.page.buildBenefit.tier || null,
                           verified: data.page.buildBenefit.verified,
                       }
                     : null,
@@ -2181,6 +2182,46 @@ class BrowserManager {
         this._contextPoolRunning = true;
         this.scheduler.coordinateContextPool?.();
         this._pumpContextPool();
+    }
+
+    discoverAccountBenefits() {
+        if (
+            this._benefitDiscoveryTask ||
+            !this.authSource.accountLoginService?.state ||
+            !this.scheduler?.needsBenefitDiscovery ||
+            this.scheduler.closed ||
+            this._recovering
+        )
+            return;
+        this._benefitDiscoveryTask = Promise.resolve()
+            .then(async () => {
+                for (const index of this.authSource.getRotationIndices()) {
+                    if (
+                        this.scheduler.closed ||
+                        this._recovering ||
+                        this.scheduler.paused ||
+                        this.scheduler.pending.length ||
+                        this.scheduler.workers.some(worker => worker.lease)
+                    )
+                        break;
+                    if (!this.scheduler.needsBenefitDiscovery(index)) continue;
+                    this.scheduler.account(index).build_benefit_probe = {
+                        at: this.scheduler.now(),
+                        session_version: this.scheduler.sessionVersion(index),
+                    };
+                    this.scheduler.saveSoon();
+                    try {
+                        await this.ensureWorkerContext(index);
+                        const benefit = this.contexts.get(index)?.page?.buildBenefit;
+                        await benefit?.ensure({ refresh: benefit.state === "failed" });
+                    } catch {
+                        // Existing initialization diagnostics report the failure; retry on a later idle pass.
+                    }
+                }
+            })
+            .finally(() => {
+                this._benefitDiscoveryTask = null;
+            });
     }
 
     requestContext(authIndex, model = null) {
@@ -3201,6 +3242,7 @@ class BrowserManager {
             this.startContextPool();
             this.scheduler.coordinateContextPool?.();
             this._pumpContextPool();
+            this.discoverAccountBenefits();
             return;
         }
         const maxContexts = this.config.maxContexts;
@@ -3532,13 +3574,17 @@ class BrowserManager {
                 },
                 onChange: () => {
                     if (this.scheduler) {
-                        this.scheduler.noteBenefitState?.(authIndex, benefit.state);
+                        this.scheduler.noteBenefitState?.(
+                            authIndex,
+                            benefit.state,
+                            benefit.tier,
+                            page.accountSessionVersion
+                        );
                         this.scheduler._eligibleRound = null;
                         this.scheduler._selectionPass = null;
                         this.scheduler.drain();
                     }
                 },
-                verified: (this.config?.scheduler?.argonVerifiedAccounts || []).includes(authIndex),
             });
             page.buildBenefit = benefit;
             benefit.dispatcher = true;
@@ -3683,9 +3729,7 @@ class BrowserManager {
             await this._simulateHumanMovement(page, 1, 1, attempt);
             attempt.mouseReady = true;
 
-            if (page.buildBenefit.verified) {
-                await this._runInitOperation(attempt, "benefit.preflight", () => page.buildBenefit.ensure());
-            }
+            await this._runInitOperation(attempt, "benefit.preflight", () => page.buildBenefit.ensure());
 
             // Final check before adding to contexts map
             this._setInitPhase(attempt, "publishing");

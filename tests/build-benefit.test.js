@@ -316,7 +316,7 @@ test("Argon policy applies before WAA and native SSE intent remains separate", (
     assert.deepEqual(loadConfig({ ARGON_VERIFIED_ACCOUNTS: "[0,2,2]" }).argonVerifiedAccounts, [0, 2]);
 });
 
-test("scheduler separates verified preflight candidates and paid generation eligibility", () => {
+test("scheduler automatically preflights new accounts but leases only confirmed paid accounts", () => {
     const scheduler = Object.create(ModelScheduler.prototype);
     const benefit = { state: "unknown" };
     Object.assign(scheduler, {
@@ -338,7 +338,7 @@ test("scheduler separates verified preflight candidates and paid generation elig
         assert.equal(scheduler.canLease(account, "gemini-4-argon"), false);
         assert.equal(account.healthy, true);
     }
-    assert.equal(scheduler.isResourceEligible({ ...account, index: 1 }, "gemini-4-argon"), false);
+    assert.equal(scheduler.isResourceEligible({ ...account, index: 1 }, "gemini-4-argon"), true);
     assert.equal(scheduler.isResourceEligible({ ...account, index: 1 }, "gemini-2.5-flash"), true);
 });
 
@@ -391,7 +391,7 @@ test("cold Argon preflight remains bounded and settles without reloading rejecte
             };
             scheduler.browserManager = browser;
             await assert.rejects(scheduler.acquire("gemini-4-argon"), /No eligible accounts/);
-            assert.deepEqual(seen, [0, 1]);
+            assert.deepEqual(seen, [0, 1, 2]);
             assert.equal(scheduler.pending.length, 0);
             assert.equal(
                 [...scheduler.accounts.values()].some(account => account.inflight),

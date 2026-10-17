@@ -1,6 +1,6 @@
 # AIStudioToAPI — Independently Maintained Version
 
-[中文文档](README.md) | English
+[中文文档](README_ZH.md) | English
 
 A browser automation service that exposes Google AI Studio Build App through OpenAI, Gemini and Anthropic compatible APIs, with account management, model scheduling, proxy nodes and usage dashboards.
 
@@ -25,7 +25,7 @@ This version adds or improves:
 Use Docker Engine / Docker Desktop and Docker Compose v2. The Dockerfile supports Linux amd64 and arm64 and downloads the Node.js base image, system packages, Camoufox and Mihomo during the build.
 
 ```bash
-git clone https://github.com/Naoya666/AIStudioToAPI.git
+git clone https://github.com/BloodYi/AIStudioToAPI.git
 cd AIStudioToAPI
 cp .env.example .env
 ```
@@ -83,7 +83,7 @@ Windows users can use Compose instead of translating the shell commands.
 Node.js **22.13.0 or newer** is required; Node.js 24 matches the Dockerfile. The full background login executor depends on Linux `/proc` and POSIX process groups, so Linux or Docker is recommended.
 
 ```bash
-git clone https://github.com/Naoya666/AIStudioToAPI.git
+git clone https://github.com/BloodYi/AIStudioToAPI.git
 cd AIStudioToAPI
 npm install
 cp .env.example .env
@@ -179,7 +179,7 @@ Third-party components, including Node.js, Camoufox and Mihomo, retain their own
 
 ### Gemini 4 Argon with legacy Build RPC
 
-`gemini-4-argon` uses the host page's existing `ProxyUnaryCall`. Verify the exact model with each account in your existing Build App, then set `ARGON_VERIFIED_ACCOUNTS=[0,2]` in `.env` using your internal auth indices and restart. The default `[]` disables dispatch. This allowlist grants no entitlement; a live paid benefit is also required. Recheck it after replacing or renumbering accounts.
+`gemini-4-argon` uses the host page's existing `ProxyUnaryCall`. Imported accounts are automatically checked for paid entitlement while idle; a current paid benefit is required before dispatch. No manual account allowlist is needed. Each confirmed usable Pro account contributes 50 daily requests to the dashboard estimate. Ultra quota remains unknown until confirmed. See the [overview](README.md) for validation limits.
 
 Entitlement observation and read-only queries are isolated per account and document. Unknown accounts may preflight but cannot generate. Failed queries remain distinct from free accounts and can retry after 30 seconds or after reload. Missing entitlement does not expire the whole account pool.
 

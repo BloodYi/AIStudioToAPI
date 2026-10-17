@@ -111,7 +111,7 @@ function installObserver({ origin, rpc, binding, owner, messageBridge = false })
         return send.apply(this, args);
     };
     state.read = async timeoutMs => {
-        if (state.tier) return { source: state.source, state: "ready-paid" };
+        if (state.tier) return { source: state.source, state: "ready-paid", tier: state.tier };
         if (state.pending) return state.pending;
         state.pending = (async () => {
             if (!state.auth)
@@ -139,9 +139,9 @@ function installObserver({ origin, rpc, binding, owner, messageBridge = false })
                     state.tier = data[0] === 1 ? "TIER1" : data[0] === 2 ? "TIER2" : null;
                     state.source = "query";
                 }
-                return { source: state.source, state: state.tier ? "ready-paid" : "ready-free" };
+                return { source: state.source, state: state.tier ? "ready-paid" : "ready-free", tier: state.tier };
             } catch (error) {
-                if (state.tier) return { source: state.source, state: "ready-paid" };
+                if (state.tier) return { source: state.source, state: "ready-paid", tier: state.tier };
                 throw error;
             } finally {
                 clearTimeout(timer);
@@ -157,11 +157,8 @@ function installObserver({ origin, rpc, binding, owner, messageBridge = false })
 }
 
 class BuildBenefitContext {
-    constructor(
-        page,
-        { authIndex, verified = false, onChange = () => {}, isCurrent = () => true, timeoutMs = 5000 } = {}
-    ) {
-        Object.assign(this, { authIndex, isCurrent, onChange, page, timeoutMs, verified });
+    constructor(page, { authIndex, onChange = () => {}, isCurrent = () => true, timeoutMs = 5000 } = {}) {
+        Object.assign(this, { authIndex, isCurrent, onChange, page, timeoutMs });
         this.state = "unknown";
         this.owner = require("node:crypto").randomUUID();
         this.epoch = 0;
@@ -171,6 +168,7 @@ class BuildBenefitContext {
                 this.epoch++;
                 this.state = "unknown";
                 this.source = null;
+                this.tier = null;
                 this.failureReason = null;
                 this.queryStatus = null;
                 this.pending = null;
@@ -223,10 +221,11 @@ class BuildBenefitContext {
         })).catch(() => null);
         if (this.disposed || !this.isCurrent() || epoch !== this.epoch || current?.id !== documentId) return;
         if (!current?.tier) {
-            if (this.verified && this.state === "failed" && Date.now() >= this.retryAt) this.ensure({ refresh: true });
+            if (this.state === "failed" && Date.now() >= this.retryAt) this.ensure({ refresh: true });
             return;
         }
         this.state = "ready-paid";
+        this.tier = current.tier;
         this.source = "native";
         this.failureReason = null;
         this.queryStatus = null;
@@ -280,6 +279,7 @@ class BuildBenefitContext {
                     throw benefitError("Build document changed");
                 this.state = result.state;
                 this.source = result.source;
+                this.tier = result.tier || null;
                 this.failureReason = result.reason || null;
                 this.queryStatus = result.httpStatus || null;
                 if (result.state === "failed") this.retryAt = Date.now() + 30000;
@@ -304,8 +304,11 @@ class BuildBenefitContext {
         return task;
     }
 
+    get verified() {
+        return this.state === "ready-paid";
+    }
+
     async assertReady() {
-        if (!this.verified) throw benefitError(`No verified Build account for ${MODEL}`);
         if ((await this.ensure()) !== "ready-paid")
             throw benefitError(
                 `Build benefit ${this.state} for ${MODEL}${this.failureReason ? ` (${this.failureReason}${this.queryStatus ? ` HTTP ${this.queryStatus}` : ""})` : ""}`

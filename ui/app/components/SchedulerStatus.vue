@@ -93,16 +93,19 @@
                 <span class="quota-hint">{{ t("schedulerEstimatedQuotaHint") }}</span>
             </div>
 
-            <p v-if="!data.quota_by_model?.length" class="scheduler-empty">
+            <p v-if="!quotaCards.length" class="scheduler-empty">
                 {{ t("schedulerNoVisibleQuota") }}
             </p>
 
             <div v-else class="quota-grid">
                 <div
-                    v-for="quota in data.quota_by_model"
+                    v-for="quota in quotaCards"
                     :key="quota.model"
                     class="quota-card"
-                    :class="{ 'quota-card-alert': getQuotaPercent(quota) <= 10 }"
+                    :class="{
+                        'quota-card-alert':
+                            quota.quota_per_account != null && !quota.ultra_accounts && getQuotaPercent(quota) <= 10,
+                    }"
                 >
                     <div class="quota-card-top">
                         <div class="model-info">
@@ -111,18 +114,26 @@
                             </span>
                             <span class="quota-model-name" :title="quota.model">{{ quota.model }}</span>
                         </div>
-                        <div class="quota-card-val">
-                            <span class="quota-number">{{ formatNumber(quota.estimated_remaining_quota) }}</span>
+                        <div v-if="quota.quota_per_account != null" class="quota-card-val">
+                            <span class="quota-number"
+                                >{{ quota.ultra_accounts ? "≥" : ""
+                                }}{{ formatNumber(quota.estimated_remaining_quota) }}</span
+                            >
                             <small class="quota-unit">{{ t("schedulerQuotaUnit") }}</small>
-                            <div v-if="getQuotaPercent(quota) <= 10" class="quota-warning-text">
+                            <div v-if="quota.ultra_accounts" class="quota-percent-text">Ultra 额度待确认</div>
+                            <div v-else-if="getQuotaPercent(quota) <= 10" class="quota-warning-text">
                                 仅剩 {{ getQuotaPercent(quota) }}% (告警)
                             </div>
                             <div v-else class="quota-percent-text">剩余 {{ getQuotaPercent(quota) }}%</div>
                         </div>
+                        <div v-else class="quota-card-val">
+                            <span class="quota-number">未知</span>
+                            <div class="quota-percent-text">暂无额度估算</div>
+                        </div>
                     </div>
 
                     <!-- Visual Quota Remaining Progress Bar -->
-                    <div class="quota-progress-track">
+                    <div v-if="quota.quota_per_account != null && !quota.ultra_accounts" class="quota-progress-track">
                         <div
                             class="quota-progress-bar"
                             :class="getQuotaPercent(quota) <= 10 ? 'bar-alert' : 'bar-normal'"
@@ -131,7 +142,11 @@
                     </div>
 
                     <div class="quota-card-footer">
-                        <span>{{ quota.tracked_accounts }} × {{ quota.quota_per_account }}</span>
+                        <span v-if="quota.quota_per_account != null"
+                            >{{ quota.tracked_accounts }} × {{ quota.quota_per_account }}</span
+                        >
+                        <span v-else-if="quota.ultra_accounts">{{ quota.ultra_accounts }} 个 Ultra · 额度未知</span>
+                        <span v-else>未提供每日额度</span>
                         <span
                             >{{ t("schedulerTodayRequests") }}
                             <strong>{{ formatNumber(quota.daily_requests) }}</strong></span
@@ -819,6 +834,43 @@ const props = defineProps({
 });
 const emit = defineEmits(["refresh"]);
 
+const quotaCards = computed(() => {
+    const estimated = props.data?.quota_by_model || [];
+    const known = new Set(estimated.map(item => item.model));
+    const unknown = (props.data?.models || [])
+        .filter(item => !known.has(item.model))
+        .map(item => {
+            if (item.model === "gemini-4-argon" && props.data?.argon_benefits) {
+                const benefit = props.data.argon_benefits;
+                return {
+                    ...item,
+                    estimated_remaining_quota: benefit.pro_estimated_remaining,
+                    quota_per_account: benefit.pro_accounts > 0 ? benefit.pro_daily_limit : null,
+                    tracked_accounts: benefit.pro_accounts,
+                    ultra_accounts: benefit.ultra_accounts,
+                };
+            }
+            if (item.model === "gemini-4-argon" && item.available_accounts > 0) {
+                const dailyLimitPerProAccount = 50;
+                return {
+                    ...item,
+                    estimated_remaining_quota: Math.max(
+                        0,
+                        item.available_accounts * dailyLimitPerProAccount - (item.daily_requests || 0)
+                    ),
+                    quota_per_account: dailyLimitPerProAccount,
+                    tracked_accounts: item.available_accounts,
+                };
+            }
+            return { ...item, estimated_remaining_quota: null, quota_per_account: null };
+        });
+    return [...estimated, ...unknown].sort((a, b) => {
+        if (a.model === "gemini-4-argon") return -1;
+        if (b.model === "gemini-4-argon") return 1;
+        return a.model.localeCompare(b.model);
+    });
+});
+
 const busy = ref(false),
     error = ref(""),
     rateLimitsReset = ref(false),
@@ -968,6 +1020,9 @@ function getQuotaPercent(quota) {
 function getModelTagLabel(modelName) {
     if (!modelName) return "MODEL";
     const lower = modelName.toLowerCase();
+    if (lower.includes("argon")) return "Argon";
+    if (lower.startsWith("gemma")) return "Gemma";
+    if (lower.includes("robotics")) return "Robotics";
     if (lower.includes("pro")) return "Pro";
     if (lower.includes("flash")) return "Flash";
     return "Gemini";
