@@ -5,6 +5,7 @@
  * Author: Ellinav, iBenzene, bbbugg, 挈挈
  */
 
+const { BuildBenefitContext } = require("./BuildBenefitContext");
 const fs = require("fs");
 const path = require("path");
 const { firefox } = require("playwright");
@@ -461,6 +462,7 @@ class BrowserManager {
     }
 
     async _closeAttemptContext(attempt) {
+        attempt?.page?.buildBenefit?.dispose();
         if (!attempt?.context) return { closed: false, skipped: true };
         if (attempt.cleanupTask) return attempt.cleanupTask;
         const startedAt = Date.now();
@@ -2114,6 +2116,15 @@ class BrowserManager {
             else if (this.isContextReady(authIndex)) state = inflight > 0 ? "BUSY" : "READY";
             return {
                 auth_index: authIndex,
+                build_benefit: data.page?.buildBenefit
+                    ? {
+                          query_status: data.page.buildBenefit.queryStatus || null,
+                          reason: data.page.buildBenefit.failureReason || null,
+                          source: data.page.buildBenefit.source || null,
+                          state: data.page.buildBenefit.state,
+                          verified: data.page.buildBenefit.verified,
+                      }
+                    : null,
                 connection_epoch: this.connectionRegistry?.getConnectionEpoch(authIndex) || null,
                 created_at: data.createdAt || null,
                 drain_reason: data.drainReason || this.pendingContextClosures.get(authIndex) || null,
@@ -3492,6 +3503,31 @@ class BrowserManager {
             page = await this._runInitOperation(attempt, "context.newPage", () => context.newPage());
             page.accountSessionVersion = storageStateObject._accountSessionVersion || 0;
             attempt.page = page;
+            const benefit = new BuildBenefitContext(page, {
+                authIndex,
+                isCurrent: () => {
+                    const service = this.authSource?.accountLoginService;
+                    const session = service?.state?.accounts.find(account => account.authIndex === authIndex);
+                    return (
+                        page.buildBenefit === benefit &&
+                        attempt.browserGeneration === this.browserGeneration &&
+                        (!service?.state ||
+                            (session?.sessionVersion === page.accountSessionVersion &&
+                                !service.invalidated.has(authIndex)))
+                    );
+                },
+                onChange: () => {
+                    if (this.scheduler) {
+                        this.scheduler.noteBenefitState?.(authIndex, benefit.state);
+                        this.scheduler._eligibleRound = null;
+                        this.scheduler._selectionPass = null;
+                        this.scheduler.drain();
+                    }
+                },
+                verified: (this.config?.scheduler?.argonVerifiedAccounts || []).includes(authIndex),
+            });
+            page.buildBenefit = benefit;
+            await this._runInitOperation(attempt, "benefit.install", () => benefit.install());
 
             // Pure JS Wakeup (Focus & Mouse Movement)
             // Skip focus operations for background tasks to avoid window focus conflicts
@@ -3618,6 +3654,10 @@ class BrowserManager {
             this._setInitPhase(attempt, "required_mouse");
             await this._simulateHumanMovement(page, 1, 1, attempt);
             attempt.mouseReady = true;
+
+            if (page.buildBenefit.verified) {
+                await this._runInitOperation(attempt, "benefit.preflight", () => page.buildBenefit.ensure());
+            }
 
             // Final check before adding to contexts map
             this._setInitPhase(attempt, "publishing");
@@ -4082,6 +4122,7 @@ class BrowserManager {
         }
 
         const contextData = this.contexts.get(authIndex);
+        contextData.page?.buildBenefit?.dispose();
         this._closingContextOwners ??= new Map();
         this._closingContextOwners.set(authIndex, contextData);
         this.closingContexts.add(authIndex);
@@ -4170,6 +4211,7 @@ class BrowserManager {
     _cleanupAllContexts() {
         // Clean up all context health monitors
         for (const [authIndex, contextData] of this.contexts.entries()) {
+            contextData.page?.buildBenefit?.dispose();
             if (contextData.healthMonitorInterval) {
                 clearInterval(contextData.healthMonitorInterval);
                 contextData.healthMonitorInterval = null;
@@ -4178,7 +4220,10 @@ class BrowserManager {
         }
 
         // Reset all references
-        for (const attempt of this._contextInitAttempts?.values() || []) attempt.cancel?.("browser reset");
+        for (const attempt of this._contextInitAttempts?.values() || []) {
+            attempt.page?.buildBenefit?.dispose();
+            attempt.cancel?.("browser reset");
+        }
         this.contexts.clear();
         this.contextCapacityReservations?.clear();
         this._contextPoolReplacements?.clear();

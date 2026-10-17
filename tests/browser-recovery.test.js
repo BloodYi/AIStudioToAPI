@@ -215,6 +215,8 @@ test("an already open WebSocket still requires mouse completion before publishin
     let releaseMouse;
     let closed = false;
     const page = {
+        addInitScript: async () => {},
+        exposeBinding: async () => {},
         isClosed: () => false,
         mouse: {
             move: () =>
@@ -223,6 +225,7 @@ test("an already open WebSocket still requires mouse completion before publishin
                 }),
         },
         on() {},
+        route: async () => {},
     };
     pool._createBrowserContext = async () => ({
         addInitScript: async () => {},

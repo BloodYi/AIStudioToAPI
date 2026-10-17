@@ -1,3 +1,4 @@
+const { isArgon } = require("./BuildBenefitContext");
 const fs = require("fs");
 const path = require("path");
 const FormatConverter = require("./FormatConverter");
@@ -299,6 +300,13 @@ class ModelScheduler {
 
     isResourceEligible(account, model, now = this.now()) {
         const slot = account.models[model];
+        if (isArgon(model)) {
+            if (!(this.config.argonVerifiedAccounts || []).includes(account.index)) return false;
+            const benefit = this.browserManager?.contexts?.get(account.index)?.page?.buildBenefit;
+            if (benefit?.isCurrent?.() === false) return false;
+            if (benefit?.state === "failed" && Date.now() >= benefit.retryAt) benefit.ensure();
+            if (benefit && ["ready-free", "failed"].includes(benefit.state)) return false;
+        }
         return (
             account.healthy &&
             !account.disabled &&
@@ -364,6 +372,15 @@ class ModelScheduler {
         this.cooldownWakeTimer?.unref?.();
     }
 
+    noteBenefitState(authIndex, state) {
+        // A failed/free preflight excludes this account only from currently waiting
+        // Argon requests. Eviction cannot cause the same queue item to reload it.
+        if (["ready-free", "failed"].includes(state)) {
+            const key = this.account(authIndex).key;
+            for (const item of this.pending) if (isArgon(item.model)) item.excluded.add(key);
+        }
+    }
+
     eligibleAccounts(model, excluded = new Set()) {
         let eligible = this._eligibleRound?.get(model);
         if (!eligible) {
@@ -382,8 +399,17 @@ class ModelScheduler {
 
     readyCandidates(model, excluded = new Set()) {
         const eligible = this.eligibleAccounts(model, excluded);
-        if (!this.config.readyContextOnly || !this.browserManager) return eligible;
-        return eligible.filter(account => this.browserManager.isContextReady(account.index));
+        if ((!this.config.readyContextOnly && !isArgon(model)) || !this.browserManager) return eligible;
+        return eligible.filter(account => {
+            if (!this.browserManager.isContextReady(account.index)) return false;
+            if (isArgon(model)) {
+                const benefit = this.browserManager.contexts?.get(account.index)?.page?.buildBenefit;
+                if (benefit?.disposed || benefit?.isCurrent?.() === false) return false;
+                if (benefit?.state === "unknown") benefit.ensure().catch(() => {});
+                return benefit?.state === "ready-paid";
+            }
+            return true;
+        });
     }
 
     needsContextForRequest(item, account = null, ignoreReadyAccount = null) {
@@ -425,6 +451,13 @@ class ModelScheduler {
     }
 
     canLease(account, model) {
+        if (
+            isArgon(model) &&
+            (!(this.config.argonVerifiedAccounts || []).includes(account.index) ||
+                this.browserManager?.contexts?.get(account.index)?.page?.buildBenefit?.state !== "ready-paid" ||
+                this.browserManager?.contexts?.get(account.index)?.page?.buildBenefit?.isCurrent?.() === false)
+        )
+            return false;
         if (account.key === this.drainingAccount) return false;
         if (model !== "__files__" && this.isAccountQuotaExhausted(account)) return false;
         const accountLimit = this.config.accountConcurrency || 0;
@@ -467,7 +500,12 @@ class ModelScheduler {
         if (atLimit && !immediate) return Promise.reject(schedulerError("Queue full", 429));
         if (signal?.aborted) return Promise.reject(schedulerError("Client disconnected", 499));
         const eligible = this.eligibleAccounts(model, excluded);
-        if (!eligible.length) return Promise.reject(schedulerError(`No eligible accounts for model ${model}`));
+        if (!eligible.length)
+            return Promise.reject(
+                schedulerError(
+                    `No eligible accounts for model ${model}${isArgon(model) ? " (requires verified Build account and paid benefit)" : ""}`
+                )
+            );
         // Record accepted discovery only after validation and access checks. Other
         // accounts remain unknown until they actually participate in this model.
         this.slot(eligible[0], model, this.now());
@@ -559,7 +597,11 @@ class ModelScheduler {
                 item.reject(schedulerError(`Model ${item.model} is disabled`, 403));
             } else if (!this.eligibleAccounts(item.model, item.excluded).length) {
                 this.remove(item);
-                item.reject(schedulerError(`No eligible accounts for model ${item.model}`));
+                item.reject(
+                    schedulerError(
+                        `No eligible accounts for model ${item.model}${isArgon(item.model) ? " (benefit preflight failed or unavailable)" : ""}`
+                    )
+                );
             }
         }
         if (this.paused) return;
@@ -693,7 +735,8 @@ class ModelScheduler {
     }
 
     _signalContextDemand(deadline = Infinity) {
-        if (!this.browserManager || !this.config.readyContextOnly) return;
+        if (!this.browserManager || (!this.config.readyContextOnly && !this.pending.some(item => isArgon(item.model))))
+            return;
         if (this.browserManager._contextInitTasks?.size >= this.config.contextInitConcurrency) return;
         const demanded = new Set();
         const requests = [];
@@ -701,6 +744,7 @@ class ModelScheduler {
         for (let n = 0; n < this.pending.length; n++) {
             if (performance.now() >= deadline) break;
             const item = this.pending[(offset + n) % this.pending.length];
+            if (!this.config.readyContextOnly && !isArgon(item.model)) continue;
             this._demandOffset = (offset + n + 1) % this.pending.length;
             if (!this.needsContextForRequest(item)) continue;
             // An admitted initializer already covers this request's next dispatch
@@ -778,7 +822,14 @@ class ModelScheduler {
 
     failure(lease, error) {
         if (!lease || lease.recorded) return lease?.expirationPromise;
-        const kind = classifyError(error);
+        let kind = classifyError(error);
+        if (
+            isArgon(lease.model) &&
+            (Number(error.status) === 403 ||
+                /PERMISSION_DENIED|RPC.*(?:Code|code)\s*7/.test(String(error.message || "")))
+        )
+            kind = "unsupported";
+        if (error.code === "BUILD_BENEFIT_NOT_READY") return;
         if (kind === "aborted") return;
         if (kind === "transport") {
             lease.recorded = true;

@@ -584,10 +584,15 @@ test("a failed old attempt closes only its local context and preserves a newer m
             localClosed = true;
         },
         newPage: async () => ({
+            addInitScript: async () => {},
             bringToFront: async () => {},
             evaluate: async () => {},
+            exposeBinding: async () => {},
             isClosed: () => true,
+            off() {},
             on: () => {},
+            route: async () => {},
+            unroute: async () => {},
             viewportSize: () => ({ height: 10, width: 10 }),
         }),
     };

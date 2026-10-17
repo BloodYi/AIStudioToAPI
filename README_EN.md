@@ -176,3 +176,13 @@ This version is derived from [iBUHub/AIStudioToAPI](https://github.com/iBUHub/AI
 This version adopts the upstream **CC BY-NC 4.0** license. All usage, distribution and modification must comply with its terms. See [LICENSE](LICENSE) and the [license summary](https://creativecommons.org/licenses/by-nc/4.0/). The changes are described above; upstream authors do not endorse this version.
 
 Third-party components, including Node.js, Camoufox and Mihomo, retain their own licenses. The image stores Mihomo's license and source link in `/usr/share/licenses/mihomo/`.
+
+### Gemini 4 Argon with legacy Build RPC
+
+`gemini-4-argon` uses the host page's existing `ProxyUnaryCall`. Verify the exact model with each account in your existing Build App, then set `ARGON_VERIFIED_ACCOUNTS=[0,2]` in `.env` using your internal auth indices and restart. The default `[]` disables dispatch. This allowlist grants no entitlement; a live paid benefit is also required. Recheck it after replacing or renumbering accounts.
+
+Entitlement observation and read-only queries are isolated per account and document. Unknown accounts may preflight but cannot generate. Failed queries remain distinct from free accounts and can retry after 30 seconds or after reload. Missing entitlement does not expire the whole account pool.
+
+Chat Completions, Responses, Anthropic and native Gemini retain JSON/SSE compatibility. Streaming for this exact model is buffered unary output, including global `real`, the `-real` suffix and native `alt=sse`. Other models keep their streaming behavior. Only final native RPC entitlement headers are supplemented; body, WAA and authentication remain intact, with no direct GenerateContent fallback. Local daily quota stays unknown; upstream 429 handling remains active.
+
+`node --test tests/build-benefit.test.js` runs real Firefox against a local TLS/CONNECT fixture without contacting Google (requires Playwright Firefox and OpenSSL). Offline success does not establish live account or Build model availability; live acceptance remains separate.

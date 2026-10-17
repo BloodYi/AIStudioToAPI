@@ -1,6 +1,6 @@
 # Gemini 4 Argon 适配方案：保留旧版 Build 请求模式
 
-日期：2026-10-17（Asia/Shanghai）。状态：待实施；本次只新增文档，未修改运行代码、执行真实上游请求或部署服务。
+日期：2026-10-17（Asia/Shanghai）。状态：运行代码及离线验证已实施；真实账号资格与 Google 上游验收尚未执行，未部署服务。
 
 ## 1. 目标与基线
 
@@ -203,14 +203,20 @@ await route.continue({ headers });
 
 未通过时保留脱敏错误证据，区分权限、通道、参数、认证和限流。不能用重复轮换、批量重新登录、写死 tier 或清除额度作为成功标准。
 
-## 10. 实施记录（待后续回填）
+## 10. 实施记录（2026-10-17）
 
-- 运行代码修改：未开始。
-- 新增测试与离线验证：未执行。
-- 真实 Firefox fixture：未执行。
-- 账号与 Build 模型资格核对：未执行。
-- 真实 Google 验收：未执行。
-- commit / push：本次未执行。
-- 生产部署：本次未执行。
+- 运行代码：新增 `BuildBenefitContext`，首次导航前安装 fetch/XHR 原生请求观察和精确 unary RPC route。权益、认证与 ext 绑定账号页面及文档；原生请求正文需匹配当前文档记录，旧文档事件不能更新缓存或补新权益。
+- 权益查询：同页面并发共享 Promise，5 秒 deadline；独立记录 unknown/loading/ready-paid/ready-free/failed、脱敏失败原因及 HTTP 状态。失败允许 30 秒后重新预检，重载立即失效；查询的 401/403/429 不进入生成错误或账号过期流程。API Key 仅从该宿主页原生 MakerSuite 请求获取，排除本模块查询及其他服务。
+- 补头范围：仅当前宿主页的目标 `gemini-4-argon:generateContent` 旧 ProxyUnaryCall。保留原请求已有的有效 tier/ext，缺失时从当前文档补充；不更改 URL、body、WAA、Authorization、Cookie 或其他 RPC，不引入直接 GenerateContent 桥接。
+- 调用策略：Chat Completions、Responses、Anthropic、Gemini native 提前选择 unary；全局 real、模型 `-real` 后缀及原生 `alt=sse` 不能绕过。对外保留 JSON/SSE，目标模型输出为缓冲模式；其他模型继续原策略。
+- 资格配置：新增环境变量 `ARGON_VERIFIED_ACCOUNTS`，严格验证为非负整数 authIndex 的 JSON 数组，默认 `[]`。这是已有 Build 资格的人工核验集合，不能替代实时付费权益；更换账号或重编号后须重新核验。配置经 `.env` 设置并重启，本轮不新增账号等级 UI，也不静态宣称模型已可调用。
+- 调度：unknown 允许受现有容量与初始化并发约束的预检，只有 ready-paid 可以租约生成；免费/失败预检从当前排队请求排除，避免淘汰后重复换入；覆盖 readyContextOnly 开启/关闭及 legacy 最终账号检查。会话版本、browserGeneration、page ownership 与文档变更均检查失效。
+- 错误处理：目标 403/RPC Code 7 作用于账号×模型，不作为 IP 风控或整个账号过期；真实 429 保持额度冷却。unary 断线、超时及权益本地错误不盲目重放生成。客户端权益头不能作为目标生成的会员依据。没有修改现有日额度或持久用量。
+- 诊断：上下文状态提供 `build_benefit` 的状态、来源、失败原因、查询 HTTP 状态及核验标志；生成日志包含内部账号 ID、request/attempt、实际 RPC 与有效缓冲模式，不记录密钥、ext、proof 或内容。
+- 新增测试：`tests/build-benefit.test.js`，并接入 `npm test`；扩展 scheduled request 端到端测试，更新使用新增 page API 的旧 browser mocks。
+- 真实 Firefox fixture：已通过。使用本地 TLS 服务和受限 CONNECT 代理接收真实 `route.continue()` 出站请求，不访问 Google；断言旧 RPC URL、正文及 proof 标记、认证、Cookie 保持原样，覆盖 tier 1/2/免费/未知枚举、损坏 JSON、401/403/429、超时、刷新、重载、迟到文档通知、账号隔离与双账号并发。未添加的 ext 保持缺失。
+- 账号与 Build 模型资格核对：未执行；没有替用户填写核验集合或授予账号标签。
+- 真实 Google 验收：未执行。仍需使用具备权限的账号按 9.3 验证冷启动、reload、context 重建、并发、取消与函数调用后续轮次；离线通过不能视为旧通道上游成功。
+- commit / push / 生产部署：未执行。
 
-本次仅完成当前回退版本与参考实现核对，并编写本方案。后续实施以保留旧请求模式为约束，测试和真实验收结果必须分别记录。
+验证结果：新增权益/Firefox 测试 8 项通过；scheduled request 回归 65 项通过（含四入口 stream/non-stream、403、429 和断线不重放）；完整 `npm test` 通过（共 393 项：361 通过、32 按现有环境条件跳过、0 失败）；改动 JS lint、Prettier 与 `git diff --check` 通过。现有需要额外环境开关的真实登录浏览器用例保持其原有 skip 条件。

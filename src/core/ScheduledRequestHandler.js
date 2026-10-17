@@ -1,3 +1,4 @@
+const { benefitError, isArgon } = require("./BuildBenefitContext");
 const RequestHandler = require("./RequestHandler");
 const { fileKeys, rememberUploadHeaders } = require("./FileAffinity");
 const { classifyError } = require("./ModelScheduler");
@@ -239,6 +240,15 @@ class ScheduledRequestHandler extends RequestHandler {
     }
 
     _shouldRetryError(error) {
+        if (
+            isArgon(this.model) &&
+            (error.code === "BUILD_BENEFIT_NOT_READY" ||
+                error.code === "QUEUE_TIMEOUT" ||
+                Number(error.status) === 504 ||
+                (Number(error.status) !== 429 && /RPC.*(?:Code|code)\s*7/.test(String(error.message || ""))) ||
+                ["account", "unsupported", "risk_controlled", "transport"].includes(classifyError(error)))
+        )
+            return false;
         return ["account", "rate_limited", "risk_controlled", "unsupported", "temporary", "transport"].includes(
             classifyError(error)
         );
@@ -364,6 +374,7 @@ class ScheduledRequestHandler extends RequestHandler {
     }
 
     async _retryTransportQueue(error, registry) {
+        if (isArgon(this.model)) throw benefitError("Argon transport interrupted; generation was not replayed");
         if (
             this.controller.signal.aborted ||
             this.response.__modelOutputStarted ||

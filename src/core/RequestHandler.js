@@ -1,3 +1,4 @@
+const { isArgon, benefitError } = require("./BuildBenefitContext");
 /**
  * File: src/core/RequestHandler.js
  * Description: Main request handler that processes API requests, manages retries, and coordinates between authentication and format conversion
@@ -963,6 +964,7 @@ class RequestHandler {
             const proxyRequest = this._buildProxyRequest(req, requestId);
             proxyRequest.is_generative = isGenerativeRequest;
             this._initializeProxyRequestAttempt(proxyRequest);
+            await this._ensureLegacyBenefit(proxyRequest);
             if (this.scheduled) {
                 try {
                     await this._acquireScheduledLease(proxyRequest);
@@ -1403,7 +1405,7 @@ class RequestHandler {
                 return this._sendErrorResponse(res, 400, "Invalid OpenAI request format.", "invalid_request_error");
             }
 
-            const effectiveStreamMode = modelStreamingMode || systemStreamMode;
+            const effectiveStreamMode = this._effectiveStreamMode(model, modelStreamingMode || systemStreamMode);
             const useEarlyStream = isOpenAIStream && effectiveStreamMode === "early";
             res.__proxyResponseStreamMode = isOpenAIStream ? effectiveStreamMode : null;
             this._updateTrackedRequest(requestId, { model, streamMode: isOpenAIStream ? effectiveStreamMode : null });
@@ -1437,6 +1439,7 @@ class RequestHandler {
                 res.__antiIncludeUsage = req.body.stream_options?.include_usage === true;
             }
             this._initializeProxyRequestAttempt(proxyRequest);
+            await this._ensureLegacyBenefit(proxyRequest);
             if (this.scheduled) {
                 try {
                     await this._acquireScheduledLease(proxyRequest);
@@ -1907,7 +1910,7 @@ class RequestHandler {
                 );
             }
 
-            const effectiveStreamMode = modelStreamingMode || systemStreamMode;
+            const effectiveStreamMode = this._effectiveStreamMode(model, modelStreamingMode || systemStreamMode);
             const useRealStream = isOpenAIStream && effectiveStreamMode === "real";
 
             const googleEndpoint = useRealStream ? "streamGenerateContent" : "generateContent";
@@ -1922,6 +1925,7 @@ class RequestHandler {
                 streaming_mode: useRealStream ? "real" : "fake",
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            await this._ensureLegacyBenefit(proxyRequest);
             if (this.scheduled) {
                 try {
                     await this._acquireScheduledLease(proxyRequest);
@@ -2312,7 +2316,7 @@ class RequestHandler {
                 return this._sendErrorResponse(res, 400, "Invalid Claude request format.", "invalid_request_error");
             }
 
-            const effectiveStreamMode = modelStreamingMode || systemStreamMode;
+            const effectiveStreamMode = this._effectiveStreamMode(model, modelStreamingMode || systemStreamMode);
             const useRealStream = isClaudeStream && effectiveStreamMode === "real";
 
             const googleEndpoint = useRealStream ? "streamGenerateContent" : "generateContent";
@@ -2327,6 +2331,7 @@ class RequestHandler {
                 streaming_mode: useRealStream ? "real" : "fake",
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            await this._ensureLegacyBenefit(proxyRequest);
             if (this.scheduled) {
                 try {
                     await this._acquireScheduledLease(proxyRequest);
@@ -2669,6 +2674,7 @@ class RequestHandler {
                 request_id: requestId,
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            await this._ensureLegacyBenefit(proxyRequest);
             if (this.scheduled) {
                 try {
                     await this._acquireScheduledLease(proxyRequest);
@@ -2828,6 +2834,7 @@ class RequestHandler {
                 request_id: requestId,
             };
             this._initializeProxyRequestAttempt(proxyRequest);
+            await this._ensureLegacyBenefit(proxyRequest);
             if (this.scheduled) {
                 try {
                     await this._acquireScheduledLease(proxyRequest);
@@ -3697,6 +3704,19 @@ class RequestHandler {
                     }
                 }
 
+                // A lost unary response may already have generated output upstream.
+                if (
+                    isArgon(this._extractModelFromPath(proxyRequest.path)) &&
+                    (this._isConnectionResetError(error) ||
+                        error.code === "BUILD_BENEFIT_NOT_READY" ||
+                        error.code === "QUEUE_TIMEOUT" ||
+                        Number(errorPayload.status) === 504)
+                ) {
+                    this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
+                    lastError = { ...errorPayload, skipAccountSwitch: true };
+                    break;
+                }
+
                 // Stop retrying immediately if the queue is closed
                 if (this._isConnectionResetError(error)) {
                     // Check the actual closure reason to provide accurate error messages
@@ -3773,6 +3793,15 @@ class RequestHandler {
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
                 const errorStatus = Number(errorPayload?.status);
+                if (
+                    isArgon(this._extractModelFromPath(proxyRequest.path)) &&
+                    ([400, 401, 403].includes(errorStatus) ||
+                        errorPayload.code === "BUILD_BENEFIT_NOT_READY" ||
+                        /PERMISSION_DENIED/.test(errorPayload.message || ""))
+                ) {
+                    lastError = { ...errorPayload, skipAccountSwitch: true };
+                    break;
+                }
                 const isNonRetryableEmbeddingClientError =
                     (errorStatus === 400 || errorStatus === 404) &&
                     this._categorizeRequest(proxyRequest?.path, "request") === "embedding";
@@ -4713,6 +4742,12 @@ class RequestHandler {
             `[Proxy] Debug: Final Gemini Request (Google Native) = ${JSON.stringify(requestBodyObj, null, 2)}`
         );
 
+        const argonGeneration = /\/models\/gemini-4-argon:(?:generateContent|streamGenerateContent)$/.test(cleanPath);
+        const query = { ...(req.query || {}) };
+        if (argonGeneration) {
+            cleanPath = cleanPath.replace(":streamGenerateContent", ":generateContent");
+            delete query.alt;
+        }
         return {
             body: req.method !== "GET" ? JSON.stringify(requestBodyObj) : undefined,
             headers: req.headers,
@@ -4721,13 +4756,14 @@ class RequestHandler {
                 (req.path.includes("generateContent") || req.path.includes("streamGenerateContent")),
             method: req.method,
             path: cleanPath,
-            query_params: req.query || {},
+            query_params: query,
             request_id: requestId,
             response_transform: responseTransform,
-            streaming_mode:
-                (modelStreamingMode || this.config.streamingMode) === "early"
-                    ? "fake"
-                    : modelStreamingMode || this.config.streamingMode,
+            streaming_mode: argonGeneration
+                ? "fake"
+                : (modelStreamingMode || this.config.streamingMode) === "early"
+                  ? "fake"
+                  : modelStreamingMode || this.config.streamingMode,
         };
     }
 
@@ -4754,7 +4790,31 @@ class RequestHandler {
         }
     }
 
+    _effectiveStreamMode(model, mode) {
+        if (isArgon(model) && mode === "real") {
+            this.logger.info(`[Build] model=gemini-4-argon rpc=ProxyUnaryCall stream_mode=fake (buffered)`);
+            return "fake";
+        }
+        return mode;
+    }
+
+    async _ensureLegacyBenefit(proxyRequest) {
+        if (this.scheduled || !isArgon(this._extractModelFromPath(proxyRequest.path)) || !proxyRequest.is_generative)
+            return;
+        const benefit = this.browserManager.contexts?.get(this.currentAuthIndex)?.page?.buildBenefit;
+        if (!benefit) throw benefitError("Build benefit context unavailable");
+        await benefit.assertReady();
+    }
+
     _initializeProxyRequestAttempt(proxyRequest) {
+        if (proxyRequest.is_generative && isArgon(this._extractModelFromPath(proxyRequest.path))) {
+            // Client headers cannot attest to the host account's membership.
+            proxyRequest.headers = Object.fromEntries(
+                Object.entries(proxyRequest.headers || {}).filter(
+                    ([name]) => !["x-aistudio-g1-tier", "x-goog-ext-519733851-bin"].includes(name.toLowerCase())
+                )
+            );
+        }
         if (!proxyRequest.request_attempt_number) {
             proxyRequest.request_attempt_number = 1;
         }
@@ -4780,6 +4840,19 @@ class RequestHandler {
     }
 
     _forwardRequest(proxyRequest, authIndex = this.currentAuthIndex) {
+        if (proxyRequest.is_generative && isArgon(this._extractModelFromPath(proxyRequest.path))) {
+            const benefit = this.browserManager.contexts?.get(authIndex)?.page?.buildBenefit;
+            if (
+                !benefit?.verified ||
+                benefit.disposed ||
+                benefit.isCurrent?.() === false ||
+                benefit.state !== "ready-paid"
+            )
+                throw benefitError("No qualified Build account for gemini-4-argon");
+            this.logger.info(
+                `[Build] account=${authIndex} request=${proxyRequest.request_id} attempt=${proxyRequest.request_attempt_id} model=gemini-4-argon rpc=ProxyUnaryCall benefit_source=${benefit.source || "unknown"} benefit_state=${benefit.state} stream_mode=${proxyRequest.streaming_mode} buffered=true`
+            );
+        }
         const connection = this.connectionRegistry.getConnectionByAuth(authIndex);
         if (connection) {
             this.logger.debug(

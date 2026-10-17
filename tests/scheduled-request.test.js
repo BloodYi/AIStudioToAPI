@@ -1450,3 +1450,110 @@ test("anti early fills missing or invalid upstream fields without overriding val
         assert.equal(res.body.includes("[DONE]"), false);
     }
 });
+
+test("Argon uses unary across all adapters while preserving client JSON and SSE", async t => {
+    for (const method of [
+        "processOpenAIRequest",
+        "processOpenAIResponseRequest",
+        "processClaudeRequest",
+        "processRequest",
+    ]) {
+        for (const stream of [false, true]) {
+            await t.test(`${method} stream=${stream}`, async t => {
+                const fixture = setup(() => success, { scheduler: { argonVerifiedAccounts: [0] } });
+                t.after(() => fixture.scheduler.close());
+                const benefit = { state: "ready-paid", verified: true };
+                fixture.browser.contexts = new Map([[0, { page: { buildBenefit: benefit }, state: "READY" }]]);
+                fixture.browser.isContextReady = index => index === 0;
+                fixture.scheduler.browserManager = fixture.browser;
+                const req = request("gemini-4-argon-real", stream);
+                if (method === "processOpenAIResponseRequest") req.body.input = "hi";
+                if (method === "processRequest") {
+                    req.path = `/v1beta/models/gemini-4-argon-real:${stream ? "streamGenerateContent" : "generateContent"}`;
+                    req.body = { contents: [{ parts: [{ text: "hi" }], role: "user" }] };
+                    req.query = stream ? { alt: "sse" } : {};
+                }
+                const res = new Response();
+                await fixture.handler[method](req, res);
+                assert.equal(res.statusCode, 200, res.body);
+                assert.equal(fixture.sent.length, 1);
+                assert.equal(fixture.sent[0].index, 0);
+                assert.equal(fixture.sent[0].request.path, "/v1beta/models/gemini-4-argon:generateContent");
+                assert.equal(fixture.sent[0].request.query_params.alt, undefined);
+                assert.equal(fixture.sent[0].request.streaming_mode, "fake");
+                if (stream) {
+                    assert.match(res.body, /data: /);
+                    assert.equal(res.__proxyResponseStreamMode, "fake");
+                } else assert.doesNotThrow(() => JSON.parse(res.body));
+                assert.match(res.body, /hello/);
+            });
+        }
+    }
+});
+
+test("Argon permission errors affect only the model and do not replay generation", async t => {
+    const fixture = setup(() => [{ event_type: "error", message: "PERMISSION_DENIED", status: 403 }], {
+        scheduler: { argonVerifiedAccounts: [0, 1] },
+    });
+    t.after(() => fixture.scheduler.close());
+    fixture.browser.contexts = new Map(
+        [0, 1].map(index => [
+            index,
+            { page: { buildBenefit: { state: "ready-paid", verified: true } }, state: "READY" },
+        ])
+    );
+    fixture.browser.isContextReady = index => index < 2;
+    fixture.scheduler.browserManager = fixture.browser;
+    const res = new Response();
+    await fixture.handler.processOpenAIRequest(request("gemini-4-argon"), res);
+    assert.equal(fixture.sent.length, 1);
+    assert.match(res.body, /PERMISSION_DENIED/);
+    const account = fixture.scheduler.account(fixture.sent[0].index);
+    assert.equal(account.healthy, true);
+    assert.equal(account.models["gemini-4-argon"].unsupported, true);
+    assert.equal(account.models["gemini-4-argon"].risk_control_failures || 0, 0);
+});
+
+test("Argon does not replay a unary generation after its connection is lost", async t => {
+    const fixture = setup(() => [], { scheduler: { argonVerifiedAccounts: [0, 1] } });
+    t.after(() => fixture.scheduler.close());
+    fixture.browser.contexts = new Map(
+        [0, 1].map(index => [
+            index,
+            { page: { buildBenefit: { state: "ready-paid", verified: true } }, state: "READY" },
+        ])
+    );
+    fixture.browser.isContextReady = index => index < 2;
+    fixture.scheduler.browserManager = fixture.browser;
+    const res = new Response();
+    const running = fixture.handler.processOpenAIRequest(request("gemini-4-argon", true), res);
+    await new Promise(resolve => setImmediate(resolve));
+    fixture.registry.closeMessageQueuesForEpoch(0, 1, "connection_lost");
+    await running;
+    assert.equal(fixture.sent.length, 1);
+    assert.match(res.body, /not replayed/);
+    assert.equal(fixture.scheduler.account(0).healthy, true);
+    assert.equal(fixture.scheduler.account(0).inflight, 0);
+});
+
+test("Argon upstream 429 retains quota cooldown without expiring the account", async t => {
+    const fixture = setup(() => [{ event_type: "error", message: "RESOURCE_EXHAUSTED", status: 429 }], {
+        maxRetries: 1,
+        scheduler: { argonVerifiedAccounts: [0], maxRetries: 0 },
+    });
+    t.after(() => fixture.scheduler.close());
+    fixture.browser.contexts = new Map([
+        [0, { page: { buildBenefit: { state: "ready-paid", verified: true } }, state: "READY" }],
+    ]);
+    fixture.browser.isContextReady = index => index === 0;
+    fixture.scheduler.browserManager = fixture.browser;
+    const res = new Response();
+    await fixture.handler.processOpenAIRequest(request("gemini-4-argon"), res);
+    assert.equal(fixture.sent.length, 1);
+    const account = fixture.scheduler.account(0);
+    assert.equal(account.healthy, true);
+    assert.equal(account.models["gemini-4-argon"].rate_limited, true);
+    assert.ok(account.models["gemini-4-argon"].cooldown_until > Date.now());
+    assert.equal(account.models["gemini-4-argon"].unsupported || false, false);
+    assert.equal(res.statusCode, 429);
+});

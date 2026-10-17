@@ -238,3 +238,13 @@ npm run build:ui
 本版本沿用上游 **CC BY-NC 4.0（署名－非商业性使用 4.0 国际）** 许可证。使用、分发与修改均需遵守原有许可证全部条款，完整内容见 [LICENSE](LICENSE) 与 [许可说明](https://creativecommons.org/licenses/by-nc/4.0/)。本仓库已说明二次开发及主要修改，不代表上游作者对本版本的背书。
 
 Docker 中包含的 Node.js、Camoufox、Mihomo 等第三方组件遵循各自许可证。Mihomo 的许可证及源码链接保存在镜像 `/usr/share/licenses/mihomo/` 中。
+
+### Gemini 4 Argon（旧 Build 模式）
+
+`gemini-4-argon` 保留宿主页的旧 `ProxyUnaryCall` 链路。先用同一账号在现有 Build App 验证准确模型 ID 和调用权限，再在 `.env` 配置 `ARGON_VERIFIED_ACCOUNTS=[0,2]`（内部 authIndex，示例值需替换）并重启。默认 `[]` 不派发此模型；此配置只声明已核验账号，不能授予会员权限。更换账号或重新编号后须重新核验并更新配置。
+
+每个账号独立观察宿主页原生权益信息，必要时查询 `GetAiStudioBenefitTier`。只有已核验且实时权益为付费的账号才可生成；未知状态只允许预检。认证未就绪、查询失败、免费或没有合格账号会返回明确错误，不会批量标记登录失效。查询失败可在 30 秒后重新预检，也可通过页面重载重新取得上下文。
+
+Chat Completions、Responses、Anthropic 和 Gemini native 均支持原有 JSON/SSE 响应格式。此模型的流式请求（包括全局 `real`、`-real` 后缀和原生 `alt=sse`）实际使用 unary 并缓冲输出；不是实时增量流。其他模型沿用原有流模式。权益补头只作用于最终宿主页 RPC，不改写正文、WAA 或原生认证，不回退到直接 GenerateContent。Argon 的本地日额度仍显示未知，实际 429 保留现有限流处理。
+
+离线测试包含真实 Firefox 与本地 TLS/CONNECT fixture，运行 `node --test tests/build-benefit.test.js`（需安装 Playwright Firefox 和 OpenSSL）；测试不访问 Google。代码及 fixture 通过不等同于真实账号已通过上游验收，具体记录见 [适配方案](docs/zh/gemini-4-argon-legacy-build-adaptation-plan-20261017.md)。
