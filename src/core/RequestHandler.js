@@ -4934,8 +4934,11 @@ class RequestHandler {
                 policy?.transport === "makersuite"
                     ? this.browserManager.contexts
                           .get(authIndex)
-                          .page.makerSuiteBridge.prepare(proxyRequest, proxyRequest.__generationDeadline) ||
-                      proxyRequest
+                          .page.makerSuiteBridge.prepare(
+                              proxyRequest,
+                              proxyRequest.__generationDeadline,
+                              this.config.makerSuiteTimeoutMs
+                          ) || proxyRequest
                     : proxyRequest;
             this.logger.debug(
                 `[Request] Forwarding request #${proxyRequest.request_id} via connection for authIndex=${authIndex}` +

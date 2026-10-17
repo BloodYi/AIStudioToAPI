@@ -191,7 +191,7 @@ See the [production diagnosis and fix report](docs/zh/gemini-4-argon-production-
 
 ### Model transport compatibility
 
-`gemini-3.7-flash` keeps its original ID, legacy Proxy RPC and real streaming. `gemini-4-argon` defaults to the MakerSuite GenerateContent bridge. All other models remain on legacy. Exact model overrides are available in the configuration UI or environment and require a restart:
+`gemini-3.7-flash` keeps its original ID, legacy Proxy RPC and real streaming. `gemini-4-argon` defaults to the MakerSuite GenerateContent bridge. All other models remain on legacy. The configuration UI provides model ID rows with legacy / bridge selectors. Saved transport overrides require a restart; environment overrides remain JSON mappings:
 
 ```dotenv
 MODEL_TRANSPORT_POLICY={"gemini-3.7-flash":"legacy","gemini-4-argon":"makersuite"}
@@ -199,7 +199,7 @@ MODEL_TRANSPORT_POLICY={"gemini-3.7-flash":"legacy","gemini-4-argon":"makersuite
 
 Only canonical model IDs and `legacy` / `makersuite` are accepted. Requests keep their transport snapshot through retries and continuation rounds. There is no automatic channel fallback or model renaming. Argon still requires a verified account and that account's live paid benefit context; neither configuration nor membership grants quota.
 
-The bridge buffers the upstream result. JSON and SSE formats remain available; requested real streaming becomes buffered output. Chat supports early headers and keepalives; other adapters retain buffered SSE. `FAKE_STREAM_TIMEOUT_MS` is a fixed generation budget (default and maximum 300000 ms). Authentication, WAA, fetch and full body reading share that budget; the bridge reserves settlement time and uses at most 295000 ms. Keepalives do not renew it. `STREAM_TIMEOUT_MS` remains the legacy real-stream idle timeout. Queue deadlines are separate; configure gateways and callers to cover queueing plus generation.
+The bridge buffers the upstream result. JSON and SSE formats remain available; requested real streaming becomes buffered output. Chat supports early headers and keepalives; other adapters retain buffered SSE. `FAKE_STREAM_TIMEOUT_MS` is a fixed generation budget (default and maximum 300000 ms). Authentication, WAA, fetch and full body reading share that budget; the bridge reserves settlement time. The UI’s bridge generation timeout (`MAKERSUITE_TIMEOUT_MS`, default 295000 ms, range 1–300000 ms) applies to new requests immediately after saving. Existing requests retain their snapshot. The actual bridge wait is bounded by both this setting and the remaining buffered budget minus settlement time. Keepalives do not renew it. `STREAM_TIMEOUT_MS` remains the legacy real-stream idle timeout. Queue deadlines are separate; configure gateways and callers to cover queueing plus generation.
 
 The bridge is installed on the owning host page and does not modify saved Build Apps. Existing clients retain their known five-minute cap; the bundled client additionally supports remaining budgets and a capability handshake. Ten-minute budgets are not supported. Internal correlation markers are removed before outbound Google calls. Credentials, opaque benefit data, proof and payloads are not logged by the transport.
 

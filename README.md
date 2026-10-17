@@ -253,7 +253,7 @@ Camoufox 生产差异及后续修复见 [生产问题定位](docs/zh/gemini-4-ar
 
 ### 模型传输兼容
 
-默认 `gemini-3.7-flash` 保留原始 ID、旧 Proxy RPC 和 real 流式；`gemini-4-argon` 使用 MakerSuite GenerateContent 桥接，其他模型仍走 legacy。可在配置页或环境变量设置精确模型映射，保存后重启生效：
+默认 `gemini-3.7-flash` 保留原始 ID、旧 Proxy RPC 和 real 流式；`gemini-4-argon` 使用 MakerSuite GenerateContent 桥接，其他模型仍走 legacy。可在配置页逐行填写模型 ID 并选择“旧通道 / 桥接通道”，保存后重启生效；环境变量仍支持精确模型映射：
 
 ```dotenv
 MODEL_TRANSPORT_POLICY={"gemini-3.7-flash":"legacy","gemini-4-argon":"makersuite"}
@@ -261,7 +261,7 @@ MODEL_TRANSPORT_POLICY={"gemini-3.7-flash":"legacy","gemini-4-argon":"makersuite
 
 只接受无指令后缀的精确模型 ID 和 `legacy` / `makersuite`，不支持通配符、自动跨通道重试或模型改名。每个请求固定策略，重试和后续轮次不切换路径。Argon 仍要求 `ARGON_VERIFIED_ACCOUNTS` 与该账号当前页面真实付费权益；配置账号 ID 不授予权限，付费也不代表有可用额度。
 
-桥接先等待完整结果，再输出 JSON 或 SSE；`-real` 和全局 real 在桥接时转为缓冲，Chat 可选择 early 提前开始并发送心跳，其他入口保留原有缓冲 SSE 行为。`FAKE_STREAM_TIMEOUT_MS` 是固定生成总预算（默认 300000，最大 300000 毫秒），桥接最多使用剩余预算减去结算余量（默认最多 295000 毫秒），包括认证、WAA、fetch 和正文读取。心跳不会延长预算。`STREAM_TIMEOUT_MS` 仍用于 legacy real 的增量空闲等待。排队期限独立；网关及调用方需要覆盖排队与生成时间。
+桥接先等待完整结果，再输出 JSON 或 SSE；`-real` 和全局 real 在桥接时转为缓冲，Chat 可选择 early 提前开始并发送心跳，其他入口保留原有缓冲 SSE 行为。`FAKE_STREAM_TIMEOUT_MS` 是固定生成总预算（默认 300000，最大 300000 毫秒），“桥接生成超时”（`MAKERSUITE_TIMEOUT_MS`，默认 295000，范围 1–300000 毫秒）可在前端修改，保存后对新请求生效，已有请求保留原预算。实际桥接等待取该时限与缓冲总预算剩余时间减去结算余量的较小值，包括认证、WAA、fetch 和正文读取。心跳不会延长预算。`STREAM_TIMEOUT_MS` 仍用于 legacy real 的增量空闲等待。排队期限独立；网关及调用方需要覆盖排队与生成时间。
 
 桥接及取消安装在当前账号宿主页，无需创建或修改已保存 Build App。旧客户端可以保留五分钟上限；新版 `scripts/client/build.js` 另支持剩余预算及能力版本握手。本版本不支持十分钟预算。内部关联标记仅用于已拦截的桥接请求，不发送给 Google；旧通道出站移除本地标记。日志记录传输与请求/有效模式，不记录认证、权益不透明值、WAA 或载荷。
 

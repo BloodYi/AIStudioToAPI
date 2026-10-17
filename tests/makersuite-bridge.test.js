@@ -684,3 +684,42 @@ test("preparation rejects user-supplied reserved correlation fields", async t =>
     assert.equal(f.bridge.attempts.size, 0);
     assert.equal(f.calls.length, 0);
 });
+
+test("per-request bridge timeouts override the installed default while preserving the outer deadline", async t => {
+    for (const [installed, timeout, budget, expected] of [
+        [5, 1000, 2000, 200],
+        [1000, 5, 2000, 504],
+        [1000, 1000, 5, 504],
+    ]) {
+        const f = fixture(t, 0, {
+            bridge: { timeoutMs: installed },
+            fetch: (url, init) =>
+                new Promise((resolve, reject) => {
+                    const timer = setTimeout(() => resolve({ status: 200, text: async () => success }), 30);
+                    init.signal.addEventListener(
+                        "abort",
+                        () => {
+                            clearTimeout(timer);
+                            reject(new DOMException("Aborted", "AbortError"));
+                        },
+                        { once: true }
+                    );
+                }),
+        });
+        await f.init();
+        const proxy = {
+            body: JSON.stringify({ contents: [{ parts: [{ text: "hi" }], role: "user" }] }),
+            request_attempt_id: "configured",
+            transport_policy: require("../src/core/ModelTransportPolicy").resolve("gemini-2.5-flash", "fake", {
+                "gemini-2.5-flash": "makersuite",
+            }),
+        };
+        const wire = f.bridge.prepare(proxy, performance.now() + budget, timeout);
+        const route = f.route({ body: JSON.parse(wire.body) });
+        await f.bridge.handle(route);
+        assert.equal(route.outcomes[0].status, expected);
+        if (expected === 504 && f.calls.length) assert.equal(f.calls[0].init.signal.aborted, true);
+        assert.equal(f.bridge.active.size, 0);
+        assert.equal(f.bridge.attempts.size, 0);
+    }
+});

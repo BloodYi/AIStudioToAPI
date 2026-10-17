@@ -1,6 +1,12 @@
 {
     "models": [
         {
+            "name": "models/gemini-4-argon",
+            "displayName": "Gemini 4 Argon",
+            "description": "Gemini 4 Argon via MakerSuite GenerateContent (buffered).",
+            "supportedGenerationMethods": ["generateContent"]
+        },
+        {
             "name": "models/gemini-2.5-flash",
             "version": "001",
             "displayName": "Gemini 2.5 Flash",

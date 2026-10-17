@@ -123,3 +123,27 @@ test("non-generation requests never register a bridge call or receive its intern
     assert.deepEqual(sent[0].query_params, { key: "client" });
     assert.equal(sent[0].remaining_budget_ms, undefined);
 });
+
+test("downstream OpenAI and Gemini model catalogues include the accepted Argon model", async t => {
+    const ProxyServerSystem = require("../src/core/ProxyServerSystem");
+    const system = Object.create(ProxyServerSystem.prototype);
+    system.config = new ConfigLoader(logger).loadConfiguration({ API_KEYS: "catalogue-fixture-key" });
+    system.logger = logger;
+    system.webRoutes = { authRoutes: { getClientIP: () => "fixture" }, setupSession() {} };
+    system.requestHandler = { withConfigurationSnapshot: next => next() };
+    const app = system._createExpressApp();
+    const server = await new Promise(resolve => {
+        const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+    });
+    t.after(() => {
+        server.closeAllConnections();
+        return new Promise(resolve => server.close(resolve));
+    });
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const openAI = await fetch(base + "/v1/models", { headers: { authorization: "Bearer catalogue-fixture-key" } });
+    assert.equal(openAI.status, 200);
+    assert.equal((await openAI.json()).data.filter(model => model.id === "gemini-4-argon").length, 1);
+    const native = await fetch(base + "/v1beta/models", { headers: { authorization: "Bearer catalogue-fixture-key" } });
+    assert.equal(native.status, 200);
+    assert.equal((await native.json()).models.filter(model => model.name === "models/gemini-4-argon").length, 1);
+});

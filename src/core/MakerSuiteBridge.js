@@ -3,6 +3,7 @@
  * 79807728179482509cf1f8a4f5e3e175d9dd6702 and e134063 (CC BY-NC 4.0).
  * The old RPC envelope is kept so existing Build apps need no manual update.
  */
+const { DEFAULT_MAKERSUITE_TIMEOUT_MS } = require("../config/TransportConfig");
 const { randomUUID } = require("node:crypto");
 const { tagStatus } = require("../utils/MakerSuiteAuth");
 const { buildBody, errorEnvelope, wrapResponse } = require("./MakerSuiteCodec");
@@ -351,8 +352,8 @@ class MakerSuiteBridge {
         page,
         logger,
         authIndex,
-        timeoutMs = 295000,
-        streamTimeoutMs = 295000,
+        timeoutMs = DEFAULT_MAKERSUITE_TIMEOUT_MS,
+        streamTimeoutMs = DEFAULT_MAKERSUITE_TIMEOUT_MS,
         policy = {},
         benefit = null,
         registerRoute = true,
@@ -452,15 +453,17 @@ class MakerSuiteBridge {
         );
         return this;
     }
-    prepare(proxyRequest, deadline) {
+    prepare(proxyRequest, deadline, timeoutMs = this.timeoutMs) {
         const id = proxyRequest.request_attempt_id;
         if (this.closed || this.benefit?.disposed || this.benefit?.isCurrent() === false)
             throw Object.assign(new Error("MakerSuite document unavailable"), { status: 503 });
-        const remaining = deadline - performance.now();
+        const startedAt = performance.now();
+        const remaining = deadline - startedAt;
         const body = JSON.parse(proxyRequest.body || "{}");
         if (!body || typeof body !== "object" || Array.isArray(body) || Object.hasOwn(body, ATTEMPT_FIELD))
             throw Object.assign(new Error("Invalid or reserved MakerSuite request metadata"), { status: 400 });
         this.attempts.set(id, {
+            bridgeDeadline: startedAt + timeoutMs,
             deadline,
             epoch: this.epoch,
             excludedKeys: [
@@ -591,7 +594,7 @@ class MakerSuiteBridge {
                 throw Object.assign(new Error("MakerSuite document changed"), { status: 503 });
             const timeoutMs = Math.floor(
                 Math.min(
-                    this.timeoutMs,
+                    registration ? registration.bridgeDeadline - performance.now() : this.timeoutMs,
                     registration ? registration.deadline - performance.now() - registration.reserveMs : this.timeoutMs
                 )
             );

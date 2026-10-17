@@ -23,7 +23,7 @@ test("allowlist matches plan and excludes file-only queue timeout and usage enab
     const keys = [...section.matchAll(/^\| `([A-Z_]+)`\s+\|/gm)].map(match => match[1]);
     assert.deepEqual(
         new Set(definitions.map(d => d.name)),
-        new Set([...keys, "LOG_DISPLAY_LIMIT", "DEBUG_MODE", "MODEL_TRANSPORT_POLICY"])
+        new Set([...keys, "LOG_DISPLAY_LIMIT", "DEBUG_MODE", "MODEL_TRANSPORT_POLICY", "MAKERSUITE_TIMEOUT_MS"])
     );
     assert.equal(new Set(definitions.map(d => d.name)).size, definitions.length);
 });
@@ -304,4 +304,26 @@ test("transport mappings persist but only a restarted configuration uses the new
     service.save({ reset: ["MODEL_TRANSPORT_POLICY"], version: service.document.version });
     const reset = new ConfigurationService({ logger }, { env: {}, file: service.file });
     assert.deepEqual(reset.running.modelTransportPolicy, {});
+});
+
+test("bridge timeout saves hot, persists, validates and preserves accepted request snapshots", t => {
+    const { service, save, system } = setup(t);
+    assert.equal(service.running.makerSuiteTimeoutMs, 295000);
+    const handler = new RequestHandler({}, {}, logger, {}, system.config, {});
+    handler.withConfigurationSnapshot(() => {
+        const result = save({ MAKERSUITE_TIMEOUT_MS: 180000 });
+        assert.equal(service.running.makerSuiteTimeoutMs, 180000);
+        assert.equal(handler.config.makerSuiteTimeoutMs, 295000);
+        assert.ok(result.applied.includes("MAKERSUITE_TIMEOUT_MS"));
+        assert.equal(
+            result.pending.some(item => item.name === "MAKERSUITE_TIMEOUT_MS"),
+            false
+        );
+    });
+    const loaded = new ConfigurationService({ logger }, { env: {}, file: service.file });
+    assert.equal(loaded.running.makerSuiteTimeoutMs, 180000);
+    for (const value of [0, -1, 300001, 1.5, "1000", null])
+        assert.throws(() => save({ MAKERSUITE_TIMEOUT_MS: value }), { status: 400 });
+    service.save({ reset: ["MAKERSUITE_TIMEOUT_MS"], version: service.document.version });
+    assert.equal(service.running.makerSuiteTimeoutMs, 295000);
 });

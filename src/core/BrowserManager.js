@@ -3550,7 +3550,7 @@ class BrowserManager {
                 page,
                 policy: this.config?.modelTransportPolicy,
                 requireRegistration: true,
-                timeoutMs: 295000,
+                timeoutMs: this.config?.makerSuiteTimeoutMs,
                 validateSession: () => this._diagnoseMakerSuiteSession(page),
             });
             page.makerSuiteBridge = bridge;

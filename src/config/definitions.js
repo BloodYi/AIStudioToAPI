@@ -306,6 +306,20 @@ module.exports = [
     },
     {
         application: "hot",
+        description:
+            "MakerSuite 桥接单次生成的最大时长，含认证、WAA 和正文读取。默认 295000 毫秒；实际还受缓冲响应总预算的剩余时间约束，并预留结算时间。保存后用于新请求，已有请求不变。",
+        group: "请求处理与模型功能",
+        label: "桥接生成超时",
+        maximum: 300000,
+        minimum: 1,
+        mode: "all",
+        name: "MAKERSUITE_TIMEOUT_MS",
+        path: "makerSuiteTimeoutMs",
+        type: "integer",
+        unit: "毫秒",
+    },
+    {
+        application: "hot",
         description: "在请求转换时强制开启模型思考功能",
         group: "请求处理与模型功能",
         label: "强制启用思考",

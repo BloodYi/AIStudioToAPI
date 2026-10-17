@@ -107,6 +107,36 @@ test(
             document.querySelector(".configuration-panel")?.textContent.includes("立即生效：单账号各模型并发上限")
         );
         assert.equal(service.saved.scheduler.accountModelConcurrency["unknown-upstream-id"], 0);
+        const transport = panel
+            .locator(".configuration-field")
+            .filter({ has: page.locator('label[for="config-MODEL_TRANSPORT_POLICY"]') });
+        assert.equal(await transport.locator("textarea").count(), 0);
+        await transport.getByRole("button", { name: "增加模型" }).click();
+        await transport.getByPlaceholder("可手动输入上游模型 ID").fill("gemini-4-argon");
+        await transport.locator(".el-select").click();
+        await page.getByRole("option", { exact: true, name: "桥接通道（makersuite）" }).click();
+        assert.deepEqual(service.saved.modelTransportPolicy, {});
+        await panel.getByRole("button", { exact: true, name: "保存" }).click();
+        await page.waitForFunction(() =>
+            document.querySelector('.configuration-panel [role="status"]')?.textContent.includes("0 项修改")
+        );
+        assert.deepEqual(service.saved.modelTransportPolicy, { "gemini-4-argon": "makersuite" });
+        assert.deepEqual(service.running.modelTransportPolicy, {});
+        await transport.getByRole("button", { name: "增加模型" }).click();
+        await transport.getByPlaceholder("可手动输入上游模型 ID").nth(1).fill("gemini-4-argon");
+        const beforeDuplicate = writes.length;
+        await panel.getByRole("button", { exact: true, name: "保存" }).click();
+        await panel.getByRole("alert").getByText("模型传输策略：模型名不能为空或重复").waitFor();
+        assert.equal(writes.length, beforeDuplicate);
+        await transport.getByRole("button", { exact: true, name: "删除" }).nth(1).click();
+        await panel.locator("#config-MAKERSUITE_TIMEOUT_MS").fill("180000");
+        await panel.locator("#config-MAKERSUITE_TIMEOUT_MS").blur();
+        assert.equal(service.running.makerSuiteTimeoutMs, 295000);
+        await panel.getByRole("button", { exact: true, name: "保存" }).click();
+        await page.waitForFunction(() =>
+            document.querySelector(".configuration-panel")?.textContent.includes("立即生效：桥接生成超时")
+        );
+        assert.equal(service.running.makerSuiteTimeoutMs, 180000);
         await panel.locator("#config-FORCE_WEB_SEARCH").locator("..").click();
         service.save({ changes: { FORCE_CODE_EXECUTION: true }, version: service.document.version });
         await panel.getByRole("button", { exact: true, name: "保存" }).click();

@@ -7,6 +7,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { DEFAULT_MAKERSUITE_TIMEOUT_MS } = require("../config/TransportConfig");
 const { getProxySummaryFromEnv } = require("./ProxyUtils");
 
 /**
@@ -37,6 +38,7 @@ class ConfigLoader {
             host: "0.0.0.0",
             httpPort: 7860,
             immediateSwitchStatusCodes: [429, 503],
+            makerSuiteTimeoutMs: DEFAULT_MAKERSUITE_TIMEOUT_MS,
             maxContexts: 1,
             maxRetries: 3,
             publicDashboard: {
@@ -135,6 +137,17 @@ class ConfigLoader {
         }
         if (Number(env.FAKE_STREAM_TIMEOUT_MS) > 300000)
             throw new Error("FAKE_STREAM_TIMEOUT_MS above 300000 is not supported by the Build client");
+        if (env.MAKERSUITE_TIMEOUT_MS !== undefined) {
+            const parsed = Number(env.MAKERSUITE_TIMEOUT_MS);
+            if (
+                !String(env.MAKERSUITE_TIMEOUT_MS).trim() ||
+                !Number.isSafeInteger(parsed) ||
+                parsed < 1 ||
+                parsed > 300000
+            )
+                throw new Error("Invalid MAKERSUITE_TIMEOUT_MS: expected an integer between 1 and 300000");
+            config.makerSuiteTimeoutMs = parsed;
+        }
         if (env.FAKE_STREAM_TIMEOUT_MS) {
             const parsed = parseInt(env.FAKE_STREAM_TIMEOUT_MS, 10);
             config.fakeStreamTimeoutMs = Number.isFinite(parsed)
